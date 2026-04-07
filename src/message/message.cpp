@@ -63,80 +63,84 @@ auto ParsedSlotText(const ParsedMessageData& data, const ParsedFieldSlot& slot) 
     return std::string_view(raw + slot.value_offset, slot.value_length);
 }
 
-auto EnsureLazyParsed(const ParsedMessageData& data, const ParsedFieldSlot& slot) -> void {
-    if (slot.lazy_parsed) {
-        return;
-    }
-    slot.lazy_parsed = true;
+auto ParsedFieldView(const ParsedMessageData& data, const ParsedFieldSlot& slot) -> FieldView {
+    FieldView view;
+    view.tag = slot.tag;
+    view.type = slot.type();
     const auto text = ParsedSlotText(data, slot);
-    switch (slot.type) {
+    view.string_value = text;
+    switch (slot.type()) {
         case FieldValueType::kInt: {
             std::int64_t value = 0;
             const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
             if (ec == std::errc() && ptr == text.data() + text.size()) {
-                slot.int_value = value;
+                view.int_value = value;
             }
             break;
         }
         case FieldValueType::kChar:
             if (text.size() == 1U) {
-                slot.char_value = text.front();
+                view.char_value = text.front();
             }
             break;
         case FieldValueType::kFloat: {
             double value = 0.0;
             const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
             if (ec == std::errc() && ptr == text.data() + text.size()) {
-                slot.float_value = value;
+                view.float_value = value;
             }
             break;
         }
         case FieldValueType::kBoolean:
-            slot.bool_value = (text == "Y");
+            view.bool_value = (text == "Y");
             break;
         default:
             break;
     }
+    return view;
 }
 
-auto ParsedFieldView(const ParsedMessageData& data, const ParsedFieldSlot& slot) -> FieldView {
-    EnsureLazyParsed(data, slot);
-    FieldView view;
-    view.tag = slot.tag;
-    view.type = slot.type;
-    view.string_value = ParsedSlotText(data, slot);
-    view.int_value = slot.int_value;
-    view.float_value = slot.float_value;
-    view.char_value = slot.char_value;
-    view.bool_value = slot.bool_value;
-    return view;
+auto FindParsedFieldInRoot(const ParsedMessageData& data, std::uint32_t tag)
+    -> const ParsedFieldSlot* {
+    auto probe = static_cast<std::uint16_t>(tag % kFieldHashTableSize);
+    for (std::size_t i = 0; i < kFieldHashTableSize; ++i) {
+        const auto slot_index = data.field_hash_table[probe];
+        if (slot_index == kInvalidHashSlot) {
+            return nullptr;
+        }
+        if (data.field_slots[slot_index].tag == tag) {
+            return &data.field_slots[slot_index];
+        }
+        probe = static_cast<std::uint16_t>((probe + 1U) % kFieldHashTableSize);
+    }
+    return nullptr;
 }
 
 auto FindParsedField(const ParsedMessageData& data, const ParsedEntryData& entry, std::uint32_t tag)
     -> const ParsedFieldSlot* {
-    auto field_index = entry.first_field;
-    while (field_index != kInvalidParsedIndex) {
-        const auto& slot = data.field_slots[field_index];
-        if (slot.tag == tag) {
-            return &slot;
+    if (entry.first_field_index == kInvalidParsedIndex || entry.field_count == 0U) {
+        return nullptr;
+    }
+    // For root entry, use hash table
+    if (&entry == &data.root) {
+        return FindParsedFieldInRoot(data, tag);
+    }
+    // For group entries, linear scan over contiguous range
+    const auto end_index = entry.first_field_index + entry.field_count;
+    for (auto i = entry.first_field_index; i < end_index; ++i) {
+        if (data.field_slots[i].tag == tag) {
+            return &data.field_slots[i];
         }
-        field_index = slot.next_field;
     }
     return nullptr;
 }
 
 auto NthParsedField(const ParsedMessageData& data, const ParsedEntryData& entry, std::size_t index)
     -> const ParsedFieldSlot* {
-    auto field_index = entry.first_field;
-    std::size_t current = 0U;
-    while (field_index != kInvalidParsedIndex) {
-        if (current == index) {
-            return &data.field_slots[field_index];
-        }
-        field_index = data.field_slots[field_index].next_field;
-        ++current;
+    if (entry.first_field_index == kInvalidParsedIndex || index >= entry.field_count) {
+        return nullptr;
     }
-    return nullptr;
+    return &data.field_slots[entry.first_field_index + index];
 }
 
 auto FindParsedGroup(const ParsedMessageData& data, const ParsedEntryData& entry, std::uint32_t count_tag)

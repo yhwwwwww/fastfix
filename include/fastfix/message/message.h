@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -66,25 +67,28 @@ struct FieldValue {
   };
 
   inline constexpr std::uint32_t kInvalidParsedIndex = std::numeric_limits<std::uint32_t>::max();
-  inline constexpr std::size_t kParsedFieldSlotInlineCapacity = 16U;
+  inline constexpr std::uint16_t kInvalidHashSlot = 0xFFFFU;
+  inline constexpr std::size_t kFieldHashTableSize = 64U;
+  inline constexpr std::size_t kParsedFieldSlotInlineCapacity = 32U;
   inline constexpr std::size_t kParsedEntryInlineCapacity = 4U;
   inline constexpr std::size_t kParsedGroupInlineCapacity = 4U;
 
   struct ParsedFieldSlot {
     std::uint32_t tag{0};
-    FieldValueType type{FieldValueType::kString};
     std::uint32_t value_offset{0};
     std::uint16_t value_length{0};
-    std::uint32_t next_field{kInvalidParsedIndex};
-    mutable std::int64_t int_value{0};
-    mutable double float_value{0.0};
-    mutable char char_value{'\0'};
-    mutable bool bool_value{false};
-    mutable bool lazy_parsed{false};
+    std::uint16_t flags{0};  // lower 3 bits: FieldValueType
+
+    [[nodiscard]] auto type() const -> FieldValueType {
+      return static_cast<FieldValueType>(flags & 0x07U);
+    }
+    auto set_type(FieldValueType t) -> void {
+      flags = static_cast<std::uint16_t>((flags & ~0x07U) | (static_cast<std::uint16_t>(t) & 0x07U));
+    }
   };
 
   struct ParsedEntryData {
-    std::uint32_t first_field{kInvalidParsedIndex};
+    std::uint32_t first_field_index{kInvalidParsedIndex};
     std::uint16_t field_count{0};
     std::uint32_t first_group{kInvalidParsedIndex};
     std::uint16_t group_count{0};
@@ -106,6 +110,11 @@ struct FieldValue {
     base::InlineSplitVector<ParsedFieldSlot, kParsedFieldSlotInlineCapacity> field_slots;
     base::InlineSplitVector<ParsedEntryData, kParsedEntryInlineCapacity> entries;
     base::InlineSplitVector<ParsedGroupFrame, kParsedGroupInlineCapacity> groups;
+    std::array<std::uint16_t, kFieldHashTableSize> field_hash_table;
+
+    ParsedMessageData() {
+      field_hash_table.fill(kInvalidHashSlot);
+    }
   };
 
 struct MessageData;
@@ -140,6 +149,9 @@ class ParsedMessage {
     auto RebindRaw(std::span<const std::byte> raw) -> void;
     [[nodiscard]] auto valid() const -> bool {
         return !data_.msg_type.empty() || data_.root.field_count != 0U || data_.root.group_count != 0U;
+    }
+    [[nodiscard]] auto mutable_data() -> ParsedMessageData& {
+        return data_;
     }
     [[nodiscard]] auto ToOwned() const -> Message;
 

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -55,6 +56,22 @@ struct Fix44BusinessOrder {
     std::string_view party_id;
     char party_id_source{'D'};
     std::int64_t party_role{0};
+};
+
+// Extracted business fields from a parsed NewOrderSingle.
+// String-view fields borrow from the parsed message's backing storage.
+struct ParsedOrder {
+    std::string_view cl_ord_id;
+    std::string_view symbol;
+    char side{'\0'};
+    std::string_view transact_time;
+    double order_qty{0.0};
+    char ord_type{'\0'};
+    double price{0.0};
+    bool has_price{false};
+    std::string_view party_id;
+    char party_id_source{'\0'};
+    int party_role{0};
 };
 
 struct BenchmarkResult {
@@ -387,6 +404,146 @@ inline auto ReportMetric(const std::string& label, const BenchmarkResult& result
         std::cout << ' ' << result.work_label << '=' << result.work_count
                   << ' ' << result.work_label << "_per_sec=" << std::fixed << std::setprecision(2)
                   << work_per_second;
+    }
+    std::cout << '\n';
+}
+
+struct LabeledResult {
+    std::string label;
+    BenchmarkResult result;
+};
+
+inline auto FormatNs(std::uint64_t ns) -> std::string {
+    if (ns >= 1'000'000U) {
+        const double ms = static_cast<double>(ns) / 1'000'000.0;
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.2f ms", ms);
+        return buf;
+    }
+    if (ns >= 1'000U) {
+        const double us = static_cast<double>(ns) / 1'000.0;
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.2f us", us);
+        return buf;
+    }
+    return std::to_string(ns) + " ns";
+}
+
+inline auto FormatCount(std::uint64_t count, std::uint64_t iterations) -> std::string {
+    if (iterations == 0U) {
+        return "0";
+    }
+    const double per_op = static_cast<double>(count) / static_cast<double>(iterations);
+    char buf[32];
+    if (per_op == std::floor(per_op)) {
+        std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(per_op));
+    } else {
+        std::snprintf(buf, sizeof(buf), "%.1f", per_op);
+    }
+    return buf;
+}
+
+inline auto FormatOpsPerSec(std::uint64_t total_ns, std::uint64_t iterations) -> std::string {
+    if (total_ns == 0U) {
+        return "0";
+    }
+    const double ops = (static_cast<double>(iterations) * 1'000'000'000.0) / static_cast<double>(total_ns);
+    char buf[32];
+    if (ops >= 1'000'000.0) {
+        std::snprintf(buf, sizeof(buf), "%.2fM", ops / 1'000'000.0);
+    } else if (ops >= 1'000.0) {
+        std::snprintf(buf, sizeof(buf), "%.1fK", ops / 1'000.0);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%.0f", ops);
+    }
+    return buf;
+}
+
+inline auto PrintResultTable(const std::vector<LabeledResult>& results) -> void {
+    struct Row {
+        std::string label;
+        std::string count;
+        std::string p50;
+        std::string p95;
+        std::string p99;
+        std::string alloc_per_op;
+        std::string ops_sec;
+        std::string cache_miss;
+        std::string branch_miss;
+    };
+
+    auto format_optional_counter = [](const std::optional<std::uint64_t>& v, std::uint64_t iters) -> std::string {
+        if (!v.has_value()) { return "n/a"; }
+        return FormatCount(v.value(), iters);
+    };
+
+    std::vector<Row> rows;
+    rows.reserve(results.size());
+    for (const auto& r : results) {
+        const auto p = SummarizePercentiles(r.result.samples_ns);
+        const auto iterations = static_cast<std::uint64_t>(r.result.samples_ns.size());
+        rows.push_back(Row{
+            .label = r.label,
+            .count = std::to_string(iterations),
+            .p50 = FormatNs(p.p50_ns),
+            .p95 = FormatNs(p.p95_ns),
+            .p99 = FormatNs(p.p99_ns),
+            .alloc_per_op = FormatCount(r.result.allocation_count, iterations),
+            .ops_sec = FormatOpsPerSec(r.result.wall_total_ns, iterations),
+            .cache_miss = format_optional_counter(r.result.cache_miss_count, iterations),
+            .branch_miss = format_optional_counter(r.result.branch_miss_count, iterations),
+        });
+    }
+
+    // Column widths.
+    std::size_t w_label = 6U;
+    std::size_t w_count = 5U;
+    std::size_t w_p50 = 3U;
+    std::size_t w_p95 = 3U;
+    std::size_t w_p99 = 3U;
+    std::size_t w_alloc = 9U;
+    std::size_t w_ops = 7U;
+    std::size_t w_cache = 10U;
+    std::size_t w_branch = 11U;
+    for (const auto& row : rows) {
+        w_label = std::max(w_label, row.label.size());
+        w_count = std::max(w_count, row.count.size());
+        w_p50 = std::max(w_p50, row.p50.size());
+        w_p95 = std::max(w_p95, row.p95.size());
+        w_p99 = std::max(w_p99, row.p99.size());
+        w_alloc = std::max(w_alloc, row.alloc_per_op.size());
+        w_ops = std::max(w_ops, row.ops_sec.size());
+        w_cache = std::max(w_cache, row.cache_miss.size());
+        w_branch = std::max(w_branch, row.branch_miss.size());
+    }
+
+    auto print_row = [&](const std::string& l, const std::string& c,
+                         const std::string& p50, const std::string& p95,
+                         const std::string& p99, const std::string& a,
+                         const std::string& o, const std::string& cm,
+                         const std::string& bm) {
+        std::cout << "  " << std::left << std::setw(static_cast<int>(w_label)) << l
+                  << "  " << std::right << std::setw(static_cast<int>(w_count)) << c
+                  << "  " << std::right << std::setw(static_cast<int>(w_p50)) << p50
+                  << "  " << std::right << std::setw(static_cast<int>(w_p95)) << p95
+                  << "  " << std::right << std::setw(static_cast<int>(w_p99)) << p99
+                  << "  " << std::right << std::setw(static_cast<int>(w_alloc)) << a
+                  << "  " << std::right << std::setw(static_cast<int>(w_ops)) << o
+                  << "  " << std::right << std::setw(static_cast<int>(w_cache)) << cm
+                  << "  " << std::right << std::setw(static_cast<int>(w_branch)) << bm
+                  << '\n';
+    };
+
+    auto print_separator = [&]() {
+        const auto total = 2U + w_label + 2U + w_count + 2U + w_p50 + 2U + w_p95 + 2U + w_p99 + 2U + w_alloc + 2U + w_ops + 2U + w_cache + 2U + w_branch;
+        std::cout << "  " << std::string(total - 2U, '-') << '\n';
+    };
+
+    std::cout << '\n';
+    print_row("Metric", "Count", "p50", "p95", "p99", "Alloc/op", "Ops/sec", "Cache/op", "Branch/op");
+    print_separator();
+    for (const auto& row : rows) {
+        print_row(row.label, row.count, row.p50, row.p95, row.p99, row.alloc_per_op, row.ops_sec, row.cache_miss, row.branch_miss);
     }
     std::cout << '\n';
 }

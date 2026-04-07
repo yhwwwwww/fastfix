@@ -30,6 +30,7 @@
 #include "fastfix/message/message.h"
 #include "fastfix/message/fixed_layout_writer.h"
 #include "fastfix/profile/normalized_dictionary.h"
+#include "sample_basic_builders.h"
 #include "fastfix/profile/profile_loader.h"
 #include "fastfix/session/admin_protocol.h"
 #include "fastfix/store/memory_store.h"
@@ -81,6 +82,28 @@ auto PopulateFix44MessageBuilder(fastfix::message::MessageBuilder& builder, cons
     party.set(448U, order.party_id)
         .set(447U, order.party_id_source)
         .set(452U, order.party_role);
+}
+
+auto ExtractOrderFromMessageView(fastfix::message::MessageView view) -> bench_support::ParsedOrder {
+    bench_support::ParsedOrder order;
+    if (auto v = view.get_string(11U)) { order.cl_ord_id = *v; }
+    if (auto v = view.get_string(55U)) { order.symbol = *v; }
+    if (auto v = view.get_char(54U))   { order.side = *v; }
+    if (auto v = view.get_string(60U)) { order.transact_time = *v; }
+    if (auto v = view.get_float(38U))  { order.order_qty = *v; }
+    if (auto v = view.get_char(40U))   { order.ord_type = *v; }
+    if (auto v = view.get_float(44U))  { order.price = *v; order.has_price = true; }
+    if (auto grp = view.raw_group(453U); grp.has_value() && grp->size() > 0U) {
+        auto entry = (*grp)[0U];
+        if (auto v = entry.field(448U)) { order.party_id = *v; }
+        if (auto v = entry.field(447U); v.has_value() && !v->empty()) {
+            order.party_id_source = (*v)[0];
+        }
+        if (auto v = entry.field(452U); v.has_value() && !v->empty()) {
+            order.party_role = static_cast<int>(*v->data() - '0');
+        }
+    }
+    return order;
 }
 
 auto BuildFix44MessageFromBusinessOrder(const Fix44BusinessOrder& order) -> fastfix::message::Message {
@@ -142,85 +165,11 @@ auto BuildFix44OrderAckFromNewOrder(
     return std::move(ack).build();
 }
 
-auto MakeEncodeTemplateConfig(const fastfix::codec::EncodeOptions& options) -> fastfix::codec::EncodeTemplateConfig {
-    fastfix::codec::EncodeTemplateConfig config;
-    config.begin_string = options.begin_string.empty() ? "FIX.4.4" : options.begin_string;
-    config.sender_comp_id = options.sender_comp_id;
-    config.target_comp_id = options.target_comp_id;
-    config.default_appl_ver_id = options.default_appl_ver_id;
-    config.delimiter = options.delimiter;
-    return config;
-}
-
-auto RunEncodeBufferBenchmark(
+auto RunEncodeBenchmark(
     const Fix44BusinessOrder& business_order,
     const fastfix::profile::NormalizedDictionaryView& dictionary,
     const fastfix::codec::EncodeOptions& base_options,
-    std::uint32_t iterations,
-    const fastfix::codec::FrameEncodeTemplate* precompiled_template = nullptr)
-    -> fastfix::base::Result<BenchmarkResult> {
-    BenchmarkResult result;
-    result.samples_ns.reserve(iterations);
-    BenchmarkMeasurement measurement;
-    fastfix::codec::EncodeBuffer encode_buffer;
-    auto options = base_options;
-    fastfix::message::MessageBuilder builder{"D"};
-    builder.reserve_fields(business_order.price.has_value() ? 7U : 6U).reserve_groups(1U).reserve_group_entries(453U, 1U);
-    for (std::uint32_t index = 0; index < iterations; ++index) {
-        const auto sample_started = std::chrono::steady_clock::now();
-        options.msg_seq_num = index + 1U;
-        builder.reset();
-        PopulateFix44MessageBuilder(builder, business_order);
-        auto status = precompiled_template == nullptr
-            ? fastfix::codec::EncodeFixMessageToBuffer(builder.view(), dictionary, options, &encode_buffer)
-            : precompiled_template->EncodeToBuffer(builder.view(), options, &encode_buffer);
-        if (!status.ok()) {
-            return status;
-        }
-        result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
-    }
-    measurement.Finish(result);
-    return result;
-}
-
-auto BuildFix44GenericOrderBuilder(const Fix44BusinessOrder& order) -> fastfix::message::MessageBuilder {
-    fastfix::message::MessageBuilder builder{"D"};
-    builder.reserve_fields(order.price.has_value() ? 7U : 6U).reserve_groups(1U).reserve_group_entries(453U, 1U);
-    PopulateFix44MessageBuilder(builder, order);
-    return builder;
-}
-
-auto RunGenericBuilderEncodeBufferBenchmark(
-    const Fix44BusinessOrder& business_order,
-    const fastfix::profile::NormalizedDictionaryView& dictionary,
-    const fastfix::codec::EncodeOptions& base_options,
-    std::uint32_t iterations,
-    const fastfix::codec::PrecompiledTemplateTable* precompiled = nullptr) -> fastfix::base::Result<BenchmarkResult> {
-    BenchmarkResult result;
-    result.samples_ns.reserve(iterations);
-    BenchmarkMeasurement measurement;
-    fastfix::codec::EncodeBuffer encode_buffer;
-    auto options = base_options;
-    for (std::uint32_t index = 0; index < iterations; ++index) {
-        const auto sample_started = std::chrono::steady_clock::now();
-        options.msg_seq_num = index + 1U;
-        auto builder = BuildFix44GenericOrderBuilder(business_order);
-        auto status = builder.encode_to_buffer(dictionary, options, &encode_buffer, precompiled);
-        if (!status.ok()) {
-            return status;
-        }
-        result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
-    }
-    measurement.Finish(result);
-    return result;
-}
-
-auto RunFixedLayoutBuilderEncodeBufferBenchmark(
-    const Fix44BusinessOrder& business_order,
-    const fastfix::profile::NormalizedDictionaryView& dictionary,
-    const fastfix::codec::EncodeOptions& base_options,
-    std::uint32_t iterations,
-    const fastfix::codec::PrecompiledTemplateTable* precompiled = nullptr) -> fastfix::base::Result<BenchmarkResult> {
+    std::uint32_t iterations) -> fastfix::base::Result<BenchmarkResult> {
     auto layout = fastfix::message::FixedLayout::Build(dictionary, "D");
     if (!layout.ok()) {
         return layout.status();
@@ -229,72 +178,27 @@ auto RunFixedLayoutBuilderEncodeBufferBenchmark(
     result.samples_ns.reserve(iterations);
     BenchmarkMeasurement measurement;
     fastfix::codec::EncodeBuffer encode_buffer;
+    fastfix::generated::profile_1001::NewOrderSingleWriter writer(layout.value());
     auto options = base_options;
     for (std::uint32_t index = 0; index < iterations; ++index) {
         const auto sample_started = std::chrono::steady_clock::now();
         options.msg_seq_num = index + 1U;
-        fastfix::message::FixedLayoutWriter writer(layout.value());
-        writer.set(11U, business_order.cl_ord_id);
-        writer.set(55U, business_order.symbol);
-        writer.set(54U, business_order.side);
-        writer.set(60U, business_order.transact_time.text);
-        writer.set(38U, business_order.order_qty);
-        writer.set(40U, business_order.ord_type);
+        writer.clear();
+        writer.set_cl_ord_id(business_order.cl_ord_id);
+        writer.set_symbol(business_order.symbol);
+        writer.set_side(business_order.side);
+        writer.set_transact_time(business_order.transact_time.text);
+        writer.set_order_qty(business_order.order_qty);
+        writer.set_ord_type(business_order.ord_type);
         if (business_order.price.has_value()) {
-            writer.set(44U, business_order.price.value());
+            writer.set_price(business_order.price.value());
         }
-        writer.reserve_group_entries(453U, 1U);
-        auto party = writer.add_group_entry(453U);
-        party.set(448U, business_order.party_id)
-            .set(447U, business_order.party_id_source)
-            .set(452U, business_order.party_role);
-        auto status = writer.encode_to_buffer(dictionary, options, &encode_buffer, precompiled);
-        if (!status.ok()) {
-            return status;
-        }
-        result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
-    }
-    measurement.Finish(result);
-    return result;
-}
-
-auto RunFixedLayoutHybridEncodeBufferBenchmark(
-    const Fix44BusinessOrder& business_order,
-    const fastfix::profile::NormalizedDictionaryView& dictionary,
-    const fastfix::codec::EncodeOptions& base_options,
-    std::uint32_t iterations,
-    const fastfix::codec::PrecompiledTemplateTable* precompiled = nullptr) -> fastfix::base::Result<BenchmarkResult> {
-    auto layout = fastfix::message::FixedLayout::Build(dictionary, "D");
-    if (!layout.ok()) {
-        return layout.status();
-    }
-    BenchmarkResult result;
-    result.samples_ns.reserve(iterations);
-    BenchmarkMeasurement measurement;
-    fastfix::codec::EncodeBuffer encode_buffer;
-    auto options = base_options;
-    for (std::uint32_t index = 0; index < iterations; ++index) {
-        const auto sample_started = std::chrono::steady_clock::now();
-        options.msg_seq_num = index + 1U;
-        fastfix::message::FixedLayoutWriter writer(layout.value());
-        writer.set(11U, business_order.cl_ord_id);
-        writer.set(55U, business_order.symbol);
-        writer.set(54U, business_order.side);
-        writer.set(60U, business_order.transact_time.text);
-        writer.set(38U, business_order.order_qty);
-        writer.set(40U, business_order.ord_type);
-        if (business_order.price.has_value()) {
-            writer.set(44U, business_order.price.value());
-        }
-        writer.reserve_group_entries(453U, 1U);
-        auto party = writer.add_group_entry(453U);
-        party.set(448U, business_order.party_id)
-            .set(447U, business_order.party_id_source)
-            .set(452U, business_order.party_role);
-        // Hybrid path: add extra fields not in the fixed layout.
-        writer.set_extra_string(58U, "benchmark-extra-text");
-        writer.set_extra_int(9999U, 42);
-        auto status = writer.encode_to_buffer(dictionary, options, &encode_buffer, precompiled);
+        writer.reserve_parties(1U);
+        writer.add_parties()
+            .set_party_id(business_order.party_id)
+            .set_party_id_source(business_order.party_id_source)
+            .set_party_role(business_order.party_role);
+        auto status = writer.encode_to_buffer(dictionary, options, &encode_buffer);
         if (!status.ok()) {
             return status;
         }
@@ -363,9 +267,7 @@ auto ActivateProtocolPair(
     return fastfix::base::Status::Ok();
 }
 
-auto ReportFastFixMetric(const std::string& label, const BenchmarkResult& result) -> void {
-    bench_support::ReportMetric(label, result, 44);
-}
+using bench_support::LabeledResult;
 
 auto RunLoopbackBenchmark(
     const fastfix::profile::NormalizedDictionaryView& dictionary,
@@ -1029,17 +931,13 @@ int main(int argc, char** argv) {
     }
 
     const auto fix44_business_order = BuildFix44BusinessOrder();
-    const auto fix44_business_order_no_price = BuildFix44BusinessOrder(false);
     const auto sample = BuildFix44MessageFromBusinessOrder(fix44_business_order);
-    const auto sample_no_price = BuildFix44MessageFromBusinessOrder(fix44_business_order_no_price);
     fastfix::codec::EncodeOptions options;
     options.begin_string = begin_string;
     options.sender_comp_id = "BUY";
     options.target_comp_id = "SELL";
     options.default_appl_ver_id = default_appl_ver_id;
-
-    auto fixed_time_options = options;
-    fixed_time_options.sending_time = "20260406-12:34:56.789";
+    options.sending_time = "20260406-12:34:56.789";
 
     auto warmup = fastfix::codec::EncodeFixMessage(sample, dictionary.value(), options);
     if (!warmup.ok()) {
@@ -1047,162 +945,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto precompiled_template = fastfix::codec::CompileFrameEncodeTemplate(
-        dictionary.value(), sample.view().msg_type(), MakeEncodeTemplateConfig(options));
-    if (!precompiled_template.ok()) {
-        std::cerr << precompiled_template.status().message() << '\n';
+    auto encode_result = RunEncodeBenchmark(
+        fix44_business_order, dictionary.value(), options, iterations);
+    if (!encode_result.ok()) {
+        std::cerr << encode_result.status().message() << '\n';
         return 1;
     }
 
-    fastfix::codec::EncodeBuffer split_warmup_buffer;
-    auto split_warmup = fastfix::codec::EncodeFixMessageToBuffer(sample, dictionary.value(), fixed_time_options, &split_warmup_buffer);
-    if (!split_warmup.ok()) {
-        std::cerr << split_warmup.message() << '\n';
-        return 1;
-    }
-    auto template_warmup = precompiled_template.value().EncodeToBuffer(sample, fixed_time_options, &split_warmup_buffer);
-    if (!template_warmup.ok()) {
-        std::cerr << template_warmup.message() << '\n';
-        return 1;
-    }
-    auto template_no_float_warmup = precompiled_template.value().EncodeToBuffer(sample_no_price, fixed_time_options, &split_warmup_buffer);
-    if (!template_no_float_warmup.ok()) {
-        std::cerr << template_no_float_warmup.message() << '\n';
-        return 1;
-    }
-
-    BenchmarkResult encode_result;
-    encode_result.samples_ns.reserve(iterations);
-    BenchmarkMeasurement encode_measurement;
-    for (std::uint32_t index = 0; index < iterations; ++index) {
-        const auto sample_started = std::chrono::steady_clock::now();
-        options.msg_seq_num = index + 1U;
-        auto business_message = BuildFix44MessageFromBusinessOrder(fix44_business_order);
-        auto encoded = fastfix::codec::EncodeFixMessage(business_message, dictionary.value(), options);
-        if (!encoded.ok()) {
-            std::cerr << encoded.status().message() << '\n';
-            return 1;
-        }
-        encode_result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
-    }
-    encode_measurement.Finish(encode_result);
-    ReportFastFixMetric("encode", encode_result);
-
-    auto encode_buffer_result = RunEncodeBufferBenchmark(fix44_business_order, dictionary.value(), options, iterations);
-    if (!encode_buffer_result.ok()) {
-        std::cerr << encode_buffer_result.status().message() << '\n';
-        return 1;
-    }
-    ReportFastFixMetric("encode-buffer", encode_buffer_result.value());
-
-    auto encode_buffer_fixed_time = RunEncodeBufferBenchmark(
-        fix44_business_order,
-        dictionary.value(),
-        fixed_time_options,
-        iterations);
-    if (!encode_buffer_fixed_time.ok()) {
-        std::cerr << encode_buffer_fixed_time.status().message() << '\n';
-        return 1;
-    }
-    ReportFastFixMetric("encode-buffer-time-fixed", encode_buffer_fixed_time.value());
-
-    auto encode_buffer_precompiled = RunEncodeBufferBenchmark(
-        fix44_business_order, dictionary.value(), options, iterations, &precompiled_template.value());
-    if (!encode_buffer_precompiled.ok()) {
-        std::cerr << encode_buffer_precompiled.status().message() << '\n';
-        return 1;
-    }
-    ReportFastFixMetric("encode-buffer-template", encode_buffer_precompiled.value());
-
-    auto encode_buffer_fixed_time_template = RunEncodeBufferBenchmark(
-        fix44_business_order,
-        dictionary.value(),
-        fixed_time_options,
-        iterations,
-        &precompiled_template.value());
-    if (!encode_buffer_fixed_time_template.ok()) {
-        std::cerr << encode_buffer_fixed_time_template.status().message() << '\n';
-        return 1;
-    }
-    ReportFastFixMetric("encode-buffer-time-fixed-template", encode_buffer_fixed_time_template.value());
-
-    auto encode_buffer_fixed_time_template_no_float = RunEncodeBufferBenchmark(
-        fix44_business_order_no_price,
-        dictionary.value(),
-        fixed_time_options,
-        iterations,
-        &precompiled_template.value());
-    if (!encode_buffer_fixed_time_template_no_float.ok()) {
-        std::cerr << encode_buffer_fixed_time_template_no_float.status().message() << '\n';
-        return 1;
-    }
-    ReportFastFixMetric(
-        "encode-buffer-time-fixed-template-no-float",
-        encode_buffer_fixed_time_template_no_float.value());
-
-    {
-        auto precompiled_table = fastfix::codec::PrecompiledTemplateTable::Build(
-            dictionary.value(), MakeEncodeTemplateConfig(options));
-        if (precompiled_table.ok()) {
-            BenchmarkResult table_result;
-            table_result.samples_ns.reserve(iterations);
-            BenchmarkMeasurement table_measurement;
-            fastfix::codec::EncodeBuffer table_buffer;
-            auto table_options = fixed_time_options;
-            for (std::uint32_t index = 0; index < iterations; ++index) {
-                const auto sample_started = std::chrono::steady_clock::now();
-                table_options.msg_seq_num = index + 1U;
-                auto business_message = BuildFix44MessageFromBusinessOrder(fix44_business_order);
-                auto status = fastfix::codec::EncodeFixMessageToBuffer(
-                    business_message,
-                    dictionary.value(),
-                    table_options,
-                    &table_buffer,
-                    &precompiled_table.value());
-                if (!status.ok()) {
-                    std::cerr << status.message() << '\n';
-                    return 1;
-                }
-                table_result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
-            }
-            table_measurement.Finish(table_result);
-            ReportFastFixMetric("encode-buffer-precompiled-table", table_result);
-        }
-    }
-
-    // Object-to-wire encode compare: three FastFix paths for FIX4.4 NewOrderSingle.
-    // Compare these against quickfix-encode / quickfix-encode-buffer from bench/quickfix_main.cpp.
-    std::cout << "encode-compare uses FIX4.4 NewOrderSingle (D) with fixed SendingTime and business-object to wire timing\n";
-    std::cout << "compare builder-generic-e2e-buffer / builder-fixed-layout-buffer / builder-fixed-layout-hybrid-buffer against QuickFIX encode metrics\n";
-
-    auto builder_precompiled = fastfix::codec::PrecompiledTemplateTable::Build(
-        dictionary.value(), MakeEncodeTemplateConfig(fixed_time_options));
-    const fastfix::codec::PrecompiledTemplateTable* builder_precompiled_ptr =
-        builder_precompiled.ok() ? &builder_precompiled.value() : nullptr;
-
-    auto generic_builder_result = RunGenericBuilderEncodeBufferBenchmark(
-        fix44_business_order, dictionary.value(), fixed_time_options, iterations, builder_precompiled_ptr);
-    if (!generic_builder_result.ok()) {
-        std::cerr << generic_builder_result.status().message() << '\n';
-        return 1;
-    }
-    ReportFastFixMetric("builder-generic-e2e-buffer", generic_builder_result.value());
-
-    auto fixed_layout_result = RunFixedLayoutBuilderEncodeBufferBenchmark(
-        fix44_business_order, dictionary.value(), fixed_time_options, iterations, builder_precompiled_ptr);
-    if (!fixed_layout_result.ok()) {
-        std::cerr << fixed_layout_result.status().message() << '\n';
-        return 1;
-    }
-    ReportFastFixMetric("builder-fixed-layout-buffer", fixed_layout_result.value());
-
-    auto hybrid_layout_result = RunFixedLayoutHybridEncodeBufferBenchmark(
-        fix44_business_order, dictionary.value(), fixed_time_options, iterations, builder_precompiled_ptr);
-    if (!hybrid_layout_result.ok()) {
-        std::cerr << hybrid_layout_result.status().message() << '\n';
-        return 1;
-    }
-    ReportFastFixMetric("builder-fixed-layout-hybrid-buffer", hybrid_layout_result.value());
+    std::vector<LabeledResult> results;
+    results.push_back({"encode", std::move(encode_result).value()});
 
     BenchmarkResult peek_result;
     peek_result.samples_ns.reserve(iterations);
@@ -1217,11 +968,12 @@ int main(int argc, char** argv) {
         peek_result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
     }
     peek_measurement.Finish(peek_result);
-    ReportFastFixMetric("peek", peek_result);
+    results.push_back({"peek", std::move(peek_result)});
 
     BenchmarkResult parse_result;
     parse_result.samples_ns.reserve(iterations);
     BenchmarkMeasurement parse_measurement;
+    double parse_sink = 0.0;
     for (std::uint32_t index = 0; index < iterations; ++index) {
         const auto sample_started = std::chrono::steady_clock::now();
         auto decoded = fastfix::codec::DecodeFixMessageView(warmup.value(), dictionary.value());
@@ -1229,10 +981,13 @@ int main(int argc, char** argv) {
             std::cerr << decoded.status().message() << '\n';
             return 1;
         }
+        const auto extracted = ExtractOrderFromMessageView(decoded.value().message.view());
         parse_result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
+        parse_sink += extracted.order_qty;
     }
     parse_measurement.Finish(parse_result);
-    ReportFastFixMetric("parse", parse_result);
+    static_cast<void>(parse_sink);
+    results.push_back({"parse", std::move(parse_result)});
 
     auto session_benchmark =
         RunSessionBenchmark(dictionary.value(), iterations, begin_string, default_appl_ver_id);
@@ -1240,7 +995,7 @@ int main(int argc, char** argv) {
         std::cerr << session_benchmark.status().message() << '\n';
         return 1;
     }
-    ReportFastFixMetric("session-inbound", session_benchmark.value());
+    results.push_back({"session-inbound", std::move(session_benchmark).value()});
 
     if (replay_iterations > 0U) {
         auto replay = RunReplayBenchmark(
@@ -1253,7 +1008,7 @@ int main(int argc, char** argv) {
             std::cerr << replay.status().message() << '\n';
             return 1;
         }
-        ReportFastFixMetric("replay", replay.value());
+        results.push_back({"replay", std::move(replay).value()});
     } else {
         std::cout << "replay skipped: --replay 0\n";
     }
@@ -1264,9 +1019,11 @@ int main(int argc, char** argv) {
             std::cerr << loopback.status().message() << '\n';
             return 1;
         }
-        ReportFastFixMetric("loopback-roundtrip", loopback.value());
+        results.push_back({"loopback-roundtrip", std::move(loopback).value()});
     } else {
         std::cout << "loopback skipped: --loopback 0\n";
     }
+
+    bench_support::PrintResultTable(results);
     return 0;
 }

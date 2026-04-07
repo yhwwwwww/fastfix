@@ -33,10 +33,12 @@ auto IsEncodeManagedTag(std::uint32_t tag) -> bool {
     }
 }
 
-auto MakeTagPrefix(std::uint32_t tag) -> std::string {
-    auto prefix = std::to_string(tag);
-    prefix.push_back('=');
-    return prefix;
+void SetEncodeStepPrefix(FixedLayout::EncodeStep& step, std::uint32_t tag) {
+    auto s = std::to_string(tag);
+    s.push_back('=');
+    const auto len = std::min(s.size(), step.prefix_data.size());
+    std::memcpy(step.prefix_data.data(), s.data(), len);
+    step.prefix_length = static_cast<std::uint8_t>(len);
 }
 
 void AppendTagToBuffer(std::string& buf, std::uint32_t tag) {
@@ -90,7 +92,7 @@ auto FixedLayout::Build(
         }
         EncodeStep step{};
         step.tag = rule.tag;
-        step.prefix = MakeTagPrefix(rule.tag);
+        SetEncodeStepPrefix(step, rule.tag);
         if (dictionary.find_group(rule.tag) != nullptr) {
             step.kind = EncodeStep::Kind::kGroup;
             for (const auto& gs : layout.group_slots_) {
@@ -215,68 +217,138 @@ FixedLayoutWriter::FixedLayoutWriter(const FixedLayout& layout)
     }
 }
 
-auto FixedLayoutWriter::set_string(std::uint32_t tag, std::string_view value) -> bool {
-    const auto idx = layout_->slot_index(tag);
-    if (idx < 0) return false;
-    const auto slot = static_cast<std::size_t>(idx);
-    slot_ranges_[slot] = SlotRange{
-        static_cast<std::uint32_t>(slot_buffer_.size()),
-        static_cast<std::uint16_t>(value.size())};
-    slot_buffer_.append(value);
-    return true;
+auto FixedLayoutWriter::clear() -> void {
+    // Reset slot ranges: keep capacity, set all lengths to 0.
+    for (std::size_t i = 0; i < slot_ranges_.size(); ++i) {
+        slot_ranges_[i] = SlotRange{};
+    }
+    slot_buffer_.clear();
+    extra_fields_buffer_.clear();
+    for (auto& g : groups_) {
+        // Clear entry strings but preserve their heap capacity for reuse.
+        for (std::size_t i = 0; i < g.active_count; ++i) {
+            g.entries[i].field_bytes.clear();
+        }
+        g.active_count = 0;
+    }
 }
 
-auto FixedLayoutWriter::set_int(std::uint32_t tag, std::int64_t value) -> bool {
+auto FixedLayoutWriter::bind_session(
+    std::string_view begin_string,
+    std::string_view sender_comp_id,
+    std::string_view target_comp_id) -> void {
+    session_bound_ = true;
+    auto& frag = session_header_;
+    frag.static_checksum = 0;
+
+    constexpr std::size_t kBLPlaceholderWidth = 10U;
+
+    // Build header_prefix: "8={bs}\x01 9=0000000000\x01 35={mt}\x01"
+    frag.header_prefix.clear();
+    frag.header_prefix.reserve(
+        2U + begin_string.size() + 1U +  // "8={bs}\x01"
+        2U + kBLPlaceholderWidth + 1U +   // "9=0000000000\x01"
+        layout_->msg_type_fragment_.size());
+
+    frag.header_prefix.append("8=");
+    frag.header_prefix.append(begin_string);
+    frag.header_prefix.push_back(codec::kFixSoh);
+    frag.header_prefix.append("9=");
+    frag.body_length_offset = frag.header_prefix.size();
+    frag.header_prefix.append("0000000000", kBLPlaceholderWidth);
+    frag.header_prefix.push_back(codec::kFixSoh);
+    frag.body_start_offset = frag.header_prefix.size();
+    frag.header_prefix.append(layout_->msg_type_fragment_);
+
+    // Build sender_target: "49={sender}\x01 56={target}\x01"
+    frag.sender_target.clear();
+    frag.sender_target.reserve(
+        3U + sender_comp_id.size() + 1U +
+        3U + target_comp_id.size() + 1U);
+    frag.sender_target.append("49=");
+    frag.sender_target.append(sender_comp_id);
+    frag.sender_target.push_back(codec::kFixSoh);
+    frag.sender_target.append("56=");
+    frag.sender_target.append(target_comp_id);
+    frag.sender_target.push_back(codec::kFixSoh);
+
+    // Pre-compute checksum for all static bytes.
+    frag.static_checksum = 0;
+    for (const auto ch : frag.header_prefix) {
+        frag.static_checksum += static_cast<unsigned char>(ch);
+    }
+    for (const auto ch : frag.sender_target) {
+        frag.static_checksum += static_cast<unsigned char>(ch);
+    }
+}
+
+auto FixedLayoutWriter::set_string(std::uint32_t tag, std::string_view value) -> FixedLayoutWriter& {
     const auto idx = layout_->slot_index(tag);
-    if (idx < 0) return false;
-    const auto slot = static_cast<std::size_t>(idx);
-    std::array<char, kIntBufSize> buf{};
-    const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), value);
-    if (ec == std::errc()) {
-        const auto len = static_cast<std::size_t>(ptr - buf.data());
+    if (idx >= 0) {
+        const auto slot = static_cast<std::size_t>(idx);
         slot_ranges_[slot] = SlotRange{
             static_cast<std::uint32_t>(slot_buffer_.size()),
-            static_cast<std::uint16_t>(len)};
-        slot_buffer_.append(buf.data(), len);
+            static_cast<std::uint16_t>(value.size())};
+        slot_buffer_.append(value);
     }
-    return true;
+    return *this;
 }
 
-auto FixedLayoutWriter::set_char(std::uint32_t tag, char value) -> bool {
+auto FixedLayoutWriter::set_int(std::uint32_t tag, std::int64_t value) -> FixedLayoutWriter& {
     const auto idx = layout_->slot_index(tag);
-    if (idx < 0) return false;
-    const auto slot = static_cast<std::size_t>(idx);
-    slot_ranges_[slot] = SlotRange{
-        static_cast<std::uint32_t>(slot_buffer_.size()), 1};
-    slot_buffer_.push_back(value);
-    return true;
+    if (idx >= 0) {
+        const auto slot = static_cast<std::size_t>(idx);
+        std::array<char, kIntBufSize> buf{};
+        const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), value);
+        if (ec == std::errc()) {
+            const auto len = static_cast<std::size_t>(ptr - buf.data());
+            slot_ranges_[slot] = SlotRange{
+                static_cast<std::uint32_t>(slot_buffer_.size()),
+                static_cast<std::uint16_t>(len)};
+            slot_buffer_.append(buf.data(), len);
+        }
+    }
+    return *this;
 }
 
-auto FixedLayoutWriter::set_float(std::uint32_t tag, double value) -> bool {
+auto FixedLayoutWriter::set_char(std::uint32_t tag, char value) -> FixedLayoutWriter& {
     const auto idx = layout_->slot_index(tag);
-    if (idx < 0) return false;
-    const auto slot = static_cast<std::size_t>(idx);
-    std::array<char, 32> buf{};
-    const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), value,
-                                          std::chars_format::general, 12);
-    if (ec == std::errc()) {
-        const auto len = static_cast<std::size_t>(ptr - buf.data());
+    if (idx >= 0) {
+        const auto slot = static_cast<std::size_t>(idx);
         slot_ranges_[slot] = SlotRange{
-            static_cast<std::uint32_t>(slot_buffer_.size()),
-            static_cast<std::uint16_t>(len)};
-        slot_buffer_.append(buf.data(), len);
+            static_cast<std::uint32_t>(slot_buffer_.size()), 1};
+        slot_buffer_.push_back(value);
     }
-    return true;
+    return *this;
 }
 
-auto FixedLayoutWriter::set_boolean(std::uint32_t tag, bool value) -> bool {
+auto FixedLayoutWriter::set_float(std::uint32_t tag, double value) -> FixedLayoutWriter& {
     const auto idx = layout_->slot_index(tag);
-    if (idx < 0) return false;
-    const auto slot = static_cast<std::size_t>(idx);
-    slot_ranges_[slot] = SlotRange{
-        static_cast<std::uint32_t>(slot_buffer_.size()), 1};
-    slot_buffer_.push_back(value ? 'Y' : 'N');
-    return true;
+    if (idx >= 0) {
+        const auto slot = static_cast<std::size_t>(idx);
+        std::array<char, 32> buf{};
+        const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), value,
+                                              std::chars_format::general, 12);
+        if (ec == std::errc()) {
+            const auto len = static_cast<std::size_t>(ptr - buf.data());
+            slot_ranges_[slot] = SlotRange{
+                static_cast<std::uint32_t>(slot_buffer_.size()),
+                static_cast<std::uint16_t>(len)};
+            slot_buffer_.append(buf.data(), len);
+        }
+    }
+    return *this;
+}
+
+auto FixedLayoutWriter::set_boolean(std::uint32_t tag, bool value) -> FixedLayoutWriter& {
+    const auto idx = layout_->slot_index(tag);
+    if (idx >= 0) {
+        const auto slot = static_cast<std::size_t>(idx);
+        slot_ranges_[slot] = SlotRange{
+            static_cast<std::uint32_t>(slot_buffer_.size()), 1};
+        slot_buffer_.push_back(value ? 'Y' : 'N');
+    }
+    return *this;
 }
 
 // ---------------------------------------------------------------------------
@@ -330,12 +402,19 @@ auto FixedLayoutWriter::set_extra_boolean(std::uint32_t tag, bool value) -> void
 auto FixedLayoutWriter::add_group_entry(std::uint32_t count_tag) -> FixedGroupEntryBuilder {
     for (auto& g : groups_) {
         if (g.count_tag == count_tag) {
+            if (g.active_count < g.entries.size()) {
+                // Reuse existing entry (preserves string capacity).
+                auto& entry = g.entries[g.active_count++];
+                return FixedGroupEntryBuilder(&entry.field_bytes);
+            }
             g.entries.push_back(GroupEntryData{});
+            ++g.active_count;
             return FixedGroupEntryBuilder(&g.entries.back().field_bytes);
         }
     }
     groups_.push_back(GroupEncodeData{.count_tag = count_tag});
     groups_.back().entries.push_back(GroupEntryData{});
+    groups_.back().active_count = 1;
     return FixedGroupEntryBuilder(&groups_.back().entries.back().field_bytes);
 }
 
@@ -346,7 +425,7 @@ auto FixedLayoutWriter::reserve_group_entries(std::uint32_t count_tag, std::size
             return;
         }
     }
-    groups_.push_back(GroupEncodeData{.count_tag = count_tag});
+    groups_.push_back(GroupEncodeData{.count_tag = count_tag, .entries = {}, .active_count = 0});
     groups_.back().entries.reserve(count);
 }
 
@@ -373,41 +452,71 @@ auto FixedLayoutWriter::encode_to_buffer(
         checksum += static_cast<unsigned char>(ch);
     };
 
-    // 1. BeginString: 8={begin_string}\x01  9=
-    at("8=");
-    at(options.begin_string);
-    ac(delimiter);
-    at("9=");
-
-    // 2. BodyLength placeholder (10 chars reserved)
     constexpr std::size_t kBLPlaceholderWidth = 10U;
-    const auto bl_offset = out.size();
-    at(std::string_view("0000000000", kBLPlaceholderWidth));
-    ac(delimiter);
-    const auto body_start = out.size();
+    std::size_t bl_offset = 0;
+    std::size_t body_start = 0;
 
-    // 3. MsgType
-    at(layout_->msg_type_fragment_);
+    if (session_bound_ && delimiter == codec::kFixSoh) {
+        // --- Fast path: use pre-built session header fragments ---
+        const auto& frag = session_header_;
 
-    // 4. MsgSeqNum
-    {
-        const auto seq = options.msg_seq_num == 0U ? 1U : options.msg_seq_num;
-        std::array<char, kUintBufSize> buf{};
-        const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), seq);
-        at("34=");
-        if (ec == std::errc()) at(std::string_view(buf.data(), static_cast<std::size_t>(ptr - buf.data())));
+        // 1-3. Header prefix (BeginString + BodyLength placeholder + MsgType) — memcpy
+        out.append(frag.header_prefix);
+        bl_offset = frag.body_length_offset;
+        body_start = frag.body_start_offset;
+        checksum = frag.static_checksum;  // includes header_prefix + sender_target
+
+        // 4. MsgSeqNum (dynamic)
+        {
+            const auto seq = options.msg_seq_num == 0U ? 1U : options.msg_seq_num;
+            std::array<char, kUintBufSize> buf{};
+            const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), seq);
+            at("34=");
+            if (ec == std::errc()) at(std::string_view(buf.data(), static_cast<std::size_t>(ptr - buf.data())));
+            ac(delimiter);
+        }
+
+        // 5-6. SenderCompID + TargetCompID — memcpy from pre-built fragment
+        //      (checksum already included via static_checksum)
+        out.append(frag.sender_target);
+    } else {
+        // --- Slow path: format each header field individually ---
+
+        // 1. BeginString: 8={begin_string}\x01  9=
+        at("8=");
+        at(options.begin_string);
+        ac(delimiter);
+        at("9=");
+
+        // 2. BodyLength placeholder (10 chars reserved)
+        bl_offset = out.size();
+        at(std::string_view("0000000000", kBLPlaceholderWidth));
+        ac(delimiter);
+        body_start = out.size();
+
+        // 3. MsgType
+        at(layout_->msg_type_fragment_);
+
+        // 4. MsgSeqNum
+        {
+            const auto seq = options.msg_seq_num == 0U ? 1U : options.msg_seq_num;
+            std::array<char, kUintBufSize> buf{};
+            const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), seq);
+            at("34=");
+            if (ec == std::errc()) at(std::string_view(buf.data(), static_cast<std::size_t>(ptr - buf.data())));
+            ac(delimiter);
+        }
+
+        // 5. SenderCompID
+        at("49=");
+        at(options.sender_comp_id);
+        ac(delimiter);
+
+        // 6. TargetCompID
+        at("56=");
+        at(options.target_comp_id);
         ac(delimiter);
     }
-
-    // 5. SenderCompID
-    at("49=");
-    at(options.sender_comp_id);
-    ac(delimiter);
-
-    // 6. TargetCompID
-    at("56=");
-    at(options.target_comp_id);
-    ac(delimiter);
 
     // 7. SendingTime
     codec::UtcTimestampBuffer ts_buf;
@@ -443,7 +552,7 @@ auto FixedLayoutWriter::encode_to_buffer(
         if (step.kind == FixedLayout::EncodeStep::Kind::kField) {
             const auto& range = slot_ranges_[step.slot_index];
             if (range.length > 0) {
-                at(step.prefix);
+                at(step.prefix());
                 at(std::string_view(slot_buffer_.data() + range.offset, range.length));
                 ac(delimiter);
             }
@@ -452,17 +561,18 @@ auto FixedLayoutWriter::encode_to_buffer(
             for (const auto& g : groups_) {
                 if (g.count_tag == step.tag) {
                     // Write "TAG=count\x01"
-                    at(step.prefix);
+                    at(step.prefix());
                     std::array<char, kUintBufSize> count_buf{};
                     const auto [count_ptr, count_ec] = std::to_chars(
-                        count_buf.data(), count_buf.data() + count_buf.size(), g.entries.size());
+                        count_buf.data(), count_buf.data() + count_buf.size(), g.active_count);
                     if (count_ec == std::errc()) {
                         at(std::string_view(count_buf.data(),
                             static_cast<std::size_t>(count_ptr - count_buf.data())));
                     }
                     ac(delimiter);
                     // Write each entry's pre-formatted bytes.
-                    for (const auto& entry : g.entries) {
+                    for (std::size_t ei = 0; ei < g.active_count; ++ei) {
+                        const auto& entry = g.entries[ei];
                         if (delimiter == codec::kFixSoh) {
                             at(entry.field_bytes);
                         } else {
@@ -502,17 +612,22 @@ auto FixedLayoutWriter::encode_to_buffer(
         const auto body_length = static_cast<std::uint32_t>(out.size() - body_start);
         std::array<char, kUintBufSize> buf{};
         const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), body_length);
-        if (ec == std::errc()) {
-            const auto len = static_cast<std::size_t>(ptr - buf.data());
-            // Adjust checksum: subtract placeholder, add real value.
-            for (std::size_t i = 0; i < kBLPlaceholderWidth; ++i) {
-                checksum -= static_cast<unsigned char>(out[bl_offset + i]);
-            }
-            for (std::size_t i = 0; i < len; ++i) {
-                checksum += static_cast<unsigned char>(buf[i]);
-            }
-            out.replace(bl_offset, kBLPlaceholderWidth, buf.data(), len);
+        if (ec != std::errc()) {
+            return base::Status::FormatError("BodyLength conversion failed");
         }
+        const auto len = static_cast<std::size_t>(ptr - buf.data());
+        if (len > kBLPlaceholderWidth) {
+            return base::Status::FormatError(
+                "encoded body length exceeds BodyLength placeholder width");
+        }
+        // Adjust checksum: subtract placeholder, add real value.
+        for (std::size_t i = 0; i < kBLPlaceholderWidth; ++i) {
+            checksum -= static_cast<unsigned char>(out[bl_offset + i]);
+        }
+        for (std::size_t i = 0; i < len; ++i) {
+            checksum += static_cast<unsigned char>(buf[i]);
+        }
+        out.replace(bl_offset, kBLPlaceholderWidth, buf.data(), len);
     }
 
     // 13. Trailer: 10=NNN\x01  (NOT included in checksum)

@@ -7,11 +7,19 @@
 
 namespace fastfix::store {
 
+enum class SyncPolicy {
+    kNone,         // OS page-cache flush only; no explicit sync.
+    kEveryWrite,   // fdatasync after every pwrite (safest, default).
+    kBatchFlush,   // Caller-initiated flush via Flush().
+};
+
 class MmapSessionStore : public SessionStore {
   public:
     struct Impl;
 
-    explicit MmapSessionStore(std::filesystem::path path);
+    explicit MmapSessionStore(
+        std::filesystem::path path,
+        SyncPolicy sync_policy = SyncPolicy::kEveryWrite);
     ~MmapSessionStore() override;
 
     auto Open() -> base::Status;
@@ -32,12 +40,16 @@ class MmapSessionStore : public SessionStore {
     auto LoadRecoveryState(std::uint64_t session_id) const
         -> base::Result<SessionRecoveryState> override;
 
+    auto Flush() -> base::Status;
+
   private:
     auto AppendOutboundLike(std::uint32_t record_type, const MessageRecord& record) -> base::Status;
     auto AppendOutboundLikeView(std::uint32_t record_type, const MessageRecordView& record) -> base::Status;
     auto AppendRecoveryState(const SessionRecoveryState& state) -> base::Status;
+    auto EnsureMapping() -> base::Status;
 
     std::filesystem::path path_;
+    SyncPolicy sync_policy_;
     std::unique_ptr<Impl> impl_;
 };
 

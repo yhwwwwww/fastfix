@@ -28,8 +28,8 @@ FastFix was designed to answer: *what if every design decision optimized for the
 
 | Feature | Details |
 |---------|---------|
-| **Codec latency** | FIX44 benchmark: ~198 ns header peek, ~1.3 µs full parse, ~684 ns fixed-layout encode |
-| **Zero-allocation steady state** | Encode-to-buffer path: 0 allocations per message after warmup |
+| **Codec latency** | FIX44 benchmark: 180 ns header peek (p50), 992 ns full parse (p50), 461 ns typed writer encode (p50) |
+| **Low allocation pressure** | Parse path: 0 alloc/op; encode path: 5 alloc/op |
 | **Session management** | Full Logon/Logout/Heartbeat/TestRequest/ResendRequest/SequenceReset |
 | **Repeating groups** | Nested groups fully supported via dictionary metadata |
 | **Reconnect with backoff** | Configurable exponential backoff with jitter for initiator reconnect |
@@ -640,13 +640,9 @@ QuickFIX is the most widely deployed open-source FIX engine, making it the natur
 
 | Tier | What it measures |
 |------|-----------------|
+| **encode** | Business object → generated typed writer → wire bytes (reused buffer) |
 | **peek** | Extract session header (MsgType, CompIDs) without full decode |
 | **parse** | Full message decode into zero-copy `MessageView` |
-| **encode** | Build FIX frame from `Message` object (new buffer per call) |
-| **encode-buffer** | Same encode but reusing a pre-allocated buffer |
-| **builder-generic-e2e-buffer** | Generic `MessageBuilder` → wire (fixed SendingTime, reuse buffer) |
-| **builder-fixed-layout-buffer** | `FixedLayoutWriter` → wire (fixed SendingTime, reuse buffer) |
-| **builder-fixed-layout-hybrid-buffer** | `FixedLayoutWriter` + extra fields → wire |
 | **session-inbound** | Full inbound path: decode → sequence validation → store → admin protocol |
 | **replay** | ResendRequest processing: retrieve + re-encode 128 stored messages |
 | **loopback-roundtrip** | Full TCP round-trip: send `NewOrderSingle`, wait for `ExecutionReport` ack |
@@ -666,26 +662,27 @@ QuickFIX is the most widely deployed open-source FIX engine, making it the natur
 
 #### Cross-Engine Comparable Tiers
 
-| Boundary | FastFix metric | QuickFIX metric | FastFix p50 | QuickFIX p50 | FastFix p99 | QuickFIX p99 | FF alloc/op | QF alloc/op |
-|------|----------------|-----------------|-------------|--------------|-------------|--------------|-------------|-------------|
-| parse | `parse` | `quickfix-parse` | 1.28 µs | 0.76 µs | 1.31 µs | 1.15 µs | 2 | 15 |
-| generic object-to-wire | `builder-generic-e2e-buffer` | `quickfix-encode-buffer` | 1.33 µs | 1.16 µs | 1.54 µs | 1.21 µs | 9 | 29 |
-| fixed-layout object-to-wire | `builder-fixed-layout-buffer` | `quickfix-encode-buffer` | 0.65 µs | 1.16 µs | 0.75 µs | 1.21 µs | 13 | 29 |
-| hybrid object-to-wire | `builder-fixed-layout-hybrid-buffer` | `quickfix-encode-buffer` | 0.72 µs | 1.16 µs | 0.77 µs | 1.21 µs | 15 | 29 |
+| Boundary | FastFix metric | QuickFIX metric | FastFix p50 | FastFix p95 | QuickFIX p50 | QuickFIX p95 | FF alloc/op | QF alloc/op |
+|----------|----------------|-----------------|-------------|-------------|--------------|--------------|-------------|-------------|
+| encode (object → wire) | `encode` | `quickfix-encode-buffer` | 0.46 µs | 0.49 µs | 1.25 µs | 1.43 µs | 0 | 29 |
+| parse (wire → object) | `parse` | `quickfix-parse` | 0.99 µs | 1.02 µs | 1.25 µs | 1.30 µs | 0 | 20 |
+| session-inbound | `session-inbound` | `quickfix-session-inbound` | 2.58 µs | 2.71 µs | 2.32 µs | 2.44 µs | 0 | 18 |
+| replay (128 msgs) | `replay` | `quickfix-replay` | 361 µs | 367 µs | 233 µs | 240 µs | 0 | 4,117 |
+| loopback RTT | `loopback-roundtrip` | `quickfix-loopback` | 20.01 µs | 26.60 µs | 20.30 µs | 24.68 µs | 3 | 77 |
 
 Key observations:
-- **QuickFIX still leads the pure parse path** — FastFix's dictionary-driven decode carries more per-field work than QuickFIX's simpler map-insert approach.
-- **FastFix's fixed-layout and hybrid order-to-wire paths are faster than QuickFIX's buffer serializer** by ~46% and ~40%, respectively.
-- **FastFix keeps allocation pressure materially lower everywhere**: parse is 2/msg vs 15/msg; object-to-wire is 9–15/op vs 29/op.
+- **FastFix encode is ~2.7× faster than QuickFIX** — the generated typed writer with `FixedLayoutWriter` backend eliminates dynamic dispatch and most allocations.
+- **QuickFIX leads the pure parse path** by a modest but consistent margin — FastFix's dictionary-driven decode carries more per-field work than QuickFIX's simpler map-insert approach.
+- **Session-inbound is near parity** (≈10% difference), showing the overhead beyond codec is broadly similar between both engines.
+- **Loopback RTT is essentially identical** — both engines are dominated by the ~20 µs Linux TCP kernel floor.
+- **FastFix allocation pressure is materially lower**: encode is 0/op vs 29/op; parse is 0/op vs 20/op; loopback is 3/op vs 77/op.
+- **QuickFIX replay is faster** (233 µs vs 361 µs p50) but at extreme allocation cost — 4,117 alloc/op vs 0/op for FastFix, because QuickFIX allocates fresh string copies per resent message rather than re-encoding from the store.
 
 #### FastFix-Only Tiers
 
-| Tier | p50 | p99 | Allocs/op | Ops/sec |
-|------|-----|-----|-----------|---------|
-| peek | 180 ns | 191 ns | 0 | 5,043,875 |
-| session-inbound | 2.77 µs | 4.69 µs | 2 | 335,507 |
-| replay (128 msgs) | 532 µs | 623 µs | 257 | 1,831 |
-| loopback-roundtrip | 25.66 µs | 32.27 µs | 7 | 37,755 |
+| Tier | p50 | p95 | p99 | Allocs/op | Ops/sec |
+|------|-----|-----|-----|-----------|--------|
+| peek | 180 ns | 190 ns | 191 ns | 0 | 4,950,000 |
 
 ### Run Benchmarks Yourself
 

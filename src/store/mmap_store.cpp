@@ -128,8 +128,12 @@ auto PayloadAt(const MmapSessionStore::Impl& impl, std::uint64_t offset) -> cons
 
 }  // namespace
 
-MmapSessionStore::MmapSessionStore(std::filesystem::path path)
-    : path_(std::move(path)), impl_(std::make_unique<Impl>()) {
+MmapSessionStore::MmapSessionStore(
+    std::filesystem::path path,
+    SyncPolicy sync_policy)
+    : path_(std::move(path)),
+      sync_policy_(sync_policy),
+      impl_(std::make_unique<Impl>()) {
 }
 
 MmapSessionStore::~MmapSessionStore() = default;
@@ -158,6 +162,11 @@ auto MmapSessionStore::Open() -> base::Status {
         }
         if (::pwrite(impl_->fd, &header, sizeof(header), 0) != static_cast<ssize_t>(sizeof(header))) {
             return base::Status::IoError(IoErrorMessage(path_, "unable to initialize mmap store"));
+        }
+        if (sync_policy_ == SyncPolicy::kEveryWrite) {
+            if (::fdatasync(impl_->fd) != 0) {
+                return base::Status::IoError(IoErrorMessage(path_, "unable to fdatasync mmap store"));
+            }
         }
     }
 
@@ -290,6 +299,12 @@ auto MmapSessionStore::AppendOutboundLikeView(std::uint32_t record_type, const M
         return base::Status::IoError(IoErrorMessage(path_, "unable to update mmap store header"));
     }
 
+    if (sync_policy_ == SyncPolicy::kEveryWrite) {
+        if (::fdatasync(impl_->fd) != 0) {
+            return base::Status::IoError(IoErrorMessage(path_, "unable to fdatasync mmap store"));
+        }
+    }
+
     status = Open();
     if (!status.ok()) {
         return status;
@@ -337,6 +352,12 @@ auto MmapSessionStore::AppendRecoveryState(const SessionRecoveryState& state) ->
         return base::Status::IoError(IoErrorMessage(path_, "unable to update mmap store header"));
     }
 
+    if (sync_policy_ == SyncPolicy::kEveryWrite) {
+        if (::fdatasync(impl_->fd) != 0) {
+            return base::Status::IoError(IoErrorMessage(path_, "unable to fdatasync mmap store"));
+        }
+    }
+
     status = Open();
     if (!status.ok()) {
         return status;
@@ -361,6 +382,23 @@ auto MmapSessionStore::SaveInboundView(const MessageRecordView& record) -> base:
     return AppendOutboundLikeView(static_cast<std::uint32_t>(StoreRecordType::kInbound), record);
 }
 
+auto MmapSessionStore::EnsureMapping() -> base::Status {
+    if (impl_->fd < 0 || impl_->mapping == nullptr) {
+        return Open();
+    }
+
+    struct stat stat_buffer {};
+    if (::fstat(impl_->fd, &stat_buffer) != 0) {
+        return base::Status::IoError(IoErrorMessage(path_, "unable to stat mmap store"));
+    }
+
+    if (static_cast<std::size_t>(stat_buffer.st_size) != impl_->mapping_size) {
+        return Open();
+    }
+
+    return base::Status::Ok();
+}
+
 auto MmapSessionStore::LoadOutboundRange(
     std::uint64_t session_id,
     std::uint32_t begin_seq,
@@ -369,7 +407,7 @@ auto MmapSessionStore::LoadOutboundRange(
         return base::Status::InvalidArgument("invalid outbound load range");
     }
 
-    auto status = const_cast<MmapSessionStore*>(this)->Open();
+    auto status = const_cast<MmapSessionStore*>(this)->EnsureMapping();
     if (!status.ok()) {
         return status;
     }
@@ -407,7 +445,7 @@ auto MmapSessionStore::LoadOutboundRangeViews(
         return base::Status::InvalidArgument("invalid outbound load range");
     }
 
-    auto status = const_cast<MmapSessionStore*>(this)->Open();
+    auto status = const_cast<MmapSessionStore*>(this)->EnsureMapping();
     if (!status.ok()) {
         return status;
     }
@@ -452,6 +490,16 @@ auto MmapSessionStore::LoadRecoveryState(std::uint64_t session_id) const
     }
 
     return it->second;
+}
+
+auto MmapSessionStore::Flush() -> base::Status {
+    if (impl_->fd < 0) {
+        return base::Status::IoError("mmap store is not open");
+    }
+    if (::fdatasync(impl_->fd) != 0) {
+        return base::Status::IoError(IoErrorMessage(path_, "unable to fdatasync mmap store"));
+    }
+    return base::Status::Ok();
 }
 
 }  // namespace fastfix::store

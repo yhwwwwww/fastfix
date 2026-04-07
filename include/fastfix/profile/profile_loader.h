@@ -21,4 +21,6 @@ auto LoadProfileFromDictionary(const NormalizedDictionary& dictionary) -> base::
 
 auto LoadProfileFromDictionaryFiles(std::span<const std::filesystem::path> paths) -> base::Result<LoadedProfile>;
 
+auto ValidateSchemaHash(const LoadedProfile& profile, std::uint64_t expected_hash) -> base::Status;
+
 }  // namespace fastfix::profile

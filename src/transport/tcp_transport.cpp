@@ -312,6 +312,11 @@ auto TcpConnection::TryReceiveFrameView() -> base::Result<std::optional<std::spa
         }
 
         read_buffer_.insert(read_buffer_.end(), buffer, buffer + rc);
+
+        if (read_buffer_.size() > kMaxReadBufferSize) {
+            Close();
+            return base::Status::IoError("TCP read buffer exceeded maximum size limit");
+        }
     }
 }
 
@@ -352,6 +357,11 @@ auto TcpConnection::ReceiveFrameView(std::chrono::milliseconds timeout) -> base:
         }
 
         read_buffer_.insert(read_buffer_.end(), buffer, buffer + rc);
+
+        if (read_buffer_.size() > kMaxReadBufferSize) {
+            Close();
+            return base::Status::IoError("TCP read buffer exceeded maximum size limit");
+        }
     }
 }
 

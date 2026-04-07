@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -26,7 +27,11 @@ class FixedLayout {
         Kind kind;
         std::uint32_t tag;
         std::uint32_t slot_index;
-        std::string prefix;  // Pre-computed "TAG=" string (e.g. "49=", "5001=")
+        std::array<char, 16> prefix_data{};   // "TAG=" chars (e.g. "49=", "5001=")
+        std::uint8_t prefix_length{0};
+        [[nodiscard]] auto prefix() const -> std::string_view {
+            return {prefix_data.data(), prefix_length};
+        }
     };
 
     static auto Build(
@@ -75,6 +80,7 @@ struct GroupEntryData {
 struct GroupEncodeData {
     std::uint32_t count_tag;
     std::vector<GroupEntryData> entries;
+    std::size_t active_count{0};  // Number of entries in use (allows reuse without dealloc)
 };
 
 /// Fixed-layout group entry builder -- appends "tag=value\x01" directly to a buffer.
@@ -102,22 +108,33 @@ class FixedGroupEntryBuilder {
 
 /// Writer that uses pre-allocated slots for O(1) field writes.
 /// Construct from a `FixedLayout`, populate fields, then `encode_to_buffer()`.
+/// Supports reuse via `clear()` and session-constant pre-baking via `bind_session()`.
 class FixedLayoutWriter {
   public:
     explicit FixedLayoutWriter(const FixedLayout& layout);
 
-    // O(1) setters -- write directly to slot at known index.
-    auto set_string(std::uint32_t tag, std::string_view value) -> bool;
-    auto set_int(std::uint32_t tag, std::int64_t value) -> bool;
-    auto set_char(std::uint32_t tag, char value) -> bool;
-    auto set_float(std::uint32_t tag, double value) -> bool;
-    auto set_boolean(std::uint32_t tag, bool value) -> bool;
+    /// Reset all field data for reuse without reallocating internal buffers.
+    auto clear() -> void;
 
-    auto set(std::uint32_t tag, std::string_view value) -> bool { return set_string(tag, value); }
-    auto set(std::uint32_t tag, std::int64_t value) -> bool { return set_int(tag, value); }
-    auto set(std::uint32_t tag, char value) -> bool { return set_char(tag, value); }
-    auto set(std::uint32_t tag, double value) -> bool { return set_float(tag, value); }
-    auto set(std::uint32_t tag, bool value) -> bool { return set_boolean(tag, value); }
+    /// Pre-bake session-constant fields (BeginString, SenderCompID, TargetCompID)
+    /// into a header fragment so that `encode_to_buffer()` uses memcpy instead of
+    /// per-field formatting.  The binding survives `clear()`.
+    auto bind_session(std::string_view begin_string,
+                      std::string_view sender_comp_id,
+                      std::string_view target_comp_id) -> void;
+
+    // O(1) setters -- write directly to slot at known index.
+    auto set_string(std::uint32_t tag, std::string_view value) -> FixedLayoutWriter&;
+    auto set_int(std::uint32_t tag, std::int64_t value) -> FixedLayoutWriter&;
+    auto set_char(std::uint32_t tag, char value) -> FixedLayoutWriter&;
+    auto set_float(std::uint32_t tag, double value) -> FixedLayoutWriter&;
+    auto set_boolean(std::uint32_t tag, bool value) -> FixedLayoutWriter&;
+
+    auto set(std::uint32_t tag, std::string_view value) -> FixedLayoutWriter& { return set_string(tag, value); }
+    auto set(std::uint32_t tag, std::int64_t value) -> FixedLayoutWriter& { return set_int(tag, value); }
+    auto set(std::uint32_t tag, char value) -> FixedLayoutWriter& { return set_char(tag, value); }
+    auto set(std::uint32_t tag, double value) -> FixedLayoutWriter& { return set_float(tag, value); }
+    auto set(std::uint32_t tag, bool value) -> FixedLayoutWriter& { return set_boolean(tag, value); }
 
     /// Add a group entry, returning a builder for populating entry fields.
     auto add_group_entry(std::uint32_t count_tag) -> FixedGroupEntryBuilder;
@@ -157,11 +174,21 @@ class FixedLayoutWriter {
         std::uint16_t length{0};  // 0 means unset
     };
 
+    struct SessionHeaderFragment {
+        std::string header_prefix;       // "8={bs}\x01 9=0000000000\x01 35={mt}\x01"
+        std::string sender_target;       // "49={sender}\x01 56={target}\x01"
+        std::uint32_t static_checksum{0}; // Checksum of header_prefix + sender_target bytes
+        std::size_t body_length_offset{0}; // Offset of placeholder within header_prefix
+        std::size_t body_start_offset{0};  // Offset right after "9=...\x01"
+    };
+
     const FixedLayout* layout_;
     std::string slot_buffer_;
     base::InlineSplitVector<SlotRange, 64> slot_ranges_;
     std::string extra_fields_buffer_;  // Pre-formatted "tag=value\x01" for hybrid-path fields.
     std::vector<GroupEncodeData> groups_;
+    SessionHeaderFragment session_header_;
+    bool session_bound_{false};
 };
 
 }  // namespace fastfix::message

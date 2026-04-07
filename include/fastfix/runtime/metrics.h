@@ -1,7 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -12,34 +15,62 @@ namespace fastfix::runtime {
 struct SessionMetrics {
     std::uint64_t session_id{0};
     std::uint32_t worker_id{0};
-    std::uint64_t inbound_messages{0};
-    std::uint64_t outbound_messages{0};
-    std::uint64_t admin_messages{0};
-    std::uint64_t resend_requests{0};
-    std::uint64_t gap_fills{0};
-    std::uint64_t parse_failures{0};
-    std::uint64_t checksum_failures{0};
-    std::uint32_t outbound_queue_depth{0};
-    std::uint64_t last_store_flush_latency_ns{0};
+    std::atomic<std::uint64_t> inbound_messages{0};
+    std::atomic<std::uint64_t> outbound_messages{0};
+    std::atomic<std::uint64_t> admin_messages{0};
+    std::atomic<std::uint64_t> resend_requests{0};
+    std::atomic<std::uint64_t> gap_fills{0};
+    std::atomic<std::uint64_t> parse_failures{0};
+    std::atomic<std::uint64_t> checksum_failures{0};
+    std::atomic<std::uint32_t> outbound_queue_depth{0};
+    std::atomic<std::uint64_t> last_store_flush_latency_ns{0};
 };
 
 struct WorkerMetrics {
     std::uint32_t worker_id{0};
-    std::uint64_t registered_sessions{0};
-    std::uint64_t inbound_messages{0};
-    std::uint64_t outbound_messages{0};
-    std::uint64_t admin_messages{0};
-    std::uint64_t resend_requests{0};
-    std::uint64_t gap_fills{0};
-    std::uint64_t parse_failures{0};
-    std::uint64_t checksum_failures{0};
-    std::uint64_t outbound_queue_depth{0};
-    std::uint64_t last_store_flush_latency_ns{0};
+    std::atomic<std::uint64_t> registered_sessions{0};
+    std::atomic<std::uint64_t> inbound_messages{0};
+    std::atomic<std::uint64_t> outbound_messages{0};
+    std::atomic<std::uint64_t> admin_messages{0};
+    std::atomic<std::uint64_t> resend_requests{0};
+    std::atomic<std::uint64_t> gap_fills{0};
+    std::atomic<std::uint64_t> parse_failures{0};
+    std::atomic<std::uint64_t> checksum_failures{0};
+    std::atomic<std::uint64_t> outbound_queue_depth{0};
+    std::atomic<std::uint64_t> last_store_flush_latency_ns{0};
 };
 
 struct RuntimeMetricsSnapshot {
-    std::vector<WorkerMetrics> workers;
-    std::vector<SessionMetrics> sessions;
+    struct SessionEntry {
+        std::uint64_t session_id{0};
+        std::uint32_t worker_id{0};
+        std::uint64_t inbound_messages{0};
+        std::uint64_t outbound_messages{0};
+        std::uint64_t admin_messages{0};
+        std::uint64_t resend_requests{0};
+        std::uint64_t gap_fills{0};
+        std::uint64_t parse_failures{0};
+        std::uint64_t checksum_failures{0};
+        std::uint32_t outbound_queue_depth{0};
+        std::uint64_t last_store_flush_latency_ns{0};
+    };
+
+    struct WorkerEntry {
+        std::uint32_t worker_id{0};
+        std::uint64_t registered_sessions{0};
+        std::uint64_t inbound_messages{0};
+        std::uint64_t outbound_messages{0};
+        std::uint64_t admin_messages{0};
+        std::uint64_t resend_requests{0};
+        std::uint64_t gap_fills{0};
+        std::uint64_t parse_failures{0};
+        std::uint64_t checksum_failures{0};
+        std::uint64_t outbound_queue_depth{0};
+        std::uint64_t last_store_flush_latency_ns{0};
+    };
+
+    std::vector<WorkerEntry> workers;
+    std::vector<SessionEntry> sessions;
 };
 
 class MetricsRegistry {
@@ -64,8 +95,9 @@ class MetricsRegistry {
     auto FindMutableSession(std::uint64_t session_id) -> SessionMetrics*;
     auto FindMutableWorker(std::uint32_t worker_id) -> WorkerMetrics*;
 
-    std::vector<WorkerMetrics> workers_;
-    std::unordered_map<std::uint64_t, SessionMetrics> sessions_;
+    mutable std::shared_mutex sessions_mutex_;
+    std::vector<std::unique_ptr<WorkerMetrics>> workers_;
+    std::unordered_map<std::uint64_t, std::unique_ptr<SessionMetrics>> sessions_;
 };
 
 }  // namespace fastfix::runtime

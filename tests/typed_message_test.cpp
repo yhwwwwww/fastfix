@@ -84,9 +84,15 @@ TEST_CASE("typed-message-view", "[typed-message]") {
     REQUIRE(dictionary.ok());
 
     fastfix::message::MessageBuilder builder{"D"};
-    builder.reserve_fields(4U).reserve_groups(1U).reserve_group_entries(453U, 1U);
+    builder.reserve_fields(11U).reserve_groups(1U).reserve_group_entries(453U, 1U);
     builder.set_string(49U, "BUY")
         .set_string(56U, "SELL")
+        .set_string(11U, "ORD-001")
+        .set_string(55U, "AAPL")
+        .set_char(54U, '1')
+        .set_string(60U, "20260406-12:00:00.000")
+        .set_int(38U, 100)
+        .set_char(40U, '2')
         .set_string(5001U, "LIT")
         .set_string(5002U, "ACC-1");
     auto party = builder.add_group_entry(453U);
@@ -116,11 +122,19 @@ TEST_CASE("typed-message-view", "[typed-message]") {
     REQUIRE(empty_typed.ok());
     std::uint32_t missing_tag = 0U;
     REQUIRE(!empty_typed.value().validate_required_fields(&missing_tag).ok());
-    REQUIRE(missing_tag == 49U);
+    REQUIRE(missing_tag == 11U);
 
     // Missing group required field.
     fastfix::message::MessageBuilder partial_builder{"D"};
-    partial_builder.set_string(49U, "BUY").set_string(56U, "SELL");
+    partial_builder.set_string(11U, "ORD-002")
+        .set_string(49U, "BUY")
+        .set_string(56U, "SELL")
+        .set_string(55U, "AAPL")
+        .set_char(54U, '1')
+        .set_string(60U, "20260406-12:00:00.000")
+        .set_int(38U, 100)
+        .set_char(40U, '2')
+        .set_string(5001U, "LIT");
     auto partial_party = partial_builder.add_group_entry(453U);
     partial_party.set_string(448U, "PTY2").set_int(452U, 9);
     auto partial_message = std::move(partial_builder).build();

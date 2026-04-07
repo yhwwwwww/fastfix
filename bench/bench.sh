@@ -27,9 +27,9 @@ commands:
   build         Build all benchmark binaries and benchmark input artifacts
   fastfix       Run FastFix benchmark against build/bench/quickfix_FIX44.art
   fastfix-ffd   Run FastFix benchmark against build/bench/quickfix_FIX44.ffd
-  quickfix      Run QuickFIX comparison benchmark
+  quickfix      Run QuickFIX comparison benchmark (parse, encode, session-inbound, replay, loopback)
   builder       Run the sample overlay builder matrix benchmark
-  compare       Run the default FastFix and QuickFIX comparison suites
+  compare       Run the default FastFix and QuickFIX comparison suites side by side
 EOF
 }
 
@@ -157,7 +157,7 @@ case "$command_name" in
         ;;
     quickfix)
         if [ "$#" -eq 0 ]; then
-            set -- --iterations 100000
+            set -- --iterations 100000 --replay 1000 --replay-span 128 --loopback 1000
         fi
         run_quickfix "$@"
         ;;
@@ -180,7 +180,7 @@ case "$command_name" in
             exit 1
         fi
         run_fastfix_artifact --iterations 100000 --loopback 1000 --replay 1000
-        run_quickfix --iterations 100000
+        run_quickfix --iterations 100000 --replay 1000 --replay-span 128 --loopback 1000
         ;;
     *)
         usage

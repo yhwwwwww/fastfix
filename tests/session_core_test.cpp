@@ -746,3 +746,65 @@ TEST_CASE("session-core: key and config accessors", "[session-core][edge]") {
     REQUIRE(s.key().sender_comp_id == "BUY");
     REQUIRE(s.key().target_comp_id == "SELL");
 }
+
+// ===========================================================================
+// UINT32_MAX sequence number wraparound boundary
+// ===========================================================================
+
+TEST_CASE("session-core: outbound seq near UINT32_MAX", "[session-core][edge][wraparound]") {
+    auto config = MakeConfig();
+    SessionCore s(config);
+    REQUIRE(s.OnTransportConnected().ok());
+    REQUIRE(s.OnLogonAccepted().ok());
+
+    // Restore to near UINT32_MAX
+    REQUIRE(s.RestoreSequenceState(1U, UINT32_MAX - 2U).ok());
+
+    auto snap = s.Snapshot();
+    REQUIRE(snap.next_out_seq == UINT32_MAX - 2U);
+
+    // Allocate: UINT32_MAX-2
+    auto seq1 = s.AllocateOutboundSeq();
+    REQUIRE(seq1.ok());
+    REQUIRE(seq1.value() == UINT32_MAX - 2U);
+
+    // Allocate: UINT32_MAX-1
+    auto seq2 = s.AllocateOutboundSeq();
+    REQUIRE(seq2.ok());
+    REQUIRE(seq2.value() == UINT32_MAX - 1U);
+
+    // Allocate: UINT32_MAX
+    auto seq3 = s.AllocateOutboundSeq();
+    REQUIRE(seq3.ok());
+    REQUIRE(seq3.value() == UINT32_MAX);
+
+    // Allocate: wraps to 0 (uint32_t overflow)
+    auto seq4 = s.AllocateOutboundSeq();
+    REQUIRE(seq4.ok());
+    REQUIRE(seq4.value() == 0U);
+
+    // Verify snapshot reflects post-wrap state
+    auto post_snap = s.Snapshot();
+    REQUIRE(post_snap.next_out_seq == 1U);
+}
+
+TEST_CASE("session-core: inbound seq near UINT32_MAX", "[session-core][edge][wraparound]") {
+    auto config = MakeConfig();
+    SessionCore s(config);
+    REQUIRE(s.OnTransportConnected().ok());
+    REQUIRE(s.OnLogonAccepted().ok());
+
+    // Restore to near UINT32_MAX for inbound
+    REQUIRE(s.RestoreSequenceState(UINT32_MAX - 1U, 1U).ok());
+
+    auto snap = s.Snapshot();
+    REQUIRE(snap.next_in_seq == UINT32_MAX - 1U);
+
+    // Observe UINT32_MAX - 1
+    REQUIRE(s.ObserveInboundSeq(UINT32_MAX - 1U).ok());
+    // Observe UINT32_MAX
+    REQUIRE(s.ObserveInboundSeq(UINT32_MAX).ok());
+
+    auto post_snap = s.Snapshot();
+    REQUIRE(post_snap.next_in_seq == 0U);  // wraps to 0
+}

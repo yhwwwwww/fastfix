@@ -770,3 +770,166 @@ TEST_CASE("PrecompiledTemplateTable build, find, and encode", "[fix-codec][preco
         buffer_global.bytes().begin(),
         buffer_global.bytes().end()));
 }
+
+// ===========================================================================
+// Malicious input resource exhaustion tests
+// ===========================================================================
+
+TEST_CASE("fix-codec: group count exceeding kMaxGroupEntryCount", "[fix-codec][resource-exhaustion]") {
+    auto dictionary = LoadCodecDictionary();
+    REQUIRE(dictionary.ok());
+
+    // Build a FIX frame with NoSides=99999, exceeding kMaxGroupEntryCount (10000)
+    // Just the count tag without any actual entries
+    auto wire = ::fastfix::tests::EncodeFixFrame(
+        "35=D|34=1|49=BUY|56=SELL|52=20260402-12:00:00.000|11=ORD-1|55=AAPL|552=99999|54=1|");
+
+    auto decoded = fastfix::codec::DecodeFixMessage(wire, dictionary.value());
+    REQUIRE(!decoded.ok());  // Must reject, not OOM
+
+    auto decoded_view = fastfix::codec::DecodeFixMessageView(wire, dictionary.value());
+    REQUIRE(!decoded_view.ok());  // View path must also reject
+}
+
+TEST_CASE("fix-codec: group count at exact boundary", "[fix-codec][resource-exhaustion]") {
+    auto dictionary = LoadCodecDictionary();
+    REQUIRE(dictionary.ok());
+
+    // Test at kMaxGroupEntryCount + 1 = 10001
+    auto wire = ::fastfix::tests::EncodeFixFrame(
+        "35=D|34=1|49=BUY|56=SELL|52=20260402-12:00:00.000|11=ORD-1|55=AAPL|552=10001|54=1|");
+
+    auto decoded = fastfix::codec::DecodeFixMessage(wire, dictionary.value());
+    REQUIRE(!decoded.ok());
+
+    auto decoded_view = fastfix::codec::DecodeFixMessageView(wire, dictionary.value());
+    REQUIRE(!decoded_view.ok());
+}
+
+TEST_CASE("fix-codec: very long message body", "[fix-codec][resource-exhaustion]") {
+    auto dictionary = LoadCodecDictionary();
+    REQUIRE(dictionary.ok());
+
+    // Build a message with a very large field value (1MB of padding)
+    std::string big_value(1'000'000, 'X');
+    std::string body = "35=D|34=1|49=BUY|56=SELL|52=20260402-12:00:00.000|11=ORD-1|55=" + big_value + "|";
+    auto wire = ::fastfix::tests::EncodeFixFrame(body);
+
+    // Should not crash or OOM — may succeed or return a validation issue
+    auto decoded = fastfix::codec::DecodeFixMessage(wire, dictionary.value());
+    // We don't care about the result value, just that it didn't crash/hang
+    (void)decoded;
+
+    auto decoded_view = fastfix::codec::DecodeFixMessageView(wire, dictionary.value());
+    (void)decoded_view;
+
+    // Peek should also handle it gracefully
+    auto peeked = fastfix::codec::PeekSessionHeaderView(wire);
+    (void)peeked;
+}
+
+TEST_CASE("fix-codec: deeply nested groups beyond kMaxGroupNestingDepth", "[fix-codec][resource-exhaustion]") {
+    // The dictionary has Sides(552) containing Parties(453).
+    // kMaxGroupNestingDepth=16 is checked at parse time.
+    // We can't easily build 16+ levels with only 2 group types,
+    // but we can verify the limit enforcement works by testing
+    // with the existing 2-level nesting and by constructing a
+    // dictionary with deeper nesting capability.
+
+    // First, verify the existing 2-level nesting works fine (below limit)
+    auto dictionary = LoadCodecDictionary();
+    REQUIRE(dictionary.ok());
+
+    auto wire = ::fastfix::tests::EncodeFixFrame(
+        "35=D|34=1|49=BUY|56=SELL|52=20260402-12:00:00.000|11=ORD-1|55=AAPL|552=1|54=1|453=1|448=P1|");
+    auto decoded = fastfix::codec::DecodeFixMessage(wire, dictionary.value());
+    REQUIRE(decoded.ok());  // 2-level nesting is fine
+
+    // Now build a dictionary with many self-referencing-like group layers
+    // to exceed kMaxGroupNestingDepth (16)
+    fastfix::profile::NormalizedDictionary deep_dict;
+    deep_dict.profile_id = 7099U;
+    deep_dict.schema_hash = 0x7099709970997099ULL;
+
+    // We need 17 group levels. Create tags: 5001..5034 for count/delimiter pairs
+    // Level 0: count=5001, delimiter=5002
+    // Level 1: count=5003, delimiter=5004
+    // ...
+    // Level 16: count=5033, delimiter=5034
+
+    std::vector<fastfix::profile::FieldDef> fields = {
+        {35U, "MsgType", fastfix::profile::ValueType::kString, 0U},
+        {49U, "SenderCompID", fastfix::profile::ValueType::kString, 0U},
+        {56U, "TargetCompID", fastfix::profile::ValueType::kString, 0U},
+    };
+    for (std::uint32_t level = 0; level <= 16; ++level) {
+        std::uint32_t count_tag = 5001U + level * 2U;
+        std::uint32_t delim_tag = 5002U + level * 2U;
+        fields.push_back({count_tag, "Count" + std::to_string(level), fastfix::profile::ValueType::kInt, 0U});
+        fields.push_back({delim_tag, "Delim" + std::to_string(level), fastfix::profile::ValueType::kString, 0U});
+    }
+    deep_dict.fields = std::move(fields);
+
+    // Top-level message uses level-0 group
+    deep_dict.messages = {
+        fastfix::profile::MessageDef{
+            .msg_type = "U1",
+            .name = "DeepTest",
+            .field_rules = {
+                {35U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+                {5001U, 0U},
+            },
+            .flags = 0U,
+        },
+    };
+
+    // Each group at level N contains the count tag for level N+1
+    std::vector<fastfix::profile::GroupDef> groups;
+    for (std::uint32_t level = 0; level <= 16; ++level) {
+        std::uint32_t count_tag = 5001U + level * 2U;
+        std::uint32_t delim_tag = 5002U + level * 2U;
+        std::vector<fastfix::profile::FieldRule> group_field_rules = {
+            {delim_tag, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+        };
+        // Add nested group count tag if not at the deepest level
+        if (level < 16U) {
+            std::uint32_t next_count_tag = 5003U + level * 2U;
+            group_field_rules.push_back({next_count_tag, 0U});
+        }
+        groups.push_back(fastfix::profile::GroupDef{
+            .count_tag = count_tag,
+            .delimiter_tag = delim_tag,
+            .name = "Group" + std::to_string(level),
+            .field_rules = std::move(group_field_rules),
+            .flags = 0U,
+        });
+    }
+    deep_dict.groups = std::move(groups);
+
+    auto artifact = fastfix::profile::BuildProfileArtifact(deep_dict);
+    REQUIRE(artifact.ok());
+    const auto artifact_path = std::filesystem::temp_directory_path() / "fastfix-deep-nest-test.art";
+    auto write_status = fastfix::profile::WriteProfileArtifact(artifact_path, artifact.value());
+    REQUIRE(write_status.ok());
+    auto loaded = fastfix::profile::LoadProfileArtifact(artifact_path);
+    std::filesystem::remove(artifact_path);
+    REQUIRE(loaded.ok());
+    auto deep_dictionary = fastfix::profile::NormalizedDictionaryView::FromProfile(std::move(loaded).value());
+    REQUIRE(deep_dictionary.ok());
+
+    // Build a wire message with 17 nesting levels: each level has count=1, delimiter=value
+    std::string body = "35=U1|34=1|49=BUY|56=SELL|52=20260402-12:00:00.000|";
+    for (std::uint32_t level = 0; level <= 16; ++level) {
+        std::uint32_t count_tag = 5001U + level * 2U;
+        std::uint32_t delim_tag = 5002U + level * 2U;
+        body += std::to_string(count_tag) + "=1|";
+        body += std::to_string(delim_tag) + "=V" + std::to_string(level) + "|";
+    }
+
+    auto deep_wire = ::fastfix::tests::EncodeFixFrame(body);
+    auto deep_decoded = fastfix::codec::DecodeFixMessage(deep_wire, deep_dictionary.value());
+    REQUIRE(!deep_decoded.ok());  // Must reject: depth 17 > kMaxGroupNestingDepth(16)
+
+    auto deep_decoded_view = fastfix::codec::DecodeFixMessageView(deep_wire, deep_dictionary.value());
+    REQUIRE(!deep_decoded_view.ok());  // View path must also reject
+}

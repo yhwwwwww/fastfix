@@ -20,33 +20,25 @@ namespace fastfix::codec {
 
 namespace {
 
-inline constexpr std::size_t kTokenInlineCapacity = 16U;
-
 template <typename Integer>
 inline constexpr std::size_t kIntegerTextBufferBytes =
     static_cast<std::size_t>(std::numeric_limits<Integer>::digits10) + 3U;
-
-struct Token {
-    std::uint32_t tag{0};
-    std::string_view value;
-    std::size_t start_offset{0};
-    std::size_t end_offset{0};
-    std::size_t value_offset{0};
-    std::size_t value_length{0};
-};
-
-using TokenList = base::InlineSplitVector<Token, kTokenInlineCapacity>;
 
 struct SeenTagBuffer {
     static constexpr std::size_t kInlineCapacity = 64U;
 
     auto contains(std::uint32_t tag) const -> bool {
+        const auto bit = std::uint64_t{1} << (tag & 63U);
+        if ((bloom_bits_ & bit) == 0U) {
+            return false;
+        }
         const auto inline_end = inline_tags.begin() + static_cast<std::ptrdiff_t>(inline_size);
         return std::find(inline_tags.begin(), inline_end, tag) != inline_end ||
                std::find(overflow_tags.begin(), overflow_tags.end(), tag) != overflow_tags.end();
     }
 
     auto push_back(std::uint32_t tag) -> void {
+        bloom_bits_ |= std::uint64_t{1} << (tag & 63U);
         if (inline_size < inline_tags.size()) {
             inline_tags[inline_size++] = tag;
             return;
@@ -62,11 +54,13 @@ struct SeenTagBuffer {
 
     auto clear() -> void {
         inline_size = 0U;
+        bloom_bits_ = 0U;
         overflow_tags.clear();
     }
 
     std::array<std::uint32_t, kInlineCapacity> inline_tags{};
     std::size_t inline_size{0U};
+    std::uint64_t bloom_bits_{0U};
     std::vector<std::uint32_t> overflow_tags;
 };
 
@@ -199,18 +193,6 @@ auto HasSeenTag(const ScopeValidationState& state, std::uint32_t tag) -> bool {
     return state.seen_tags.contains(tag);
 }
 
-auto CountGroupRules(
-    const profile::NormalizedDictionaryView& dictionary,
-    std::span<const profile::FieldRuleRecord> rules) -> std::size_t {
-    std::size_t count = 0U;
-    for (const auto& rule : rules) {
-        if (dictionary.find_group(rule.tag) != nullptr) {
-            ++count;
-        }
-    }
-    return count;
-}
-
 template <typename RuleSpan>
 auto ValidateConsumedField(
     const profile::NormalizedDictionaryView& dictionary,
@@ -221,7 +203,8 @@ auto ValidateConsumedField(
     ValidationIssue* issue,
     bool allow_standard_session_fields,
     bool schema_known,
-    const char* scope_name) -> void {
+    const char* scope_name,
+    const profile::FieldDefRecord* known_field_def = nullptr) -> void {
     if (state == nullptr) {
         return;
     }
@@ -242,7 +225,8 @@ auto ValidateConsumedField(
     if (!schema_known) {
         return;
     }
-    if (dictionary.find_field(tag) == nullptr && !(rules.empty() && IsImplicitStandardField(tag))) {
+    const auto* field_ptr = known_field_def != nullptr ? known_field_def : dictionary.find_field(tag);
+    if (field_ptr == nullptr && !(rules.empty() && IsImplicitStandardField(tag))) {
         SetValidationIssue(
             issue,
             ValidationIssueKind::kUnknownField,
@@ -285,6 +269,51 @@ auto ParseUnsigned(std::string_view text, const char* label) -> base::Result<std
     return value;
 }
 
+struct InlineField {
+    std::uint32_t tag;
+    std::size_t start_offset;
+    std::size_t value_offset;
+    std::uint16_t value_length;
+    std::size_t next_pos;
+};
+
+auto ScanNextField(
+    std::span<const std::byte> bytes,
+    std::size_t field_start,
+    std::byte delimiter_byte,
+    std::byte equals_byte) -> base::Result<InlineField> {
+    if (field_start >= bytes.size()) {
+        return base::Status::FormatError("FIX frame is missing its final delimiter");
+    }
+    const auto remaining = bytes.size() - field_start;
+    const auto* soh_ptr = FindByte(bytes.data() + field_start, remaining, delimiter_byte);
+    const auto soh_index = static_cast<std::size_t>(soh_ptr - bytes.data());
+    if (soh_index >= bytes.size()) {
+        return base::Status::FormatError("FIX frame is missing its final delimiter");
+    }
+    if (soh_index == field_start) {
+        return base::Status::FormatError("empty FIX field is not allowed");
+    }
+    const auto field_len = soh_index - field_start;
+    const auto* eq_ptr = FindByte(bytes.data() + field_start, field_len, equals_byte);
+    const auto equals = static_cast<std::size_t>(eq_ptr - (bytes.data() + field_start));
+    if (equals >= field_len || equals == 0U || equals == field_len - 1U) {
+        return base::Status::FormatError("invalid FIX field syntax");
+    }
+    const auto* field_bytes = reinterpret_cast<const char*>(bytes.data() + field_start);
+    auto tag = ParseUnsigned(std::string_view(field_bytes, equals), "field tag");
+    if (!tag.ok()) {
+        return tag.status();
+    }
+    return InlineField{
+        .tag = tag.value(),
+        .start_offset = field_start,
+        .value_offset = field_start + equals + 1U,
+        .value_length = static_cast<std::uint16_t>(field_len - equals - 1U),
+        .next_pos = soh_index + 1U,
+    };
+}
+
 auto ParseSigned(std::string_view text, const char* label) -> base::Result<std::int64_t> {
     std::int64_t value = 0;
     const auto* begin = text.data();
@@ -317,24 +346,22 @@ auto ParseBoolean(std::string_view text, const char* label) -> base::Result<bool
     return base::Status::InvalidArgument(std::string("invalid ") + label);
 }
 
-auto ResolveFieldType(
-    std::uint32_t tag,
-    const profile::NormalizedDictionaryView& dictionary) -> message::FieldValueType {
-    if (const auto* field = dictionary.find_field(tag); field != nullptr) {
-        switch (static_cast<profile::ValueType>(field->value_type)) {
-            case profile::ValueType::kInt:
-                return message::FieldValueType::kInt;
-            case profile::ValueType::kChar:
-                return message::FieldValueType::kChar;
-            case profile::ValueType::kFloat:
-                return message::FieldValueType::kFloat;
-            case profile::ValueType::kBoolean:
-                return message::FieldValueType::kBoolean;
-            default:
-                return message::FieldValueType::kString;
-        }
+auto FieldTypeFromDef(const profile::FieldDefRecord& field) -> message::FieldValueType {
+    switch (static_cast<profile::ValueType>(field.value_type)) {
+        case profile::ValueType::kInt:
+            return message::FieldValueType::kInt;
+        case profile::ValueType::kChar:
+            return message::FieldValueType::kChar;
+        case profile::ValueType::kFloat:
+            return message::FieldValueType::kFloat;
+        case profile::ValueType::kBoolean:
+            return message::FieldValueType::kBoolean;
+        default:
+            return message::FieldValueType::kString;
     }
+}
 
+auto FieldTypeFallback(std::uint32_t tag) -> message::FieldValueType {
     switch (tag) {
         case 9:
         case 34:
@@ -355,6 +382,24 @@ auto ResolveFieldType(
         default:
             return message::FieldValueType::kString;
     }
+}
+
+auto ResolveFieldType(
+    std::uint32_t tag,
+    const profile::NormalizedDictionaryView& dictionary) -> message::FieldValueType {
+    if (const auto* field = dictionary.find_field(tag); field != nullptr) {
+        return FieldTypeFromDef(*field);
+    }
+    return FieldTypeFallback(tag);
+}
+
+auto ResolveFieldTypeWithDef(
+    std::uint32_t tag,
+    const profile::FieldDefRecord* field_def) -> message::FieldValueType {
+    if (field_def != nullptr) {
+        return FieldTypeFromDef(*field_def);
+    }
+    return FieldTypeFallback(tag);
 }
 
 template <typename Builder>
@@ -422,14 +467,47 @@ auto FindParsedFieldIndex(
     const message::ParsedMessageData& parsed,
     ParsedContainerRef container,
     std::uint32_t tag) -> std::uint32_t {
-    auto field_index = ResolveContainer(parsed, container).first_field;
-    while (field_index != message::kInvalidParsedIndex) {
-        if (parsed.field_slots[field_index].tag == tag) {
-            return field_index;
+    const auto& entry = ResolveContainer(parsed, container);
+    if (container.root) {
+        // Use hash table for root
+        auto probe = static_cast<std::uint16_t>(tag % message::kFieldHashTableSize);
+        for (std::size_t i = 0; i < message::kFieldHashTableSize; ++i) {
+            const auto slot_index = parsed.field_hash_table[probe];
+            if (slot_index == message::kInvalidHashSlot) {
+                return message::kInvalidParsedIndex;
+            }
+            if (parsed.field_slots[slot_index].tag == tag) {
+                return static_cast<std::uint32_t>(slot_index);
+            }
+            probe = static_cast<std::uint16_t>((probe + 1U) % message::kFieldHashTableSize);
         }
-        field_index = parsed.field_slots[field_index].next_field;
+        return message::kInvalidParsedIndex;
+    }
+    // For group entries, linear scan over contiguous range
+    if (entry.first_field_index == message::kInvalidParsedIndex || entry.field_count == 0U) {
+        return message::kInvalidParsedIndex;
+    }
+    const auto end_index = entry.first_field_index + entry.field_count;
+    for (auto i = entry.first_field_index; i < end_index; ++i) {
+        if (parsed.field_slots[i].tag == tag) {
+            return i;
+        }
     }
     return message::kInvalidParsedIndex;
+}
+
+auto InsertIntoRootHashTable(
+    message::ParsedMessageData* parsed,
+    std::uint32_t slot_index) -> void {
+    const auto tag = parsed->field_slots[slot_index].tag;
+    auto probe = static_cast<std::uint16_t>(tag % message::kFieldHashTableSize);
+    for (std::size_t i = 0; i < message::kFieldHashTableSize; ++i) {
+        if (parsed->field_hash_table[probe] == message::kInvalidHashSlot) {
+            parsed->field_hash_table[probe] = static_cast<std::uint16_t>(slot_index);
+            return;
+        }
+        probe = static_cast<std::uint16_t>((probe + 1U) % message::kFieldHashTableSize);
+    }
 }
 
 auto AppendParsedFieldSlot(
@@ -438,37 +516,47 @@ auto AppendParsedFieldSlot(
     message::ParsedFieldSlot slot) -> void {
     auto existing = FindParsedFieldIndex(*parsed, container, slot.tag);
     if (existing != message::kInvalidParsedIndex) {
-        slot.next_field = parsed->field_slots[existing].next_field;
-        parsed->field_slots[existing] = std::move(slot);
+        parsed->field_slots[existing] = slot;
         return;
     }
 
     const auto new_index = static_cast<std::uint32_t>(parsed->field_slots.size());
-    parsed->field_slots.push_back(std::move(slot));
+    parsed->field_slots.push_back(slot);
 
     auto& entry = ResolveContainer(parsed, container);
-    if (entry.first_field == message::kInvalidParsedIndex) {
-        entry.first_field = new_index;
-    } else {
-        auto tail = entry.first_field;
-        while (parsed->field_slots[tail].next_field != message::kInvalidParsedIndex) {
-            tail = parsed->field_slots[tail].next_field;
-        }
-        parsed->field_slots[tail].next_field = new_index;
+    if (entry.first_field_index == message::kInvalidParsedIndex) {
+        entry.first_field_index = new_index;
     }
     ++entry.field_count;
+
+    if (container.root) {
+        InsertIntoRootHashTable(parsed, new_index);
+    }
 }
 
 auto MakeParsedFieldSlot(
-    std::span<const std::byte> bytes,
-    const Token& token,
-    const profile::NormalizedDictionaryView& dictionary) -> base::Result<message::ParsedFieldSlot> {
+    std::uint32_t tag,
+    std::uint32_t value_offset,
+    std::uint16_t value_length,
+    const profile::NormalizedDictionaryView& dictionary) -> message::ParsedFieldSlot {
     message::ParsedFieldSlot slot;
-    slot.tag = token.tag;
-    slot.type = ResolveFieldType(token.tag, dictionary);
-    slot.value_offset = static_cast<std::uint32_t>(token.value_offset);
-    slot.value_length = static_cast<std::uint16_t>(token.value_length);
-    (void)bytes;
+    slot.tag = tag;
+    slot.set_type(ResolveFieldType(tag, dictionary));
+    slot.value_offset = value_offset;
+    slot.value_length = value_length;
+    return slot;
+}
+
+auto MakeParsedFieldSlotWithType(
+    std::uint32_t tag,
+    std::uint32_t value_offset,
+    std::uint16_t value_length,
+    message::FieldValueType field_type) -> message::ParsedFieldSlot {
+    message::ParsedFieldSlot slot;
+    slot.tag = tag;
+    slot.set_type(field_type);
+    slot.value_offset = value_offset;
+    slot.value_length = value_length;
     return slot;
 }
 
@@ -540,26 +628,40 @@ auto AppendParsedEntry(message::ParsedMessageData* parsed, std::uint32_t group_i
 auto ParseParsedGroupEntries(
     const profile::NormalizedDictionaryView& dictionary,
     std::span<const std::byte> bytes,
-    const TokenList& tokens,
-    std::size_t index,
+    std::size_t byte_pos,
+    std::byte delimiter_byte,
+    std::byte equals_byte,
+    std::string_view count_value,
     const profile::GroupDefRecord& group_def,
     message::ParsedMessageData* parsed,
     ParsedContainerRef parent,
     std::uint16_t depth,
     ValidationIssue* validation_issue) -> base::Result<std::size_t> {
-    auto count = ParseUnsigned(tokens[index].value, "group count");
+    auto count = ParseUnsigned(count_value, "group count");
     if (!count.ok()) {
         return count.status();
+    }
+    if (count.value() > kMaxGroupEntryCount) {
+        return base::Status::FormatError(
+            "group " + std::to_string(group_def.count_tag) +
+            " entry count " + std::to_string(count.value()) +
+            " exceeds maximum " + std::to_string(kMaxGroupEntryCount));
+    }
+    if (depth >= kMaxGroupNestingDepth) {
+        return base::Status::FormatError(
+            "group " + std::to_string(group_def.count_tag) +
+            " nesting depth " + std::to_string(depth) +
+            " exceeds maximum " + std::to_string(kMaxGroupNestingDepth));
     }
     const auto frame_index = EnsureParsedGroup(parsed, parent, group_def.count_tag, depth);
     const auto group_rules = dictionary.group_field_rules(group_def);
     parsed->entries.reserve(parsed->entries.size() + count.value());
-    ++index;
 
     for (std::uint32_t entry_index = 0; entry_index < count.value(); ++entry_index) {
         ScopeValidationState validation_state;
         validation_state.seen_tags.reserve(group_rules.size());
-        if (index >= tokens.size() || tokens[index].tag != group_def.delimiter_tag) {
+
+        if (byte_pos >= bytes.size()) {
             SetValidationIssue(
                 validation_issue,
                 ValidationIssueKind::kIncorrectNumInGroupCount,
@@ -567,14 +669,34 @@ auto ParseParsedGroupEntries(
                 "group " + std::to_string(group_def.count_tag) + " expected delimiter tag " +
                     std::to_string(group_def.delimiter_tag) + " for entry " +
                     std::to_string(entry_index + 1U));
-            return index;
+            return byte_pos;
+        }
+        {
+            auto peek = ScanNextField(bytes, byte_pos, delimiter_byte, equals_byte);
+            if (!peek.ok()) {
+                return peek.status();
+            }
+            if (peek.value().tag != group_def.delimiter_tag) {
+                SetValidationIssue(
+                    validation_issue,
+                    ValidationIssueKind::kIncorrectNumInGroupCount,
+                    group_def.count_tag,
+                    "group " + std::to_string(group_def.count_tag) + " expected delimiter tag " +
+                        std::to_string(group_def.delimiter_tag) + " for entry " +
+                        std::to_string(entry_index + 1U));
+                return byte_pos;
+            }
         }
 
         const auto parsed_entry_index = AppendParsedEntry(parsed, frame_index);
         const auto entry_ref = EntryContainer(parsed_entry_index);
         bool seen_any_field = false;
-        while (index < tokens.size()) {
-            const auto tag = tokens[index].tag;
+        while (byte_pos < bytes.size()) {
+            auto field = ScanNextField(bytes, byte_pos, delimiter_byte, equals_byte);
+            if (!field.ok()) {
+                return field.status();
+            }
+            const auto tag = field.value().tag;
             if (seen_any_field && tag == group_def.delimiter_tag) {
                 break;
             }
@@ -591,32 +713,38 @@ auto ParseParsedGroupEntries(
                     true,
                     "group");
 
-                auto slot = MakeParsedFieldSlot(bytes, tokens[index], dictionary);
-                if (!slot.ok()) {
-                    return slot.status();
-                }
-                AppendParsedFieldSlot(parsed, entry_ref, std::move(slot).value());
+                auto slot = MakeParsedFieldSlot(
+                    tag,
+                    static_cast<std::uint32_t>(field.value().value_offset),
+                    field.value().value_length,
+                    dictionary);
+                AppendParsedFieldSlot(parsed, entry_ref, slot);
 
                 if (const auto* nested_group = dictionary.find_group(tag); nested_group != nullptr) {
-                    auto next_index = ParseParsedGroupEntries(
+                    auto value_sv = std::string_view(
+                        reinterpret_cast<const char*>(bytes.data() + field.value().value_offset),
+                        field.value().value_length);
+                    auto next_pos = ParseParsedGroupEntries(
                         dictionary,
                         bytes,
-                        tokens,
-                        index,
+                        field.value().next_pos,
+                        delimiter_byte,
+                        equals_byte,
+                        value_sv,
                         *nested_group,
                         parsed,
                         entry_ref,
                         static_cast<std::uint16_t>(depth + 1U),
                         validation_issue);
-                    if (!next_index.ok()) {
-                        return next_index.status();
+                    if (!next_pos.ok()) {
+                        return next_pos.status();
                     }
-                    index = next_index.value();
+                    byte_pos = next_pos.value();
                     seen_any_field = true;
                     continue;
                 }
 
-                ++index;
+                byte_pos = field.value().next_pos;
                 seen_any_field = true;
                 continue;
             }
@@ -625,152 +753,7 @@ auto ParseParsedGroupEntries(
         }
     }
 
-    return index;
-}
-
-auto Tokenize(std::span<const std::byte> bytes, char delimiter) -> base::Result<TokenList> {
-    TokenList tokens;
-    const auto delimiter_byte = static_cast<std::byte>(static_cast<unsigned char>(delimiter));
-    const auto equals_byte = static_cast<std::byte>('=');
-    tokens.reserve(std::max<std::size_t>(32U, bytes.size() / 8U));
-    std::size_t field_start = 0;
-    while (field_start < bytes.size()) {
-        const auto remaining = bytes.size() - field_start;
-        const auto* soh_ptr = FindByte(bytes.data() + field_start, remaining, delimiter_byte);
-        const auto index = static_cast<std::size_t>(soh_ptr - bytes.data());
-
-        if (index >= bytes.size()) {
-            break;
-        }
-
-        if (index == field_start) {
-            return base::Status::FormatError("empty FIX field is not allowed");
-        }
-
-        const auto field_len = index - field_start;
-        const auto* eq_ptr = FindByte(bytes.data() + field_start, field_len, equals_byte);
-        const auto equals = static_cast<std::size_t>(eq_ptr - (bytes.data() + field_start));
-        if (equals >= field_len || equals == 0U || equals == field_len - 1U) {
-            return base::Status::FormatError("invalid FIX field syntax");
-        }
-
-        const auto* field_bytes = reinterpret_cast<const char*>(bytes.data() + field_start);
-        auto tag = ParseUnsigned(std::string_view(field_bytes, equals), "field tag");
-        if (!tag.ok()) {
-            return tag.status();
-        }
-
-        const auto value_start = field_start + equals + 1U;
-        const auto value_len = field_len - equals - 1U;
-        tokens.push_back(Token{
-            .tag = tag.value(),
-            .value = std::string_view(reinterpret_cast<const char*>(bytes.data() + value_start), value_len),
-            .start_offset = field_start,
-            .end_offset = index + 1U,
-            .value_offset = value_start,
-            .value_length = value_len,
-        });
-        field_start = index + 1U;
-    }
-
-    if (field_start != bytes.size()) {
-        return base::Status::FormatError("FIX frame is missing its final delimiter");
-    }
-
-    if (tokens.empty()) {
-        return base::Status::FormatError("FIX frame has no fields");
-    }
-    return tokens;
-}
-
-auto ParseGroupEntries(
-    const profile::NormalizedDictionaryView& dictionary,
-    const TokenList& tokens,
-    std::size_t index,
-    const profile::GroupDefRecord& group_def,
-    const std::function<void(std::size_t)>& reserve_group_entries,
-    const std::function<message::GroupEntryBuilder()>& add_group_entry,
-    ValidationIssue* validation_issue) -> base::Result<std::size_t> {
-    auto count = ParseUnsigned(tokens[index].value, "group count");
-    if (!count.ok()) {
-        return count.status();
-    }
-    const auto group_rules = dictionary.group_field_rules(group_def);
-    if (reserve_group_entries) {
-        reserve_group_entries(count.value());
-    }
-    ++index;
-
-    for (std::uint32_t entry_index = 0; entry_index < count.value(); ++entry_index) {
-        ScopeValidationState validation_state;
-        validation_state.seen_tags.reserve(group_rules.size());
-        if (index >= tokens.size() || tokens[index].tag != group_def.delimiter_tag) {
-            SetValidationIssue(
-                validation_issue,
-                ValidationIssueKind::kIncorrectNumInGroupCount,
-                group_def.count_tag,
-                "group " + std::to_string(group_def.count_tag) + " expected delimiter tag " +
-                    std::to_string(group_def.delimiter_tag) + " for entry " +
-                    std::to_string(entry_index + 1U));
-            return index;
-        }
-
-        auto entry = add_group_entry();
-        entry.reserve_fields(group_rules.size());
-        entry.reserve_groups(CountGroupRules(dictionary, group_rules));
-        bool seen_any_field = false;
-        while (index < tokens.size()) {
-            const auto tag = tokens[index].tag;
-            if (seen_any_field && tag == group_def.delimiter_tag) {
-                break;
-            }
-
-            if (const auto ri = dictionary.group_rule_index(group_def, tag); ri >= 0) {
-                ValidateConsumedField(
-                    dictionary,
-                    tag,
-                    group_rules,
-                    ri,
-                    &validation_state,
-                    validation_issue,
-                    false,
-                    true,
-                    "group");
-                if (const auto* nested_group = dictionary.find_group(tag); nested_group != nullptr) {
-                    auto status = ApplyScalarField(entry, tag, tokens[index].value, dictionary);
-                    if (!status.ok()) {
-                        return status;
-                    }
-                    auto next_index = ParseGroupEntries(
-                        dictionary,
-                        tokens,
-                        index,
-                        *nested_group,
-                        [&entry, tag](std::size_t count) { entry.reserve_group_entries(tag, count); },
-                        [&entry, tag]() { return entry.add_group_entry(tag); },
-                        validation_issue);
-                    if (!next_index.ok()) {
-                        return next_index.status();
-                    }
-                    index = next_index.value();
-                    seen_any_field = true;
-                    continue;
-                }
-
-                auto status = ApplyScalarField(entry, tag, tokens[index].value, dictionary);
-                if (!status.ok()) {
-                    return status;
-                }
-                ++index;
-                seen_any_field = true;
-                continue;
-            }
-
-            break;
-        }
-    }
-
-    return index;
+    return byte_pos;
 }
 
 auto ShouldSkipField(std::uint32_t tag) -> bool {
@@ -1289,10 +1272,16 @@ auto EncodeFixMessageGenericToBuffer(
     {
         std::array<char, kIntegerTextBufferBytes<std::uint32_t>> bl_buf{};
         const auto [ptr, ec] = std::to_chars(bl_buf.data(), bl_buf.data() + bl_buf.size(), body_length);
-        if (ec == std::errc()) {
-            full.replace(body_length_offset, kBodyLengthPlaceholderWidth,
-                         bl_buf.data(), static_cast<std::size_t>(ptr - bl_buf.data()));
+        if (ec != std::errc()) {
+            return base::Status::FormatError("BodyLength conversion failed");
         }
+        const auto digits = static_cast<std::size_t>(ptr - bl_buf.data());
+        if (digits > kBodyLengthPlaceholderWidth) {
+            return base::Status::FormatError(
+                "encoded body length exceeds BodyLength placeholder width");
+        }
+        full.replace(body_length_offset, kBodyLengthPlaceholderWidth,
+                     bl_buf.data(), digits);
     }
 
     // Compute checksum over entire buffer so far (same approach as post-hoc scan)
@@ -1561,12 +1550,22 @@ auto FrameEncodeTemplate::EncodeToBuffer(
 
     EncodeScopeTemplate(full, &checksum, message, *state_->body_scope, delimiter, true);
 
-    ReplaceUnsignedPlaceholder(
-        full,
-        body_length_offset,
-        kBodyLengthPlaceholderWidth,
-        static_cast<std::uint32_t>(full.size() - body_start),
-        &checksum);
+    {
+        const auto body_length = static_cast<std::uint32_t>(full.size() - body_start);
+        std::array<char, kIntegerTextBufferBytes<std::uint32_t>> bl_check{};
+        const auto [bl_ptr, bl_ec] = std::to_chars(bl_check.data(), bl_check.data() + bl_check.size(), body_length);
+        if (bl_ec != std::errc() ||
+            static_cast<std::size_t>(bl_ptr - bl_check.data()) > kBodyLengthPlaceholderWidth) {
+            return base::Status::FormatError(
+                "encoded body length exceeds BodyLength placeholder width");
+        }
+        ReplaceUnsignedPlaceholder(
+            full,
+            body_length_offset,
+            kBodyLengthPlaceholderWidth,
+            body_length,
+            &checksum);
+    }
 
     checksum %= 256U;
     AppendTracked(full, nullptr, std::string_view("10="));
@@ -1706,159 +1705,226 @@ auto DecodeFixMessageView(
     const profile::NormalizedDictionaryView& dictionary,
     char delimiter) -> base::Result<DecodedMessageView> {
     const char normalized_delimiter = NormalizeDelimiter(delimiter);
-    auto tokens = Tokenize(bytes, normalized_delimiter);
-    if (!tokens.ok()) {
-        return tokens.status();
-    }
-    if (tokens.value().size() < 4U) {
-        return base::Status::FormatError("FIX frame is too short");
-    }
+    const auto delimiter_byte = static_cast<std::byte>(static_cast<unsigned char>(normalized_delimiter));
+    const auto equals_byte = static_cast<std::byte>('=');
 
-    const auto& fields = tokens.value();
-    if (fields[0].tag != 8U || fields[1].tag != 9U || fields.back().tag != 10U) {
+    // Scan field 0: must be tag 8 (BeginString)
+    auto field0 = ScanNextField(bytes, 0U, delimiter_byte, equals_byte);
+    if (!field0.ok()) {
+        return field0.status();
+    }
+    if (field0.value().tag != 8U) {
         return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
     }
 
-    auto declared_body_length = ParseUnsigned(fields[1].value, "BodyLength");
+    // Scan field 1: must be tag 9 (BodyLength)
+    auto field1 = ScanNextField(bytes, field0.value().next_pos, delimiter_byte, equals_byte);
+    if (!field1.ok()) {
+        return field1.status();
+    }
+    if (field1.value().tag != 9U) {
+        return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
+    }
+
+    auto declared_body_length = ParseUnsigned(
+        std::string_view(
+            reinterpret_cast<const char*>(bytes.data() + field1.value().value_offset),
+            field1.value().value_length),
+        "BodyLength");
     if (!declared_body_length.ok()) {
         return declared_body_length.status();
     }
-    const auto actual_body_length = fields.back().start_offset - fields[1].end_offset;
-    if (declared_body_length.value() != actual_body_length) {
-        return base::Status::FormatError("BodyLength mismatch");
-    }
 
-    auto expected_checksum = ParseUnsigned(fields.back().value, "CheckSum");
-    if (!expected_checksum.ok()) {
-        return expected_checksum.status();
-    }
-    std::uint32_t actual_checksum = 0;
-    for (std::size_t index = 0; index < fields.back().start_offset; ++index) {
-        actual_checksum += std::to_integer<unsigned char>(bytes[index]);
-    }
-    actual_checksum %= 256U;
-    if (actual_checksum != expected_checksum.value()) {
-        return base::Status::FormatError("CheckSum mismatch");
-    }
+    const auto body_start_offset = field1.value().next_pos;
 
     message::ParsedMessageData parsed_message;
     parsed_message.raw = bytes;
-    parsed_message.field_slots.reserve(fields.size());
-    parsed_message.groups.reserve(std::max<std::size_t>(1U, fields.size() / 4U));
     SessionHeaderView header;
     ValidationIssue validation_issue;
-    header.begin_string = fields[0].value;
+    header.begin_string = std::string_view(
+        reinterpret_cast<const char*>(bytes.data() + field0.value().value_offset),
+        field0.value().value_length);
     header.body_length = declared_body_length.value();
-    header.checksum = expected_checksum.value();
     ScopeValidationState message_validation;
-    message_validation.seen_tags.reserve(fields.size());
+    message_validation.seen_tags.reserve(bytes.size() / 8U);
 
-    std::size_t index = 2U;
-    while (index + 1U < fields.size()) {
-        const auto& field = fields[index];
-        if (ShouldSkipField(field.tag)) {
-            ++index;
+    std::size_t byte_pos = field1.value().next_pos;
+    std::size_t field_count = 2U;
+    std::size_t checksum_field_start = 0U;
+    bool saw_checksum = false;
+
+    // Cached across loop iterations — updated once when tag 35 is seen.
+    const profile::MessageDefRecord* cached_message_def = nullptr;
+    std::span<const profile::FieldRuleRecord> cached_rules{};
+
+    while (byte_pos < bytes.size()) {
+        auto scanned = ScanNextField(bytes, byte_pos, delimiter_byte, equals_byte);
+        if (!scanned.ok()) {
+            return scanned.status();
+        }
+        ++field_count;
+        const auto tag = scanned.value().tag;
+        const auto value_sv = std::string_view(
+            reinterpret_cast<const char*>(bytes.data() + scanned.value().value_offset),
+            scanned.value().value_length);
+
+        if (tag == 10U) {
+            auto expected_checksum = ParseUnsigned(value_sv, "CheckSum");
+            if (!expected_checksum.ok()) {
+                return expected_checksum.status();
+            }
+            header.checksum = expected_checksum.value();
+            checksum_field_start = scanned.value().start_offset;
+            saw_checksum = true;
+            byte_pos = scanned.value().next_pos;
+            break;
+        }
+
+        if (ShouldSkipField(tag)) {
+            byte_pos = scanned.value().next_pos;
             continue;
         }
 
-        if (field.tag == 35U) {
-            parsed_message.msg_type = field.value;
-            header.msg_type = field.value;
-            const auto* message_def = dictionary.find_message(header.msg_type);
-            const auto rules = message_def != nullptr
-                                   ? dictionary.message_field_rules(*message_def)
-                                   : std::span<const profile::FieldRuleRecord>{};
+        if (tag == 35U) {
+            parsed_message.msg_type = value_sv;
+            header.msg_type = value_sv;
+            cached_message_def = dictionary.find_message(header.msg_type);
+            cached_rules = cached_message_def != nullptr
+                               ? dictionary.message_field_rules(*cached_message_def)
+                               : std::span<const profile::FieldRuleRecord>{};
             ValidateConsumedField(
                 dictionary,
-                field.tag,
-                rules,
-                message_def != nullptr ? dictionary.message_rule_index(*message_def, field.tag) : -1,
+                tag,
+                cached_rules,
+                cached_message_def != nullptr ? dictionary.message_rule_index(*cached_message_def, tag) : -1,
                 &message_validation,
                 &validation_issue,
                 true,
-                message_def != nullptr,
+                cached_message_def != nullptr,
                 "message");
-            auto slot = MakeParsedFieldSlot(bytes, field, dictionary);
-            if (!slot.ok()) {
-                return slot.status();
-            }
-            AppendParsedFieldSlot(&parsed_message, RootContainer(), std::move(slot).value());
-            ++index;
+            auto slot = MakeParsedFieldSlot(
+                tag,
+                static_cast<std::uint32_t>(scanned.value().value_offset),
+                scanned.value().value_length,
+                dictionary);
+            AppendParsedFieldSlot(&parsed_message, RootContainer(), slot);
+            byte_pos = scanned.value().next_pos;
             continue;
         }
-        if (field.tag == 34U) {
-            auto parsed = ParseUnsigned(field.value, "MsgSeqNum");
+        if (tag == 34U) {
+            auto parsed = ParseUnsigned(value_sv, "MsgSeqNum");
             if (!parsed.ok()) {
                 return parsed.status();
             }
             header.msg_seq_num = parsed.value();
-        } else if (field.tag == 49U) {
-            header.sender_comp_id = field.value;
-        } else if (field.tag == 56U) {
-            header.target_comp_id = field.value;
-        } else if (field.tag == 52U) {
-            header.sending_time = field.value;
-        } else if (field.tag == 122U) {
-            header.orig_sending_time = field.value;
-        } else if (field.tag == 1137U) {
-            header.default_appl_ver_id = field.value;
-        } else if (field.tag == 43U) {
-            auto parsed = ParseBoolean(field.value, "PossDupFlag");
+        } else if (tag == 49U) {
+            header.sender_comp_id = value_sv;
+        } else if (tag == 56U) {
+            header.target_comp_id = value_sv;
+        } else if (tag == 52U) {
+            header.sending_time = value_sv;
+        } else if (tag == 122U) {
+            header.orig_sending_time = value_sv;
+        } else if (tag == 1137U) {
+            header.default_appl_ver_id = value_sv;
+        } else if (tag == 43U) {
+            auto parsed = ParseBoolean(value_sv, "PossDupFlag");
             if (!parsed.ok()) {
                 return parsed.status();
             }
             header.poss_dup = parsed.value();
         }
 
-        const profile::MessageDefRecord* message_def = nullptr;
-        if (!header.msg_type.empty()) {
-            message_def = dictionary.find_message(header.msg_type);
-        }
-        const auto rules = message_def != nullptr
-                               ? dictionary.message_field_rules(*message_def)
-                               : std::span<const profile::FieldRuleRecord>{};
+        // Single find_field per field — used for both validation and type resolution.
+        const auto* field_def = dictionary.find_field(tag);
 
         ValidateConsumedField(
             dictionary,
-            field.tag,
-            rules,
-            message_def != nullptr ? dictionary.message_rule_index(*message_def, field.tag) : -1,
+            tag,
+            cached_rules,
+            cached_message_def != nullptr ? dictionary.message_rule_index(*cached_message_def, tag) : -1,
             &message_validation,
             &validation_issue,
             true,
-            message_def != nullptr,
-            "message");
+            cached_message_def != nullptr,
+            "message",
+            field_def);
 
-        if (message_def != nullptr && dictionary.message_rule_allows_tag(*message_def, field.tag) &&
-            dictionary.find_group(field.tag) != nullptr) {
-            auto slot = MakeParsedFieldSlot(bytes, field, dictionary);
-            if (!slot.ok()) {
-                return slot.status();
-            }
-            AppendParsedFieldSlot(&parsed_message, RootContainer(), std::move(slot).value());
-            auto next_index = ParseParsedGroupEntries(
+        if (cached_message_def != nullptr && dictionary.message_rule_allows_tag(*cached_message_def, tag) &&
+            dictionary.find_group(tag) != nullptr) {
+            auto slot = MakeParsedFieldSlotWithType(
+                tag,
+                static_cast<std::uint32_t>(scanned.value().value_offset),
+                scanned.value().value_length,
+                ResolveFieldTypeWithDef(tag, field_def));
+            AppendParsedFieldSlot(&parsed_message, RootContainer(), slot);
+            auto next_pos = ParseParsedGroupEntries(
                 dictionary,
                 bytes,
-                fields,
-                index,
-                *dictionary.find_group(field.tag),
+                scanned.value().next_pos,
+                delimiter_byte,
+                equals_byte,
+                value_sv,
+                *dictionary.find_group(tag),
                 &parsed_message,
                 RootContainer(),
                 1U,
                 &validation_issue);
-            if (!next_index.ok()) {
-                return next_index.status();
+            if (!next_pos.ok()) {
+                return next_pos.status();
             }
-            index = next_index.value();
+            byte_pos = next_pos.value();
             continue;
         }
 
-        auto slot = MakeParsedFieldSlot(bytes, field, dictionary);
-        if (!slot.ok()) {
-            return slot.status();
+        auto slot = MakeParsedFieldSlotWithType(
+            tag,
+            static_cast<std::uint32_t>(scanned.value().value_offset),
+            scanned.value().value_length,
+            ResolveFieldTypeWithDef(tag, field_def));
+        AppendParsedFieldSlot(&parsed_message, RootContainer(), slot);
+        byte_pos = scanned.value().next_pos;
+    }
+
+    if (byte_pos != bytes.size()) {
+        return base::Status::FormatError("FIX frame has trailing data after CheckSum");
+    }
+    if (field_count < 4U) {
+        return base::Status::FormatError("FIX frame is too short");
+    }
+    if (!saw_checksum) {
+        return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
+    }
+
+    const auto actual_body_length = checksum_field_start - body_start_offset;
+    if (declared_body_length.value() != actual_body_length) {
+        return base::Status::FormatError("BodyLength mismatch");
+    }
+
+    const auto actual_checksum = [&]() -> std::uint32_t {
+        const auto* data = bytes.data();
+        std::uint32_t sum = 0;
+#if FASTFIX_HAS_SSE2
+        const auto zero = _mm_setzero_si128();
+        std::size_t i = 0;
+        for (; i + 16 <= checksum_field_start; i += 16) {
+            auto chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
+            auto sad = _mm_sad_epu8(chunk, zero);
+            sum += static_cast<std::uint32_t>(_mm_extract_epi16(sad, 0)) +
+                   static_cast<std::uint32_t>(_mm_extract_epi16(sad, 4));
         }
-        AppendParsedFieldSlot(&parsed_message, RootContainer(), std::move(slot).value());
-        ++index;
+        for (; i < checksum_field_start; ++i) {
+            sum += std::to_integer<unsigned char>(data[i]);
+        }
+#else
+        for (std::size_t i = 0; i < checksum_field_start; ++i) {
+            sum += std::to_integer<unsigned char>(data[i]);
+        }
+#endif
+        return sum % 256U;
+    }();
+    if (actual_checksum != header.checksum) {
+        return base::Status::FormatError("CheckSum mismatch");
     }
 
     DecodedMessageView decoded;

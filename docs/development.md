@@ -271,14 +271,14 @@ $BIN_DIR/fastfix-dictgen \
 | `--input` | yes | Base dictionary file (`.ffd`) |
 | `--merge` | no | Additional `.ffd` file(s) to merge, can specify multiple (also accepts `--overlay` for backwards compatibility) |
 | `--output` | yes | Output artifact path (`.art`) |
-| `--cpp-builders` | no | Generate C++ header with profile constants |
+| `--cpp-builders` | no | Generate C++ header with typed writer classes and profile constants |
 
 **Note:** `.art` precompilation is optional. The Engine can load `.ffd` files directly at runtime via the `dictionary=` config line or `config.profile_dictionaries`.
 
 **Output:**
 
 - `.art` — Binary artifact (mmap-loadable). Contains string table, field/message/group definitions, validation rules, lookup tables.
-- C++ header (optional) — Profile constants (profile ID, schema hash).
+- C++ header (optional) — Typed writer classes backed by `FixedLayoutWriter` (compile-time type-safe, O(1) slot writes), Tag constants, profile ID and schema hash.
 
 ### Adding a New FIX Version
 
@@ -299,13 +299,27 @@ You can also write `.ffd` files by hand for full control.
 
 ### Generated Profile Header
 
-The `--cpp-builders` flag produces a header with profile constants:
+The `--cpp-builders` flag produces a header with typed writer classes and profile constants:
 
 ```cpp
 #include "build/generated/sample_basic_builders.h"
 
 using namespace fastfix::generated::profile_1001;
-// kProfileId, kSchemaHash are available as inline constexpr values.
+
+// Build a FixedLayout for the message type, then use the generated writer.
+auto layout = message::FixedLayout::Build(dictionary_view, NewOrderSingleWriter::kMsgType);
+NewOrderSingleWriter writer(layout.value());
+writer.bind_session("FIX.4.4", "SENDER", "TARGET");
+
+// Hot loop — clear + fill + encode.
+writer.clear();
+writer.set_venue_order_type("LIT")
+      .set_venue_account("ACC-1");
+writer.add_parties()
+      .set_party_id("PTY1")
+      .set_party_id_source('D')
+      .set_party_role(1);
+writer.encode_to_buffer(dictionary_view, options, &buf);
 ```
 
 ---

@@ -7,6 +7,7 @@
 #include "fastfix/profile/dictgen_input.h"
 #include "fastfix/profile/overlay.h"
 #include "fastfix/profile/profile_loader.h"
+#include "sample_basic_builders.h"
 
 #include "test_support.h"
 
@@ -130,12 +131,12 @@ TEST_CASE("fixed-layout-writer-scalar-fields", "[message-api][fixed-layout]") {
     REQUIRE(layout.ok());
 
     fastfix::message::FixedLayoutWriter writer(layout.value());
-    REQUIRE(writer.set_string(49U, "BUY"));
-    REQUIRE(writer.set_string(56U, "SELL"));
-    REQUIRE(writer.set_string(5001U, "LIT"));
+    writer.set_string(49U, "BUY");
+    writer.set_string(56U, "SELL");
+    writer.set_string(5001U, "LIT");
 
-    // Unknown tag should fail.
-    CHECK_FALSE(writer.set_string(99999U, "NOPE"));
+    // Unknown tag silently ignored (no error reporting on hot path).
+    writer.set_string(99999U, "NOPE");
 
     // Encode + decode roundtrip to verify fields.
     fastfix::codec::EncodeOptions options;
@@ -258,10 +259,10 @@ TEST_CASE("fixed-layout-writer-all-value-types", "[message-api][fixed-layout]") 
     fastfix::message::FixedLayoutWriter writer(layout.value());
 
     // All tags in this profile are string/int/char type: 49=string, 56=string, 5001=string, 5002=string.
-    CHECK(writer.set_string(49U, "BUY"));
-    CHECK(writer.set_string(56U, "SELL"));
-    CHECK(writer.set_string(5001U, "LIT"));
-    CHECK(writer.set_string(5002U, "ACC-1"));
+    writer.set_string(49U, "BUY");
+    writer.set_string(56U, "SELL");
+    writer.set_string(5001U, "LIT");
+    writer.set_string(5002U, "ACC-1");
 
     // Encode + decode roundtrip to verify all value types.
     fastfix::codec::EncodeOptions options;
@@ -338,9 +339,9 @@ TEST_CASE("fixed-layout-writer-extra-fields-hybrid-path", "[message-api][fixed-l
     fastfix::message::FixedLayoutWriter writer(layout.value());
 
     // Set known layout fields via normal O(1) setters.
-    REQUIRE(writer.set_string(49U, "SENDER"));
-    REQUIRE(writer.set_string(56U, "TARGET"));
-    REQUIRE(writer.set_string(5001U, "LIT"));
+    writer.set_string(49U, "SENDER");
+    writer.set_string(56U, "TARGET");
+    writer.set_string(5001U, "LIT");
 
     // Set extra fields NOT in the layout via hybrid path.
     writer.set_extra_string(9999U, "CUSTOM_VAL");
@@ -381,4 +382,197 @@ TEST_CASE("fixed-layout-writer-extra-fields-hybrid-path", "[message-api][fixed-l
     REQUIRE(writer2.encode_to_buffer(dictionary.value(), options, &buf2).ok());
     const auto wire2 = buf2.text();
     CHECK(wire2.find("8888=EXT") != std::string_view::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Generated typed writer tests
+// ---------------------------------------------------------------------------
+
+using namespace fastfix::generated::profile_1001;
+
+TEST_CASE("generated-writer-scalar-fields", "[message-api][generated-writer]") {
+    auto dictionary = LoadMessageApiDictionary();
+    REQUIRE(dictionary.ok());
+
+    auto layout = fastfix::message::FixedLayout::Build(dictionary.value(), "D");
+    REQUIRE(layout.ok());
+
+    NewOrderSingleWriter writer(layout.value());
+    writer.set_venue_order_type("LIT").set_venue_account("ACC-1");
+
+    fastfix::codec::EncodeOptions options;
+    options.begin_string = "FIX.4.4";
+    options.sender_comp_id = "BUY";
+    options.target_comp_id = "SELL";
+    options.msg_seq_num = 1U;
+    options.sending_time = "20260406-12:00:00.000";
+
+    fastfix::codec::EncodeBuffer buf;
+    REQUIRE(writer.encode_to_buffer(dictionary.value(), options, &buf).ok());
+
+    auto decoded = fastfix::codec::DecodeFixMessageView(buf.bytes(), dictionary.value());
+    REQUIRE(decoded.ok());
+    auto view = decoded.value().message.view();
+
+    CHECK(view.msg_type() == "D");
+    REQUIRE(view.get_string(Tag::VenueOrderType).has_value());
+    CHECK(view.get_string(Tag::VenueOrderType).value() == "LIT");
+    REQUIRE(view.get_string(Tag::VenueAccount).has_value());
+    CHECK(view.get_string(Tag::VenueAccount).value() == "ACC-1");
+}
+
+TEST_CASE("generated-writer-with-groups", "[message-api][generated-writer]") {
+    auto dictionary = LoadMessageApiDictionary();
+    REQUIRE(dictionary.ok());
+
+    auto layout = fastfix::message::FixedLayout::Build(dictionary.value(), "D");
+    REQUIRE(layout.ok());
+
+    NewOrderSingleWriter writer(layout.value());
+    writer.set_venue_order_type("LIT");
+    writer.add_parties()
+        .set_party_id("PTY1")
+        .set_party_id_source('D')
+        .set_party_role(1);
+    writer.add_parties()
+        .set_party_id("PTY2")
+        .set_party_id_source('G')
+        .set_party_role(4);
+
+    fastfix::codec::EncodeOptions options;
+    options.begin_string = "FIX.4.4";
+    options.sender_comp_id = "BUY";
+    options.target_comp_id = "SELL";
+    options.msg_seq_num = 2U;
+    options.sending_time = "20260406-12:00:00.000";
+
+    fastfix::codec::EncodeBuffer buf;
+    REQUIRE(writer.encode_to_buffer(dictionary.value(), options, &buf).ok());
+
+    auto decoded = fastfix::codec::DecodeFixMessageView(buf.bytes(), dictionary.value());
+    REQUIRE(decoded.ok());
+    auto view = decoded.value().message.view();
+
+    auto group = view.group(Tag::NoPartyIDs);
+    REQUIRE(group.has_value());
+    REQUIRE(group->size() == 2U);
+    CHECK((*group)[0].get_string(Tag::PartyID).value() == "PTY1");
+    CHECK((*group)[0].get_char(Tag::PartyIDSource).value() == 'D');
+    CHECK((*group)[0].get_int(Tag::PartyRole).value() == 1);
+    CHECK((*group)[1].get_string(Tag::PartyID).value() == "PTY2");
+    CHECK((*group)[1].get_char(Tag::PartyIDSource).value() == 'G');
+    CHECK((*group)[1].get_int(Tag::PartyRole).value() == 4);
+}
+
+TEST_CASE("generated-writer-matches-raw-fixed-layout-writer", "[message-api][generated-writer]") {
+    auto dictionary = LoadMessageApiDictionary();
+    REQUIRE(dictionary.ok());
+
+    auto layout = fastfix::message::FixedLayout::Build(dictionary.value(), "D");
+    REQUIRE(layout.ok());
+
+    fastfix::codec::EncodeOptions options;
+    options.begin_string = "FIX.4.4";
+    options.sender_comp_id = "BUY";
+    options.target_comp_id = "SELL";
+    options.msg_seq_num = 3U;
+    options.sending_time = "20260406-12:34:56.789";
+
+    // Build via raw FixedLayoutWriter.
+    fastfix::message::FixedLayoutWriter raw(layout.value());
+    raw.set_string(5001U, "LIT");
+    raw.set_string(5002U, "ACC-1");
+    auto raw_party = raw.add_group_entry(453U);
+    raw_party.set_string(448U, "PTY1").set_char(447U, 'D').set_int(452U, 1);
+
+    fastfix::codec::EncodeBuffer raw_buf;
+    REQUIRE(raw.encode_to_buffer(dictionary.value(), options, &raw_buf).ok());
+
+    // Build via generated NewOrderSingleWriter.
+    NewOrderSingleWriter typed(layout.value());
+    typed.set_venue_order_type("LIT").set_venue_account("ACC-1");
+    typed.add_parties()
+        .set_party_id("PTY1")
+        .set_party_id_source('D')
+        .set_party_role(1);
+
+    fastfix::codec::EncodeBuffer typed_buf;
+    REQUIRE(typed.encode_to_buffer(dictionary.value(), options, &typed_buf).ok());
+
+    // Wire output should be identical.
+    CHECK(raw_buf.text() == typed_buf.text());
+}
+
+TEST_CASE("generated-writer-clear-and-reuse", "[message-api][generated-writer]") {
+    auto dictionary = LoadMessageApiDictionary();
+    REQUIRE(dictionary.ok());
+
+    auto layout = fastfix::message::FixedLayout::Build(dictionary.value(), "D");
+    REQUIRE(layout.ok());
+
+    NewOrderSingleWriter writer(layout.value());
+    writer.bind_session("FIX.4.4", "BUY", "SELL");
+
+    fastfix::codec::EncodeOptions options;
+    options.begin_string = "FIX.4.4";
+    options.sender_comp_id = "BUY";
+    options.target_comp_id = "SELL";
+    options.sending_time = "20260406-12:00:00.000";
+
+    // First encode.
+    writer.set_venue_order_type("LIT");
+    options.msg_seq_num = 1U;
+    fastfix::codec::EncodeBuffer buf1;
+    REQUIRE(writer.encode_to_buffer(dictionary.value(), options, &buf1).ok());
+
+    // Clear and reuse.
+    writer.clear();
+    writer.set_venue_order_type("DARK");
+    writer.set_venue_account("ACC-2");
+    options.msg_seq_num = 2U;
+    fastfix::codec::EncodeBuffer buf2;
+    REQUIRE(writer.encode_to_buffer(dictionary.value(), options, &buf2).ok());
+
+    auto decoded = fastfix::codec::DecodeFixMessageView(buf2.bytes(), dictionary.value());
+    REQUIRE(decoded.ok());
+    auto view = decoded.value().message.view();
+
+    CHECK(view.msg_type() == "D");
+    REQUIRE(view.get_string(Tag::VenueOrderType).has_value());
+    CHECK(view.get_string(Tag::VenueOrderType).value() == "DARK");
+    REQUIRE(view.get_string(Tag::VenueAccount).has_value());
+    CHECK(view.get_string(Tag::VenueAccount).value() == "ACC-2");
+
+    // First-encode fields should NOT leak into second encode.
+    const auto wire = buf2.text();
+    CHECK(wire.find("5001=DARK") != std::string_view::npos);
+    CHECK(wire.find("5001=LIT") == std::string_view::npos);
+}
+
+TEST_CASE("generated-writer-escape-hatch", "[message-api][generated-writer]") {
+    auto dictionary = LoadMessageApiDictionary();
+    REQUIRE(dictionary.ok());
+
+    auto layout = fastfix::message::FixedLayout::Build(dictionary.value(), "D");
+    REQUIRE(layout.ok());
+
+    NewOrderSingleWriter writer(layout.value());
+    writer.set_venue_order_type("LIT");
+
+    // Use escape hatch for an unknown/extension field.
+    writer.writer().set_extra_string(9999U, "CUSTOM");
+
+    fastfix::codec::EncodeOptions options;
+    options.begin_string = "FIX.4.4";
+    options.sender_comp_id = "BUY";
+    options.target_comp_id = "SELL";
+    options.msg_seq_num = 1U;
+    options.sending_time = "20260406-12:00:00.000";
+
+    fastfix::codec::EncodeBuffer buf;
+    REQUIRE(writer.encode_to_buffer(dictionary.value(), options, &buf).ok());
+
+    const auto wire = buf.text();
+    CHECK(wire.find("9999=CUSTOM") != std::string_view::npos);
+    CHECK(wire.find("5001=LIT") != std::string_view::npos);
 }

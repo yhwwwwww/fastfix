@@ -28,7 +28,7 @@ What each command does:
 - `fastfix`: runs the main FastFix suite against `build/bench/quickfix_FIX44.art`. If no extra args are supplied, it uses `--iterations 100000 --loopback 1000 --replay 1000`.
 - `fastfix-ffd`: runs the same FastFix suite but loads `build/bench/quickfix_FIX44.ffd` directly at startup. Default args are `--iterations 30000 --loopback 200 --replay 200`.
 - `quickfix`: runs the QuickFIX comparison benchmark against the same upstream `FIX44.xml`. Default args are `--iterations 100000`.
-- `builder`: runs the main FastFix suite against `build/bench/quickfix_FIX44.art`, defaulting to `--iterations 100000 --loopback 0 --replay 0`. Use this when iterating on the object-to-wire encode comparison block (`builder-generic-e2e-buffer`, `builder-fixed-layout-buffer`, `builder-fixed-layout-hybrid-buffer`) without paying for loopback/replay noise.
+- `builder`: runs the main FastFix suite against `build/bench/quickfix_FIX44.art`, defaulting to `--iterations 100000 --loopback 0 --replay 0`. Use this to iterate on the encode metric without loopback/replay noise.
 - `compare`: runs the default FastFix artifact suite followed by the default QuickFIX comparison suite.
 
 Prerequisites:
@@ -40,111 +40,106 @@ Prerequisites:
 
 ## Measurement Boundaries
 
-The object-to-wire encode comparisons are intentionally measured from a neutral business object to wire bytes.
+Encode comparisons measure from a neutral business object to wire bytes. Both FastFix and QuickFIX pin `SendingTime` to a fixture timestamp so numbers stay focused on object construction plus serialization instead of per-iteration clock formatting.
 
-- FastFix codec microbench metrics (`encode*`) build a `fastfix::message::Message` or `MessageBuilder` inside the timed region and then encode it.
-- FastFix object-to-wire compare metrics (`builder-generic-e2e-buffer`, `builder-fixed-layout-buffer`, `builder-fixed-layout-hybrid-buffer`) build and populate the benchmark-side builder/writer inside the timed region and then call `encode_to_buffer()`.
-- QuickFIX encode metrics build `FIX44::NewOrderSingle` inside the timed region and then serialize it.
-- Both sides pin `SendingTime` to the fixture timestamp for the primary compare path, so the numbers stay focused on object construction plus serialization instead of per-iteration clock formatting.
+- FastFix `encode`: uses the codegen-generated typed writer (backed by `FixedLayoutWriter`) to populate fields from a business object, then calls `encode_to_buffer()`.
+- QuickFIX `quickfix-encode-buffer`: builds `FIX44::NewOrderSingle` from the same business object, then serializes into a reused output buffer.
 - Parse metrics start from a complete FIX frame and measure parse into the protocol object model.
 
-This avoids comparing one side's pure serializer against the other side's object-construction path.
+## Benchmark Metrics
 
-## Benchmark Groups
+### FastFix Suite
 
-### FastFix Main Suite
-
-- `parse`: FIX44 wire frame to `fastfix::message::Message`.
-- `encode`: business object to `Message`, then encode to a fresh string.
-- `encode-buffer`: business object to `Message`, then encode into a reused output buffer.
-- `encode-buffer-time-fixed`: same as `encode-buffer`, but `SendingTime` is fixed instead of regenerated each iteration.
-- `encode-buffer-template`: same as `encode-buffer`, but the template lookup is cached.
-- `encode-buffer-time-fixed-template`: combines fixed `SendingTime` with cached template lookup.
-- `encode-buffer-time-fixed-template-no-float`: same as above, with the float field omitted from the sample order.
-- `encode-buffer-precompiled-table`: encode path using the precompiled field table.
-- `peek`: parse header-enough information for lightweight inspection.
-- `session-inbound`: decode plus admin/session handling for an inbound application frame.
-- `replay`: resend/recovery path across a span of stored messages.
-- `loopback-roundtrip`: initiator sends `NewOrderSingle (35=D)` over local TCP loopback and waits until the acceptor returns `ExecutionReport (35=8)` order ack.
-
-### FastFix Object-To-Wire Encode Compare
-
-These are the three FastFix encode methods intended for direct comparison against the QuickFIX encode metrics.
-
-- `builder-generic-e2e-buffer`: generic `MessageBuilder` path from business object to wire.
-- `builder-fixed-layout-buffer`: fixed-layout hot path from business object to wire.
-- `builder-fixed-layout-hybrid-buffer`: fixed-layout hot path plus extra-field hybrid path from business object to wire.
-
-All three use fixed `SendingTime` and `encode_to_buffer()` so they stay on the same comparison boundary as QuickFIX's buffer-based metric.
+| Metric | What it measures |
+|--------|-----------------|
+| `encode` | Business object → generated typed writer → wire bytes (reused buffer) |
+| `peek` | Extract session header from raw FIX frame without full parse |
+| `parse` | FIX44 wire frame → `fastfix::message::Message` |
+| `session-inbound` | Full session layer: decode + admin/session handling for an inbound application frame |
+| `replay` | Resend/recovery path across a span of stored messages |
+| `loopback-roundtrip` | Initiator sends NewOrderSingle over TCP loopback, waits for ExecutionReport ack |
 
 ### QuickFIX Comparison Suite
 
-- `quickfix-parse`: FIX44 wire frame to `FIX44::NewOrderSingle`.
-- `quickfix-encode`: business object to `FIX44::NewOrderSingle`, then serialize to a fresh string.
-- `quickfix-encode-buffer`: same serializer, but write into a reused caller-owned output buffer.
-
-QuickFIX C++ exposes one real FIX serializer with two call styles (`toString()` and `toString(buffer)`). Both metrics use fixed `SendingTime` to match the FastFix object-to-wire compare block.
+| Metric | What it measures |
+|--------|-----------------|
+| `quickfix-parse` | FIX44 wire frame → `FIX44::NewOrderSingle` |
+| `quickfix-encode` | Business object → `FIX44::NewOrderSingle` → fresh string |
+| `quickfix-encode-buffer` | Same as above, but into a reused caller-owned output buffer |
+| `quickfix-session-inbound` | Full session layer: `Session::next()` on an application frame including sequence validation and store |
+| `quickfix-replay` | In-process ResendRequest replay across a span of stored messages |
+| `quickfix-loopback` | Real TCP loopback using `ThreadedSocketAcceptor`; measures full round-trip RTT |
 
 ## Latest Full Compare Snapshot
 
-The full default suite was rerun on 2026-04-06 with `./bench/bench.sh compare`. The raw output from that run is saved at `build/bench/latest-compare.txt`.
+The full default suite was rerun on 2026-04-08 with `./bench/bench.sh compare`. The raw output from that run is saved at `build/bench/latest-compare.txt`.
 
 ### Cross-Engine Summary
 
-| Comparable boundary | FastFix metric | FastFix avg_ns | QuickFIX metric | QuickFIX avg_ns | Delta vs QuickFIX | FastFix alloc/op | QuickFIX alloc/op |
-|------|------|--------|------|--------|------------------|------------------|-------------------|
-| parse | `parse` | 1314.35 | `quickfix-parse` | 846.74 | +55.2% slower | 2.00 | 15.00 |
-| generic object-to-wire | `builder-generic-e2e-buffer` | 1337.90 | `quickfix-encode-buffer` | 1263.39 | +5.9% slower | 9.00 | 29.00 |
-| fixed-layout object-to-wire | `builder-fixed-layout-buffer` | 684.05 | `quickfix-encode-buffer` | 1263.39 | 45.9% faster | 13.00 | 29.00 |
-| hybrid object-to-wire | `builder-fixed-layout-hybrid-buffer` | 754.13 | `quickfix-encode-buffer` | 1263.39 | 40.3% faster | 15.00 | 29.00 |
+| Boundary | FastFix metric | QuickFIX metric | FastFix p50 | FastFix p95 | QuickFIX p50 | QuickFIX p95 |
+|----------|----------------|-----------------|-------------|-------------|--------------|--------------|
+| encode (object → wire) | `encode` | `quickfix-encode-buffer` | 461 ns | 491 ns | 1.25 µs | 1.43 µs |
+| parse (wire → object) | `parse` | `quickfix-parse` | 992 ns | 1.02 µs | 1.25 µs | 1.30 µs |
+| session-inbound | `session-inbound` | `quickfix-session-inbound` | 2.58 µs | 2.71 µs | 2.32 µs | 2.44 µs |
+| replay (128 msgs) | `replay` | `quickfix-replay` | 361 µs | 367 µs | 233 µs | 240 µs |
+| loopback RTT | `loopback-roundtrip` | `quickfix-loopback` | 20.01 µs | 26.60 µs | 20.30 µs | 24.68 µs |
 
-QuickFIX still leads the raw parse path, but the current FastFix fixed-layout and hybrid order-to-wire paths are ahead of QuickFIX's buffer serializer on the same business-object-to-wire boundary.
-
+FastFix encode is ~2.7× faster via the generated typed writer. QuickFIX leads the raw parse path by a modest margin. Session-inbound is near parity (~10% difference). QuickFIX replay is faster wall-time but allocates 4,117/op vs 0/op for FastFix — it returns stored string copies per message rather than re-encoding from the store. Loopback is dominated by TCP kernel RTT and is essentially identical.
 ### FastFix Suite Snapshot
 
-| Metric | avg_ns | p50_ns | p99_ns | alloc/op | ops/sec |
-|--------|--------|--------|--------|----------|---------|
-| `encode` | 1471.15 | 1383 | 1864 | 14.00 | 679,741 |
-| `encode-buffer` | 1490.47 | 1453 | 1684 | 5.00 | 670,930 |
-| `encode-buffer-time-fixed` | 1412.62 | 1382 | 1743 | 5.00 | 707,906 |
-| `encode-buffer-template` | 1224.99 | 1172 | 1393 | 5.00 | 816,336 |
-| `encode-buffer-time-fixed-template` | 1185.23 | 1142 | 1363 | 5.00 | 843,718 |
-| `encode-buffer-time-fixed-template-no-float` | 1179.28 | 1122 | 1422 | 5.00 | 847,973 |
-| `encode-buffer-precompiled-table` | 1430.97 | 1382 | 1603 | 9.00 | 698,828 |
-| `builder-generic-e2e-buffer` | 1337.90 | 1333 | 1543 | 9.00 | 747,443 |
-| `builder-fixed-layout-buffer` | 684.05 | 651 | 752 | 13.00 | 1,461,876 |
-| `builder-fixed-layout-hybrid-buffer` | 754.13 | 721 | 771 | 15.00 | 1,326,035 |
-| `peek` | 198.26 | 180 | 191 | 0.00 | 5,043,875 |
-| `parse` | 1314.35 | 1283 | 1313 | 2.00 | 760,833 |
-| `session-inbound` | 2980.57 | 2765 | 4688 | 2.00 | 335,507 |
-| `replay` | 546176.55 | 532382 | 622737 | 257.00 | 1,831 |
-| `loopback-roundtrip` | 26486.70 | 25657 | 32269 | 7.00 | 37,755 |
-
-The same run also reported `335,506.73` inbound messages/s on `session-inbound` and `234,356.46` replay frames/s across the 128-frame resend batches.
+| Metric | p50 | p95 | p99 | alloc/op | ops/sec | cache/op | branch/op |
+|--------|-----|-----|-----|----------|---------|----------|-----------|
+| `encode` | 461 ns | 491 ns | 571 ns | 0 | 2,020,000 | 0.0 | 0.0 |
+| `peek` | 180 ns | 190 ns | 191 ns | 0 | 4,950,000 | 0.0 | 0.0 |
+| `parse` | 992 ns | 1.02 µs | 1.23 µs | 0 | 967,900 | 0.0 | 0.0 |
+| `session-inbound` | 2.58 µs | 2.71 µs | 4.00 µs | 0 | 371,700 | 0.9 | 0.1 |
+| `replay` | 361 µs | 367 µs | 378 µs | 0 | 2,900 | 19.7 | 197.1 |
+| `loopback-roundtrip` | 20.01 µs | 26.60 µs | 35.19 µs | 3 | 45,200 | 16.1 | 34.4 |
 
 ### QuickFIX Suite Snapshot
 
-| Metric | avg_ns | p50_ns | p99_ns | alloc/op | ops/sec |
-|--------|--------|--------|--------|----------|---------|
-| `quickfix-parse` | 846.74 | 761 | 1152 | 15.00 | 1,181,002 |
-| `quickfix-encode` | 1297.66 | 1202 | 1332 | 30.00 | 770,620 |
-| `quickfix-encode-buffer` | 1263.39 | 1163 | 1213 | 29.00 | 791,521 |
+| Metric | p50 | p95 | p99 | alloc/op | ops/sec | cache/op | branch/op |
+|--------|-----|-----|-----|----------|---------|----------|-----------|
+| `quickfix-parse` | 1.25 µs | 1.30 µs | 1.85 µs | 20 | 736,100 | 0.1 | 0.0 |
+| `quickfix-encode` | 1.27 µs | 1.44 µs | 1.62 µs | 30 | 690,300 | 0.0 | 0.0 |
+| `quickfix-encode-buffer` | 1.25 µs | 1.43 µs | 1.45 µs | 29 | 723,200 | 0.0 | 0.0 |
+| `quickfix-session-inbound` | 2.32 µs | 2.44 µs | 3.11 µs | 18 | 421,400 | 0.5 | 0.2 |
+| `quickfix-replay` | 233 µs | 240 µs | 242 µs | 4,117 | 4,300 | 12.1 | 215.2 |
+| `quickfix-loopback` | 20.30 µs | 24.68 µs | 31.64 µs | 77 | 45,900 | 14.5 | 16.4 |
 
 ## Metric Fields
 
-Each result line prints the same metric schema.
+Each result is reported in two forms: a compact aligned table and a verbose single-line summary.
+
+### Table columns
+
+The printed table (via `PrintResultTable`) contains these columns:
+
+| Column | Description |
+|--------|-------------|
+| `Metric` | Benchmark name |
+| `Count` | Number of iterations |
+| `p50`, `p95`, `p99` | Latency percentiles formatted as `ns` or `µs` |
+| `Alloc/op` | Heap allocations per iteration (from global `operator new` hooks) |
+| `Ops/sec` | Throughput derived from total wall time |
+| `Cache/op` | L1/LLC cache misses per iteration from Linux `perf_event_open`; `n/a` when unavailable |
+| `Branch/op` | Branch mispredictions per iteration from Linux `perf_event_open`; `n/a` when unavailable |
+
+### Verbose line fields
+
+Each benchmark also emits a single raw line with the full counter set:
 
 - `count`: number of benchmark iterations.
 - `total_ns`: wall-clock nanoseconds for the full benchmark run.
 - `cpu_ns`: process CPU nanoseconds consumed during the run.
 - `cpu_pct`: `cpu_ns / total_ns` as a percentage.
-- `allocs`: heap allocation count captured through the benchmark-local `operator new` hooks.
-- `alloc_bytes`: total bytes allocated through those hooks.
+- `allocs`: total heap allocation count over all iterations.
+- `alloc_bytes`: total bytes allocated over all iterations.
 - `avg_ns`: average wall-clock nanoseconds per iteration.
-- `min_ns`, `p50_ns`, `p95_ns`, `p99_ns`, `p999_ns`, `max_ns`: percentile summary over the per-iteration samples.
+- `min_ns`, `p50_ns`, `p95_ns`, `p99_ns`, `p999_ns`, `max_ns`: percentile summary over per-iteration `steady_clock` samples.
 - `ops_per_sec`: iterations per second derived from wall time.
-- `cache_miss`, `branch_miss`: Linux `perf_event_open` counters when available, otherwise `n/a`.
-- `<work_label>` and `<work_label>_per_sec`: additional work counters used by benchmarks such as replay where one iteration may emit multiple outbound frames.
+- `cache_miss`, `branch_miss`: total Linux `perf_event_open` hardware counters for the full run; omitted on non-Linux platforms.
+- `<work_label>`, `<work_label>_per_sec`: optional extra throughput counters for benchmarks where one iteration produces multiple output units (e.g. `frames` for the replay path).
 
 ## Output Artifacts
 

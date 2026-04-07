@@ -73,13 +73,20 @@ TEST_CASE("dictgen", "[dictgen]") {    const auto ToReadableFrame = [](std::span
         ordered_merged.value().messages.end(),
         [](const auto& candidate) { return candidate.msg_type == "D"; });
     REQUIRE(ordered_message != ordered_merged.value().messages.end());
-    REQUIRE(ordered_message->field_rules.size() == 6U);
+    REQUIRE(ordered_message->field_rules.size() == 13U);
     REQUIRE(ordered_message->field_rules[0].tag == 35U);
-    REQUIRE(ordered_message->field_rules[1].tag == 49U);
-    REQUIRE(ordered_message->field_rules[2].tag == 56U);
-    REQUIRE(ordered_message->field_rules[3].tag == 5001U);
-    REQUIRE(ordered_message->field_rules[4].tag == 5002U);
-    REQUIRE(ordered_message->field_rules[5].tag == 453U);
+    REQUIRE(ordered_message->field_rules[1].tag == 11U);
+    REQUIRE(ordered_message->field_rules[2].tag == 49U);
+    REQUIRE(ordered_message->field_rules[3].tag == 56U);
+    REQUIRE(ordered_message->field_rules[4].tag == 55U);
+    REQUIRE(ordered_message->field_rules[5].tag == 54U);
+    REQUIRE(ordered_message->field_rules[6].tag == 60U);
+    REQUIRE(ordered_message->field_rules[7].tag == 38U);
+    REQUIRE(ordered_message->field_rules[8].tag == 40U);
+    REQUIRE(ordered_message->field_rules[9].tag == 44U);
+    REQUIRE(ordered_message->field_rules[10].tag == 5001U);
+    REQUIRE(ordered_message->field_rules[11].tag == 5002U);
+    REQUIRE(ordered_message->field_rules[12].tag == 453U);
 
     auto ordered_artifact = fastfix::profile::BuildProfileArtifact(ordered_merged.value());
     REQUIRE(ordered_artifact.ok());
@@ -91,10 +98,10 @@ TEST_CASE("dictgen", "[dictgen]") {    const auto ToReadableFrame = [](std::span
     REQUIRE(ordered_view.ok());
     const auto* ordered_message_view = ordered_view.value().find_message("D");
     REQUIRE(ordered_message_view != nullptr);
-    REQUIRE(ordered_view.value().message_field_rules(*ordered_message_view).size() == 6U);
-    REQUIRE(ordered_view.value().message_field_rules(*ordered_message_view)[3].tag == 5001U);
-    REQUIRE(ordered_view.value().message_field_rules(*ordered_message_view)[4].tag == 5002U);
-    REQUIRE(ordered_view.value().message_field_rules(*ordered_message_view)[5].tag == 453U);
+    REQUIRE(ordered_view.value().message_field_rules(*ordered_message_view).size() == 13U);
+    REQUIRE(ordered_view.value().message_field_rules(*ordered_message_view)[10].tag == 5001U);
+    REQUIRE(ordered_view.value().message_field_rules(*ordered_message_view)[11].tag == 5002U);
+    REQUIRE(ordered_view.value().message_field_rules(*ordered_message_view)[12].tag == 453U);
 
     fastfix::codec::EncodeOptions options;
     options.begin_string = "FIX.4.4";

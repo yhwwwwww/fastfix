@@ -435,7 +435,12 @@ void Engine::SetSessionFactory(SessionFactory factory) {
 
 void WhitelistSessionFactory::Allow(std::string_view begin_string, std::string_view sender_comp_id,
                                     const CounterpartyConfig& config_template) {
-    entries_.push_back(Entry{
+    std::string key;
+    key.reserve(begin_string.size() + 1 + sender_comp_id.size());
+    key.append(begin_string);
+    key.push_back('\x01');
+    key.append(sender_comp_id);
+    entries_.emplace(std::move(key), Entry{
         .begin_string = std::string(begin_string),
         .sender_comp_id = std::string(sender_comp_id),
         .config_template = config_template,
@@ -448,16 +453,33 @@ void WhitelistSessionFactory::AllowAny(const CounterpartyConfig& config_template
 
 auto WhitelistSessionFactory::operator()(const session::SessionKey& key) const
     -> base::Result<CounterpartyConfig> {
-    for (const auto& entry : entries_) {
-        if (entry.begin_string != key.begin_string) {
-            continue;
+    // Try exact match first: begin_string + \x01 + sender_comp_id
+    {
+        std::string lookup;
+        lookup.reserve(key.begin_string.size() + 1 + key.sender_comp_id.size());
+        lookup.append(key.begin_string);
+        lookup.push_back('\x01');
+        lookup.append(key.sender_comp_id);
+        const auto it = entries_.find(lookup);
+        if (it != entries_.end()) {
+            auto config = it->second.config_template;
+            config.session.key = key;
+            return config;
         }
-        if (!entry.sender_comp_id.empty() && entry.sender_comp_id != key.sender_comp_id) {
-            continue;
+    }
+
+    // Try wildcard sender match: begin_string + \x01 + ""
+    {
+        std::string lookup;
+        lookup.reserve(key.begin_string.size() + 1);
+        lookup.append(key.begin_string);
+        lookup.push_back('\x01');
+        const auto it = entries_.find(lookup);
+        if (it != entries_.end()) {
+            auto config = it->second.config_template;
+            config.session.key = key;
+            return config;
         }
-        auto config = entry.config_template;
-        config.session.key = key;
-        return config;
     }
 
     if (allow_any_template_.has_value()) {

@@ -156,3 +156,40 @@ TEST_CASE("profile warming disabled by default", "[profile-loader]") {
     REQUIRE(options.mlock == false);
 }
 
+TEST_CASE("schema_hash validation match", "[profile-loader]") {
+    const auto artifact_path = std::filesystem::temp_directory_path() / "fastfix-schema-hash-test.art";
+    WriteTestArtifact(artifact_path);
+
+    auto loaded = fastfix::profile::LoadProfileArtifact(artifact_path);
+    REQUIRE(loaded.ok());
+
+    // Matching hash succeeds
+    auto status = fastfix::profile::ValidateSchemaHash(loaded.value(), 0x1122334455667788ULL);
+    REQUIRE(status.ok());
+
+    std::filesystem::remove(artifact_path);
+}
+
+TEST_CASE("schema_hash validation mismatch", "[profile-loader]") {
+    const auto artifact_path = std::filesystem::temp_directory_path() / "fastfix-schema-hash-mismatch-test.art";
+    WriteTestArtifact(artifact_path);
+
+    auto loaded = fastfix::profile::LoadProfileArtifact(artifact_path);
+    REQUIRE(loaded.ok());
+
+    // Wrong hash fails with VersionMismatch
+    auto status = fastfix::profile::ValidateSchemaHash(loaded.value(), 0xDEADBEEFULL);
+    REQUIRE_FALSE(status.ok());
+    REQUIRE(status.code() == fastfix::base::ErrorCode::kVersionMismatch);
+    REQUIRE(status.message().find("schema_hash mismatch") != std::string::npos);
+
+    std::filesystem::remove(artifact_path);
+}
+
+TEST_CASE("schema_hash validation invalid profile", "[profile-loader]") {
+    fastfix::profile::LoadedProfile empty_profile;
+    auto status = fastfix::profile::ValidateSchemaHash(empty_profile, 42ULL);
+    REQUIRE_FALSE(status.ok());
+    REQUIRE(status.code() == fastfix::base::ErrorCode::kInvalidArgument);
+}
+

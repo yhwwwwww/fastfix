@@ -14,6 +14,7 @@
 namespace fastfix::transport {
 
 inline constexpr int kDefaultTcpListenBacklog = 64;
+inline constexpr std::size_t kMaxReadBufferSize = 1048576U;  // 1 MB
 
 class TcpConnection {
   public:

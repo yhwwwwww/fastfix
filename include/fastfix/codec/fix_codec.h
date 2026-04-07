@@ -18,6 +18,8 @@ namespace fastfix::codec {
 
 inline constexpr char kFixSoh = '\x01';
 inline constexpr std::size_t kUtcTimestampLength = 21U;
+inline constexpr std::uint32_t kMaxGroupEntryCount = 10000U;
+inline constexpr std::uint16_t kMaxGroupNestingDepth = 16U;
 
 enum class ValidationIssueKind : std::uint32_t {
     kNone = 0,

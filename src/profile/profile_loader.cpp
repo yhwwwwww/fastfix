@@ -265,4 +265,17 @@ auto LoadProfileFromDictionaryFiles(std::span<const std::filesystem::path> paths
     return LoadProfileFromDictionary(merged);
 }
 
+auto ValidateSchemaHash(const LoadedProfile& profile, std::uint64_t expected_hash) -> base::Status {
+    if (!profile.valid()) {
+        return base::Status::InvalidArgument("ValidateSchemaHash: loaded profile is not valid");
+    }
+    const auto actual_hash = profile.schema_hash();
+    if (actual_hash != expected_hash) {
+        return base::Status::VersionMismatch(
+            "schema_hash mismatch: artifact has " + std::to_string(actual_hash) +
+            " but generated code expects " + std::to_string(expected_hash));
+    }
+    return base::Status::Ok();
+}
+
 }  // namespace fastfix::profile

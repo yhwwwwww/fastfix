@@ -47,7 +47,7 @@ class WhitelistSessionFactory {
         std::string sender_comp_id;
         CounterpartyConfig config_template;
     };
-    std::vector<Entry> entries_;
+    std::unordered_map<std::string, Entry> entries_;
     std::optional<CounterpartyConfig> allow_any_template_;
 };
 
