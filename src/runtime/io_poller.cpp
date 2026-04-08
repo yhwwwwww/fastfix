@@ -9,7 +9,10 @@
 #include <sys/epoll.h>
 #include <unistd.h>
 
+#if __has_include(<liburing.h>)
+#define FASTFIX_HAS_LIBURING 1
 #include <liburing.h>
+#endif
 
 namespace fastfix::runtime {
 
@@ -147,6 +150,7 @@ class EpollPoller final : public IoPoller {
 // IoUringPoller
 // ---------------------------------------------------------------------------
 
+#ifdef FASTFIX_HAS_LIBURING
 class IoUringPoller final : public IoPoller {
   public:
     ~IoUringPoller() override { Close(); }
@@ -270,15 +274,18 @@ class IoUringPoller final : public IoPoller {
     std::unordered_map<int, std::size_t> fd_tags_;
     std::vector<std::size_t> ready_tags_;
 };
+#endif  // FASTFIX_HAS_LIBURING
 
 // ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
 
 auto DetectBestIoBackend() -> IoBackend {
+#ifdef FASTFIX_HAS_LIBURING
     if (IsIoBackendAvailable(IoBackend::kIoUring)) {
         return IoBackend::kIoUring;
     }
+#endif
     return IoBackend::kEpoll;
 }
 
@@ -287,11 +294,15 @@ auto IsIoBackendAvailable(IoBackend backend) -> bool {
         case IoBackend::kPoll:  return true;
         case IoBackend::kEpoll: return true;
         case IoBackend::kIoUring: {
+#ifdef FASTFIX_HAS_LIBURING
             io_uring ring{};
             int ret = io_uring_queue_init(1, &ring, 0);
             if (ret < 0) return false;
             io_uring_queue_exit(&ring);
             return true;
+#else
+            return false;
+#endif
         }
     }
     return false;
@@ -299,8 +310,13 @@ auto IsIoBackendAvailable(IoBackend backend) -> bool {
 
 auto CreateIoPoller(IoBackend backend) -> std::unique_ptr<IoPoller> {
     switch (backend) {
+#ifdef FASTFIX_HAS_LIBURING
         case IoBackend::kIoUring:
             return std::make_unique<IoUringPoller>();
+#else
+        case IoBackend::kIoUring:
+            return std::make_unique<EpollPoller>();  // fallback: no liburing
+#endif
         case IoBackend::kEpoll:
             return std::make_unique<EpollPoller>();
         case IoBackend::kPoll:
