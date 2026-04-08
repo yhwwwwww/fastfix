@@ -76,6 +76,7 @@ target("fastfix-fuzz-codec")
 
 target("fastfix-fuzz-codec-libfuzzer")
     set_kind("binary")
+    set_default(false)
     add_deps("fastfix")
     add_files("tools/fuzz-codec/fuzz_entry.cpp")
     add_cxflags("-fsanitize=fuzzer", {force = true})
