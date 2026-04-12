@@ -11,9 +11,8 @@
 namespace fastfix::runtime {
 
 enum class IoBackend : std::uint32_t {
-    kPoll = 0,
-    kEpoll = 1,
-    kIoUring = 2,
+    kEpoll = 0,
+    kIoUring = 1,
 };
 
 /// Returns the best available backend for the running kernel.

@@ -89,7 +89,7 @@ struct EngineConfig {
     std::vector<std::uint32_t> worker_cpu_affinity;
     QueueAppThreadingMode queue_app_mode{QueueAppThreadingMode::kCoScheduled};
     PollMode poll_mode{PollMode::kBlocking};
-    IoBackend io_backend{IoBackend::kPoll};
+    IoBackend io_backend{IoBackend::kEpoll};
     std::vector<std::uint32_t> app_cpu_affinity;
     std::vector<std::filesystem::path> profile_artifacts;
     std::vector<std::vector<std::filesystem::path>> profile_dictionaries;

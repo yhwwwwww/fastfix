@@ -5,8 +5,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include <poll.h>
 #include <sys/epoll.h>
+#include <sys/poll.h>
 #include <unistd.h>
 
 #if !defined(FASTFIX_DISABLE_LIBURING) && __has_include(<liburing.h>)
@@ -15,65 +15,6 @@
 #endif
 
 namespace fastfix::runtime {
-
-// ---------------------------------------------------------------------------
-// PollPoller
-// ---------------------------------------------------------------------------
-
-class PollPoller final : public IoPoller {
-  public:
-    ~PollPoller() override { Close(); }
-
-    auto Init() -> base::Status override { return base::Status::Ok(); }
-
-    auto AddFd(int fd, std::size_t tag) -> base::Status override {
-        pollfds_.push_back(pollfd{.fd = fd, .events = POLLIN, .revents = 0});
-        tags_.push_back(tag);
-        return base::Status::Ok();
-    }
-
-    auto RemoveFd(int fd) -> void override {
-        for (std::size_t i = 0; i < pollfds_.size(); ++i) {
-            if (pollfds_[i].fd == fd) {
-                pollfds_.erase(pollfds_.begin() + static_cast<std::ptrdiff_t>(i));
-                tags_.erase(tags_.begin() + static_cast<std::ptrdiff_t>(i));
-                return;
-            }
-        }
-    }
-
-    auto Wait(std::chrono::milliseconds timeout) -> base::Result<int> override {
-        for (auto& pfd : pollfds_) { pfd.revents = 0; }
-        const int timeout_ms = timeout.count() < 0 ? -1 : static_cast<int>(timeout.count());
-        const int rc = ::poll(pollfds_.data(), pollfds_.size(), timeout_ms);
-        if (rc < 0) {
-            if (errno == EINTR) return 0;
-            return base::Status::IoError(std::string("poll failed: ") + std::strerror(errno));
-        }
-        ready_tags_.clear();
-        for (std::size_t i = 0; i < pollfds_.size(); ++i) {
-            if (pollfds_[i].revents & (POLLIN | POLLERR | POLLHUP)) {
-                ready_tags_.push_back(tags_[i]);
-            }
-        }
-        return static_cast<int>(ready_tags_.size());
-    }
-
-    auto ReadyTag(int index) const -> std::size_t override {
-        return ready_tags_[static_cast<std::size_t>(index)];
-    }
-
-    auto Close() -> void override {
-        pollfds_.clear();
-        tags_.clear();
-        ready_tags_.clear();
-    }
-
-  private:
-    std::vector<pollfd> pollfds_;
-    std::vector<std::size_t> tags_;
-    std::vector<std::size_t> ready_tags_;
-};
 
 // ---------------------------------------------------------------------------
 // EpollPoller
@@ -266,7 +207,8 @@ class IoUringPoller final : public IoPoller {
 
   private:
     static constexpr unsigned kRingSize = 256;
-    static constexpr std::size_t kRemoveTag = ~std::size_t{0};
+    // kRemoveTag must differ from ShardPoller::kWakeupTag (= ~size_t{0}).
+    static constexpr std::size_t kRemoveTag = ~std::size_t{0} - 1U;
 
     io_uring ring_{};
     bool initialized_{false};
@@ -291,7 +233,6 @@ auto DetectBestIoBackend() -> IoBackend {
 
 auto IsIoBackendAvailable(IoBackend backend) -> bool {
     switch (backend) {
-        case IoBackend::kPoll:  return true;
         case IoBackend::kEpoll: return true;
         case IoBackend::kIoUring: {
 #ifdef FASTFIX_HAS_LIBURING
@@ -319,9 +260,8 @@ auto CreateIoPoller(IoBackend backend) -> std::unique_ptr<IoPoller> {
 #endif
         case IoBackend::kEpoll:
             return std::make_unique<EpollPoller>();
-        case IoBackend::kPoll:
         default:
-            return std::make_unique<PollPoller>();
+            return std::make_unique<EpollPoller>();
     }
 }
 

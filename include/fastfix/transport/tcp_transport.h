@@ -54,7 +54,11 @@ class TcpConnection {
   private:
     auto Swap(TcpConnection& other) noexcept -> void;
 
+    // Returns: 1=ready, 0=timeout, -1=error. Monitors fd for given events using epoll.
+    auto EpollWaitFd(int fd, uint32_t events, int timeout_ms) -> int;
+
     int fd_{-1};
+    int epoll_fd_ = -1;
     std::vector<std::byte> read_buffer_;
     std::vector<std::byte> frame_buffer_;
     std::size_t read_cursor_{0};
@@ -97,6 +101,7 @@ class TcpAcceptor {
     auto Swap(TcpAcceptor& other) noexcept -> void;
 
     int fd_{-1};
+    int epoll_fd_ = -1;
     std::uint16_t port_{0};
 };
 

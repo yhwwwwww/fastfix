@@ -150,11 +150,11 @@ auto ParsePollMode(std::string_view token) -> base::Result<PollMode> {
 
 auto ParseIoBackend(std::string_view token) -> base::Result<IoBackend> {
     const auto value = Trim(token);
-    if (value.empty() || value == "poll") {
-        return IoBackend::kPoll;
-    }
-    if (value == "epoll") {
+    if (value.empty() || value == "epoll") {
         return IoBackend::kEpoll;
+    }
+    if (value == "poll") {
+        return base::Status::InvalidArgument("poll backend has been removed, use epoll or io_uring");
     }
     if (value == "io_uring") {
         return IoBackend::kIoUring;
@@ -617,13 +617,12 @@ auto LoadEngineConfigText(std::string_view text, const std::filesystem::path& ba
             auto durable_local_utc_offset = base::Result<std::int32_t>(0);
             if (parts.size() > counterparty_columns::kDurableLocalUtcOffsetSeconds &&
                 !Trim(parts[counterparty_columns::kDurableLocalUtcOffsetSeconds]).empty()) {
-                auto raw = ParseInteger<std::uint32_t>(
+                durable_local_utc_offset = ParseInteger<std::int32_t>(
                     parts[counterparty_columns::kDurableLocalUtcOffsetSeconds],
                     "durable_local_utc_offset_seconds");
-                if (!raw.ok()) {
-                    return raw.status();
+                if (!durable_local_utc_offset.ok()) {
+                    return durable_local_utc_offset.status();
                 }
-                durable_local_utc_offset = static_cast<std::int32_t>(raw.value());
             }
             auto durable_use_system_tz = base::Result<bool>(true);
             if (parts.size() > counterparty_columns::kDurableUseSystemTimezone &&

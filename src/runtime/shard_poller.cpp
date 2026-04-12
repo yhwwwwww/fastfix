@@ -18,18 +18,7 @@ auto ShardPoller::DrainWakeup() -> void {
     wakeup_.Drain();
 }
 
-auto ShardPoller::CaptureReady(std::span<const pollfd> pollfds, PollState& state) const -> void {
-    for (std::size_t index = 0; index < state.connection_ready.size(); ++index) {
-        state.connection_ready[index] =
-            (pollfds[state.connection_poll_offset + index].revents & POLLIN) != 0;
-    }
-}
-
 auto ShardPoller::InitBackend(IoBackend backend) -> base::Status {
-    if (backend == IoBackend::kPoll) {
-        return base::Status::Ok();
-    }
-
     io_poller_ = CreateIoPoller(backend);
     if (io_poller_ == nullptr) {
         return base::Status::InvalidArgument("unsupported io backend");

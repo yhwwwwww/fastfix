@@ -6,7 +6,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
-#include <poll.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -65,29 +65,6 @@ auto SetReuseAddr(int fd) -> base::Status {
     int enabled = kSocketOptionEnabled;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) != 0) {
         return base::Status::IoError(std::string("setsockopt(SO_REUSEADDR) failed: ") + std::strerror(errno));
-    }
-    return base::Status::Ok();
-}
-
-auto PollFd(int fd, short events, std::chrono::milliseconds timeout) -> base::Status {
-    pollfd descriptor{};
-    descriptor.fd = fd;
-    descriptor.events = events;
-    const auto timeout_ms = timeout.count() > std::numeric_limits<int>::max()
-                                ? std::numeric_limits<int>::max()
-                                : static_cast<int>(timeout.count());
-    const int rc = poll(&descriptor, 1, timeout_ms);
-    if (rc == 0) {
-        return base::Status::IoError("socket operation timed out");
-    }
-    if (rc < 0) {
-        return base::Status::IoError(std::string("poll failed: ") + std::strerror(errno));
-    }
-    if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-        return base::Status::IoError("socket closed or errored while polling");
-    }
-    if ((descriptor.revents & events) == 0) {
-        return base::Status::IoError("socket did not become ready for the requested event");
     }
     return base::Status::Ok();
 }
@@ -203,6 +180,7 @@ auto TcpConnection::operator=(TcpConnection&& other) noexcept -> TcpConnection& 
 
 auto TcpConnection::Swap(TcpConnection& other) noexcept -> void {
     std::swap(fd_, other.fd_);
+    std::swap(epoll_fd_, other.epoll_fd_);
     std::swap(read_buffer_, other.read_buffer_);
     std::swap(frame_buffer_, other.frame_buffer_);
     std::swap(read_cursor_, other.read_cursor_);
@@ -217,30 +195,47 @@ auto TcpConnection::Connect(
         return addresses.status();
     }
 
+    const auto timeout_ms = timeout.count() > std::numeric_limits<int>::max()
+                                ? std::numeric_limits<int>::max()
+                                : static_cast<int>(timeout.count());
+
+    const int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        ReleaseAddress(addresses.value());
+        return base::Status::IoError("epoll_create1 failed");
+    }
+
     addrinfo* results = addresses.value();
     for (auto* address = results; address != nullptr; address = address->ai_next) {
-        const int fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        const int fd = socket(address->ai_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (fd < 0) {
             continue;
         }
 
-        auto status = SetNonBlocking(fd);
-        if (!status.ok()) {
-            close(fd);
-            ReleaseAddress(results);
-            return status;
-        }
-
         const int rc = connect(fd, address->ai_addr, address->ai_addrlen);
-        if (rc != 0 && errno != EINPROGRESS) {
-            close(fd);
-            continue;
-        }
-
-        status = PollFd(fd, POLLOUT, timeout);
-        if (!status.ok()) {
-            close(fd);
-            continue;
+        if (rc != 0) {
+            if (errno != EINPROGRESS) {
+                close(fd);
+                continue;
+            }
+            // Wait for connection via epoll
+            struct epoll_event ev{};
+            ev.events = EPOLLOUT;
+            ev.data.fd = fd;
+            if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+                close(fd);
+                continue;
+            }
+            struct epoll_event out{};
+            int eret;
+            do {
+                eret = epoll_wait(epfd, &out, 1, timeout_ms);
+            } while (eret == -1 && errno == EINTR);
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+            if (eret <= 0 || (out.events & (EPOLLERR | EPOLLHUP))) {
+                close(fd);
+                continue;
+            }
         }
 
         int socket_error = 0;
@@ -250,29 +245,42 @@ auto TcpConnection::Connect(
             continue;
         }
 
-        status = SetNoDelay(fd);
+        auto status = SetNoDelay(fd);
         if (!status.ok()) {
             close(fd);
+            ::close(epfd);
             ReleaseAddress(results);
             return status;
         }
         TrySetBusyPoll(fd);
         TrySetQuickAck(fd);
 
+        ::close(epfd);
         ReleaseAddress(results);
         return TcpConnection(fd);
     }
 
+    ::close(epfd);
     ReleaseAddress(results);
     return base::Status::IoError("could not connect to TCP endpoint");
 }
 
 auto TcpConnection::Send(std::span<const std::byte> bytes, std::chrono::milliseconds timeout) -> base::Status {
+    if (epoll_fd_ < 0) {
+        epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
+        if (epoll_fd_ < 0) return base::Status::IoError("epoll_create1 failed");
+    }
+    const auto timeout_ms = timeout.count() > std::numeric_limits<int>::max()
+                                ? std::numeric_limits<int>::max()
+                                : static_cast<int>(timeout.count());
     std::size_t sent = 0;
     while (sent < bytes.size()) {
-        auto status = PollFd(fd_, POLLOUT, timeout);
-        if (!status.ok()) {
-            return status;
+        int poll_ret = EpollWaitFd(fd_, EPOLLOUT, timeout_ms);
+        if (poll_ret == 0) {
+            return base::Status::IoError("socket operation timed out");
+        }
+        if (poll_ret < 0) {
+            return base::Status::IoError("socket closed or errored while polling");
         }
 
         const auto rc = send(fd_, bytes.data() + sent, bytes.size() - sent, MSG_NOSIGNAL);
@@ -363,6 +371,10 @@ auto TcpConnection::TryReceiveFrameView() -> base::Result<std::optional<std::spa
 }
 
 auto TcpConnection::ReceiveFrameView(std::chrono::milliseconds timeout) -> base::Result<std::span<const std::byte>> {
+    if (epoll_fd_ < 0) {
+        epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
+        if (epoll_fd_ < 0) return base::Status::IoError("epoll_create1 failed");
+    }
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (true) {
         auto unconsumed = std::span<const std::byte>(
@@ -391,10 +403,16 @@ auto TcpConnection::ReceiveFrameView(std::chrono::milliseconds timeout) -> base:
             return base::Status::IoError("timed out while waiting for a FIX frame");
         }
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        const auto remaining_ms = remaining.count() > std::numeric_limits<int>::max()
+                                      ? std::numeric_limits<int>::max()
+                                      : static_cast<int>(remaining.count());
 
-        auto status = PollFd(fd_, POLLIN, remaining);
-        if (!status.ok()) {
-            return status;
+        int poll_ret = EpollWaitFd(fd_, EPOLLIN, remaining_ms);
+        if (poll_ret == 0) {
+            return base::Status::IoError("socket operation timed out");
+        }
+        if (poll_ret < 0) {
+            return base::Status::IoError("socket closed or errored while polling");
         }
 
         std::byte buffer[kDefaultReadBufferCapacity];
@@ -486,7 +504,31 @@ auto TcpConnection::ReceiveFrame(std::chrono::milliseconds timeout) -> base::Res
     return std::vector<std::byte>(frame.value().begin(), frame.value().end());
 }
 
+auto TcpConnection::EpollWaitFd(int fd, uint32_t events, int timeout_ms) -> int {
+    struct epoll_event ev{};
+    ev.events = events;
+    ev.data.fd = fd;
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) != 0) {
+        if (errno == EEXIST) {
+            epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
+        } else {
+            return -1;
+        }
+    }
+    struct epoll_event out{};
+    int ret;
+    do {
+        ret = epoll_wait(epoll_fd_, &out, 1, timeout_ms);
+    } while (ret == -1 && errno == EINTR);
+    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+    if (ret == 0) return 0;   // timeout
+    if (ret < 0) return -1;   // error
+    if (out.events & (EPOLLERR | EPOLLHUP)) return -1;
+    return 1;  // ready
+}
+
 auto TcpConnection::Close() -> void {
+    if (epoll_fd_ >= 0) { ::close(epoll_fd_); epoll_fd_ = -1; }
     if (fd_ >= 0) {
         close(fd_);
         fd_ = -1;
@@ -518,6 +560,7 @@ auto TcpAcceptor::operator=(TcpAcceptor&& other) noexcept -> TcpAcceptor& {
 
 auto TcpAcceptor::Swap(TcpAcceptor& other) noexcept -> void {
     std::swap(fd_, other.fd_);
+    std::swap(epoll_fd_, other.epoll_fd_);
     std::swap(port_, other.port_);
 }
 
@@ -572,9 +615,30 @@ auto TcpAcceptor::Listen(const std::string& host, std::uint16_t port, int backlo
 }
 
 auto TcpAcceptor::Accept(std::chrono::milliseconds timeout) -> base::Result<TcpConnection> {
-    auto status = PollFd(fd_, POLLIN, timeout);
-    if (!status.ok()) {
-        return status;
+    if (epoll_fd_ < 0) {
+        epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
+        if (epoll_fd_ < 0) return base::Status::IoError("epoll_create1 failed");
+    }
+    const auto timeout_ms = timeout.count() > std::numeric_limits<int>::max()
+                                ? std::numeric_limits<int>::max()
+                                : static_cast<int>(timeout.count());
+    struct epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = fd_;
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd_, &ev) != 0) {
+        return base::Status::IoError("epoll_ctl failed in Accept");
+    }
+    struct epoll_event out{};
+    int ret;
+    do {
+        ret = epoll_wait(epoll_fd_, &out, 1, timeout_ms);
+    } while (ret == -1 && errno == EINTR);
+    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd_, nullptr);
+    if (ret == 0) {
+        return base::Status::IoError("socket operation timed out");
+    }
+    if (ret < 0 || (out.events & (EPOLLERR | EPOLLHUP))) {
+        return base::Status::IoError("socket closed or errored while polling");
     }
 
     auto connection = TryAccept();
@@ -613,6 +677,7 @@ auto TcpAcceptor::TryAccept() -> base::Result<std::optional<TcpConnection>> {
 }
 
 auto TcpAcceptor::Close() -> void {
+    if (epoll_fd_ >= 0) { ::close(epoll_fd_); epoll_fd_ = -1; }
     if (fd_ >= 0) {
         close(fd_);
         fd_ = -1;
