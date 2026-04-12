@@ -15,7 +15,7 @@ namespace fastfix::codec {
 /// Pre-compiled per-field metadata for a known message type.
 /// Replaces runtime dictionary lookups with direct array indexing.
 struct CompiledFieldSlot {
-    std::uint16_t tag{0};
+    std::uint32_t tag{0};
     message::FieldValueType field_type{message::FieldValueType::kString};
     bool is_group_count{false};
     const profile::GroupDefRecord* group_def{nullptr};

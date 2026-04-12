@@ -43,7 +43,7 @@ auto CompiledMessageDecoder::Build(
 
         const auto slot_idx = decoder.slot_count_;
         auto& slot = decoder.slots_[slot_idx];
-        slot.tag = static_cast<std::uint16_t>(tag);
+        slot.tag = tag;
 
         // Resolve field type from dictionary definition.
         const auto* field_def = dictionary.find_field(tag);

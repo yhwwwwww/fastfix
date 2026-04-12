@@ -171,7 +171,7 @@ class FixedLayoutWriter {
   private:
     struct SlotRange {
         std::uint32_t offset{0};
-        std::uint16_t length{0};  // 0 means unset
+        std::uint32_t length{0};  // 0 means unset
     };
 
     struct SessionHeaderFragment {

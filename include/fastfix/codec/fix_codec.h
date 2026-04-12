@@ -224,8 +224,6 @@ class PrecompiledTemplateTable {
         FrameEncodeTemplate tmpl;
     };
     std::vector<Entry> entries_;
-    mutable std::string_view last_hit_msg_type_{};
-    mutable const FrameEncodeTemplate* last_hit_tmpl_{nullptr};
 };
 
 auto CurrentUtcTimestamp(UtcTimestampBuffer* buffer) -> std::string_view;

@@ -1,6 +1,7 @@
 #include "fastfix/session/session_core.h"
 
 #include <functional>
+#include <limits>
 
 namespace fastfix::session {
 
@@ -131,6 +132,9 @@ auto SessionCore::AllocateOutboundSeq() -> base::Result<std::uint32_t> {
         return base::Status::InvalidArgument("outbound sequence numbers can only be allocated for an active session");
     }
 
+    if (next_out_seq_ == std::numeric_limits<std::uint32_t>::max()) {
+        return base::Status::InvalidArgument("outbound sequence number overflow; session reset required");
+    }
     return next_out_seq_++;
 }
 
@@ -144,9 +148,19 @@ auto SessionCore::ObserveInboundSeq(std::uint32_t seq_num) -> base::Status {
         return base::Status::InvalidArgument("received a duplicate or stale inbound sequence number");
     }
     if (seq_num > next_in_seq_) {
-        pending_resend_ = ResendRange{.begin_seq = next_in_seq_, .end_seq = seq_num - 1};
-        resume_state_ = state_;
-        state_ = SessionState::kResendProcessing;
+        if (state_ == SessionState::kResendProcessing && pending_resend_.has_value()) {
+            // Already recovering: extend the gap range rather than overwriting resume_state_.
+            // Overwriting resume_state_ here would cause CompleteResend() to restore to
+            // kResendProcessing instead of the original active state.
+            const auto new_end = seq_num - 1;
+            if (new_end > pending_resend_->end_seq) {
+                pending_resend_->end_seq = new_end;
+            }
+        } else {
+            pending_resend_ = ResendRange{.begin_seq = next_in_seq_, .end_seq = seq_num - 1};
+            resume_state_ = state_;
+            state_ = SessionState::kResendProcessing;
+        }
         return base::Status::InvalidArgument("inbound sequence gap detected");
     }
 

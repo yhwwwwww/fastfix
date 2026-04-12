@@ -503,21 +503,31 @@ auto AdminProtocol::EncodeFrame(
             flags |= MessageRecordFlagValue(store::MessageRecordFlags::kPossDup);
         }
 
-        status = store_->SaveOutboundView(store::MessageRecordView{
-            .session_id = session_.session_id(),
-            .seq_num = seq_num,
-            .timestamp_ns = timestamp_ns,
-            .flags = flags,
-            .payload = encoded_frame.bytes.view(),
-        });
+        const auto snapshot = session_.Snapshot();
+        status = store_->SaveOutboundViewAndRecoveryState(
+            store::MessageRecordView{
+                .session_id = session_.session_id(),
+                .seq_num = seq_num,
+                .timestamp_ns = timestamp_ns,
+                .flags = flags,
+                .payload = encoded_frame.bytes.view(),
+            },
+            store::SessionRecoveryState{
+                .session_id = snapshot.session_id,
+                .next_in_seq = snapshot.next_in_seq,
+                .next_out_seq = snapshot.next_out_seq,
+                .last_inbound_ns = snapshot.last_inbound_ns,
+                .last_outbound_ns = snapshot.last_outbound_ns,
+                .active = snapshot.state != SessionState::kDisconnected,
+            });
         if (!status.ok()) {
             return status;
         }
-    }
-
-    status = PersistRecoveryState();
-    if (!status.ok()) {
-        return status;
+    } else {
+        status = PersistRecoveryState();
+        if (!status.ok()) {
+            return status;
+        }
     }
 
     return encoded_frame;

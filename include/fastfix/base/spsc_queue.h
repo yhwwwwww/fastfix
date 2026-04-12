@@ -36,7 +36,6 @@ class SpscQueue {
         }
 
         T value = std::move(slots_[tail]);
-        slots_[tail] = T{};
         tail_.store(Next(tail), std::memory_order_release);
         return value;
     }
@@ -59,10 +58,14 @@ class SpscQueue {
         return index + 1U == capacity_ ? 0U : index + 1U;
     }
 
+    // slots_ and capacity_ are read by both producer and consumer but never written
+    // after construction, so they do not need cache-line isolation.
     std::vector<T> slots_;
     std::size_t capacity_{0};
-    std::atomic<std::size_t> head_{0};
-    std::atomic<std::size_t> tail_{0};
+    // head_ is written by the producer; put it on its own cache line to avoid
+    // false sharing with tail_ (written by the consumer).
+    alignas(64) std::atomic<std::size_t> head_{0};
+    alignas(64) std::atomic<std::size_t> tail_{0};
 };
 
 }  // namespace fastfix::base

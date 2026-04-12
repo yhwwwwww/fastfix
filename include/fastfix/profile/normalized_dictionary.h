@@ -24,6 +24,7 @@ enum class ValueType : std::uint32_t {
 enum class FieldFlags : std::uint32_t {
     kNone = 0,
     kCustom = 1U << 0,
+    kAllowTypeOverride = 1U << 1,
 };
 
 enum class MessageFlags : std::uint32_t {

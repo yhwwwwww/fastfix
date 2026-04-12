@@ -241,9 +241,9 @@ auto FixedLayoutWriter::bind_session(
     auto& frag = session_header_;
     frag.static_checksum = 0;
 
-    constexpr std::size_t kBLPlaceholderWidth = 10U;
+    constexpr std::size_t kBLPlaceholderWidth = 7U;
 
-    // Build header_prefix: "8={bs}\x01 9=0000000000\x01 35={mt}\x01"
+    // Build header_prefix: "8={bs}\x01 9=0000000\x01 35={mt}\x01"
     frag.header_prefix.clear();
     frag.header_prefix.reserve(
         2U + begin_string.size() + 1U +  // "8={bs}\x01"
@@ -288,7 +288,7 @@ auto FixedLayoutWriter::set_string(std::uint32_t tag, std::string_view value) ->
         const auto slot = static_cast<std::size_t>(idx);
         slot_ranges_[slot] = SlotRange{
             static_cast<std::uint32_t>(slot_buffer_.size()),
-            static_cast<std::uint16_t>(value.size())};
+            static_cast<std::uint32_t>(value.size())};
         slot_buffer_.append(value);
     }
     return *this;
@@ -304,7 +304,7 @@ auto FixedLayoutWriter::set_int(std::uint32_t tag, std::int64_t value) -> FixedL
             const auto len = static_cast<std::size_t>(ptr - buf.data());
             slot_ranges_[slot] = SlotRange{
                 static_cast<std::uint32_t>(slot_buffer_.size()),
-                static_cast<std::uint16_t>(len)};
+                static_cast<std::uint32_t>(len)};
             slot_buffer_.append(buf.data(), len);
         }
     }
@@ -333,7 +333,7 @@ auto FixedLayoutWriter::set_float(std::uint32_t tag, double value) -> FixedLayou
             const auto len = static_cast<std::size_t>(ptr - buf.data());
             slot_ranges_[slot] = SlotRange{
                 static_cast<std::uint32_t>(slot_buffer_.size()),
-                static_cast<std::uint16_t>(len)};
+                static_cast<std::uint32_t>(len)};
             slot_buffer_.append(buf.data(), len);
         }
     }
@@ -452,7 +452,7 @@ auto FixedLayoutWriter::encode_to_buffer(
         checksum += static_cast<unsigned char>(ch);
     };
 
-    constexpr std::size_t kBLPlaceholderWidth = 10U;
+    constexpr std::size_t kBLPlaceholderWidth = 7U;
     std::size_t bl_offset = 0;
     std::size_t body_start = 0;
 

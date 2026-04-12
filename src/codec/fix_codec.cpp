@@ -10,9 +10,7 @@
 #include <ctime>
 #include <functional>
 #include <limits>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string_view>
 #include <tuple>
@@ -92,41 +90,6 @@ struct CompiledScopeTemplate {
     std::vector<CompiledScopeStep> steps;
     std::vector<std::uint32_t> scalar_tags;
     std::vector<std::uint32_t> group_tags;
-};
-
-struct TemplateCacheKey {
-    std::uintptr_t dictionary_identity{0};
-    std::uint64_t schema_hash{0};
-    std::uint64_t profile_id{0};
-    std::string msg_type;
-    std::string begin_string;
-    std::string sender_comp_id;
-    std::string target_comp_id;
-    std::string default_appl_ver_id;
-    char delimiter{kFixSoh};
-
-    [[nodiscard]] auto operator<(const TemplateCacheKey& other) const -> bool {
-        return std::tie(
-                   dictionary_identity,
-                   schema_hash,
-                   profile_id,
-                   msg_type,
-                   begin_string,
-                   sender_comp_id,
-                   target_comp_id,
-                   default_appl_ver_id,
-                   delimiter) <
-            std::tie(
-                     other.dictionary_identity,
-                   other.schema_hash,
-                   other.profile_id,
-                   other.msg_type,
-                   other.begin_string,
-                   other.sender_comp_id,
-                   other.target_comp_id,
-                   other.default_appl_ver_id,
-                   other.delimiter);
-    }
 };
 
 auto IsStandardSessionField(std::uint32_t tag) -> bool {
@@ -263,7 +226,7 @@ struct InlineField {
     std::uint32_t tag;
     std::size_t start_offset;
     std::size_t value_offset;
-    std::uint16_t value_length;
+    std::uint32_t value_length;
     std::size_t next_pos;
 };
 
@@ -299,7 +262,7 @@ auto ScanNextField(
         .tag = tag.value(),
         .start_offset = field_start,
         .value_offset = field_start + equals + 1U,
-        .value_length = static_cast<std::uint16_t>(field_len - equals - 1U),
+        .value_length = static_cast<std::uint32_t>(field_len - equals - 1U),
         .next_pos = soh_index + 1U,
     };
 }
@@ -528,7 +491,7 @@ auto AppendParsedFieldSlot(
 auto MakeParsedFieldSlot(
     std::uint32_t tag,
     std::uint32_t value_offset,
-    std::uint16_t value_length,
+    std::uint32_t value_length,
     const profile::NormalizedDictionaryView& dictionary) -> message::ParsedFieldSlot {
     message::ParsedFieldSlot slot;
     slot.tag = tag;
@@ -541,7 +504,7 @@ auto MakeParsedFieldSlot(
 auto MakeParsedFieldSlotWithType(
     std::uint32_t tag,
     std::uint32_t value_offset,
-    std::uint16_t value_length,
+    std::uint32_t value_length,
     message::FieldValueType field_type) -> message::ParsedFieldSlot {
     message::ParsedFieldSlot slot;
     slot.tag = tag;
@@ -606,12 +569,9 @@ auto AppendParsedEntry(message::ParsedMessageData* parsed, std::uint32_t group_i
     if (group.first_entry == message::kInvalidParsedIndex) {
         group.first_entry = new_index;
     } else {
-        auto tail = group.first_entry;
-        while (parsed->entries[tail].next_entry != message::kInvalidParsedIndex) {
-            tail = parsed->entries[tail].next_entry;
-        }
-        parsed->entries[tail].next_entry = new_index;
+        parsed->entries[group.last_entry].next_entry = new_index;
     }
+    group.last_entry = new_index;
     ++group.entry_count;
     return new_index;
 }
@@ -1225,7 +1185,7 @@ auto EncodeFixMessageGenericToBuffer(
     full.push_back(delimiter);
     full.append("9=");
 
-    constexpr std::size_t kBodyLengthPlaceholderWidth = 10U;
+    constexpr std::size_t kBodyLengthPlaceholderWidth = 7U;
     const auto body_length_offset = full.size();
     full.append(kBodyLengthPlaceholderWidth, '0');
     full.push_back(delimiter);
@@ -1289,60 +1249,6 @@ auto EncodeFixMessageGenericToBuffer(
     cksum_digits[2] = static_cast<char>('0' + (checksum % 10U));
     AppendField(full, 10U, std::string_view(cksum_digits.data(), 3U), delimiter);
     return base::Status::Ok();
-}
-
-auto MakeTemplateConfig(const EncodeOptions& options) -> EncodeTemplateConfig {
-    return EncodeTemplateConfig{
-        .begin_string = options.begin_string.empty() ? std::string("FIX.4.4") : options.begin_string,
-        .sender_comp_id = options.sender_comp_id,
-        .target_comp_id = options.target_comp_id,
-        .default_appl_ver_id = options.default_appl_ver_id,
-        .delimiter = NormalizeDelimiter(options.delimiter),
-    };
-}
-
-auto BuildTemplateCacheKey(
-    const profile::NormalizedDictionaryView& dictionary,
-    std::string_view msg_type,
-    const EncodeOptions& options) -> TemplateCacheKey {
-    const auto config = MakeTemplateConfig(options);
-    return TemplateCacheKey{
-        .dictionary_identity = reinterpret_cast<std::uintptr_t>(&dictionary.profile().header()),
-        .schema_hash = dictionary.profile().header().schema_hash,
-        .profile_id = dictionary.profile().header().profile_id,
-        .msg_type = std::string(msg_type),
-        .begin_string = config.begin_string,
-        .sender_comp_id = config.sender_comp_id,
-        .target_comp_id = config.target_comp_id,
-        .default_appl_ver_id = config.default_appl_ver_id,
-        .delimiter = config.delimiter,
-    };
-}
-
-auto LookupCachedTemplate(
-    const profile::NormalizedDictionaryView& dictionary,
-    std::string_view msg_type,
-    const EncodeOptions& options) -> const FrameEncodeTemplate* {
-    static std::mutex cache_mutex;
-    static std::map<TemplateCacheKey, FrameEncodeTemplate> cache;
-
-    auto key = BuildTemplateCacheKey(dictionary, msg_type, options);
-    {
-        std::scoped_lock lock(cache_mutex);
-        const auto found = cache.find(key);
-        if (found != cache.end()) {
-            return &found->second;
-        }
-    }
-
-    auto compiled = CompileFrameEncodeTemplate(dictionary, msg_type, MakeTemplateConfig(options));
-    if (!compiled.ok()) {
-        return nullptr;
-    }
-
-    std::scoped_lock lock(cache_mutex);
-    const auto [it, inserted] = cache.emplace(std::move(key), compiled.value());
-    return &it->second;
 }
 
 }  // namespace
@@ -1504,7 +1410,7 @@ auto FrameEncodeTemplate::EncodeToBuffer(
     std::uint32_t checksum = 0;
     AppendTracked(full, &checksum, state_->begin_prefix);
 
-    constexpr std::size_t kBodyLengthPlaceholderWidth = 10U;
+    constexpr std::size_t kBodyLengthPlaceholderWidth = 7U;
     const auto body_length_offset = full.size();
     AppendTracked(full, &checksum, std::string_view("0000000000", kBodyLengthPlaceholderWidth));
     AppendTracked(full, &checksum, delimiter);
@@ -1582,16 +1488,6 @@ auto EncodeFixMessageToBuffer(
     const profile::NormalizedDictionaryView& dictionary,
     const EncodeOptions& options,
     EncodeBuffer* buffer) -> base::Status {
-    const auto msg_type = message.msg_type();
-    if (!msg_type.empty()) {
-        const auto* compiled = LookupCachedTemplate(dictionary, msg_type, options);
-        if (compiled != nullptr) {
-            auto status = compiled->EncodeToBuffer(message, options, buffer);
-            if (status.ok()) {
-                return status;
-            }
-        }
-    }
     return EncodeFixMessageGenericToBuffer(message, options, buffer);
 }
 
@@ -1611,21 +1507,11 @@ auto EncodeFixMessageToBuffer(
     EncodeBuffer* buffer,
     const PrecompiledTemplateTable* precompiled) -> base::Status {
     const auto msg_type = message.msg_type();
-    if (!msg_type.empty()) {
-        if (precompiled != nullptr) {
-            if (const auto* tmpl = precompiled->find(msg_type); tmpl != nullptr) {
-                auto status = tmpl->EncodeToBuffer(message, options, buffer);
-                if (status.ok()) {
-                    return status;
-                }
-            }
-        } else {
-            const auto* compiled = LookupCachedTemplate(dictionary, msg_type, options);
-            if (compiled != nullptr) {
-                auto status = compiled->EncodeToBuffer(message, options, buffer);
-                if (status.ok()) {
-                    return status;
-                }
+    if (!msg_type.empty() && precompiled != nullptr) {
+        if (const auto* tmpl = precompiled->find(msg_type); tmpl != nullptr) {
+            auto status = tmpl->EncodeToBuffer(message, options, buffer);
+            if (status.ok()) {
+                return status;
             }
         }
     }
@@ -1659,15 +1545,10 @@ auto PrecompiledTemplateTable::Build(
 }
 
 auto PrecompiledTemplateTable::find(std::string_view msg_type) const -> const FrameEncodeTemplate* {
-    if (last_hit_tmpl_ != nullptr && last_hit_msg_type_ == msg_type) {
-        return last_hit_tmpl_;
-    }
     auto it = std::lower_bound(entries_.begin(), entries_.end(), msg_type,
         [](const Entry& entry, std::string_view type) { return entry.msg_type < type; });
     if (it != entries_.end() && it->msg_type == msg_type) {
-        last_hit_msg_type_ = it->msg_type;
-        last_hit_tmpl_ = &it->tmpl;
-        return last_hit_tmpl_;
+        return &it->tmpl;
     }
     return nullptr;
 }
@@ -1841,8 +1722,10 @@ auto DecodeFixMessageView(
             "message",
             field_def);
 
-        if (cached_message_def != nullptr && dictionary.message_rule_allows_tag(*cached_message_def, tag) &&
-            dictionary.find_group(tag) != nullptr) {
+        const auto* group_def = (cached_message_def != nullptr &&
+            dictionary.message_rule_allows_tag(*cached_message_def, tag))
+            ? dictionary.find_group(tag) : nullptr;
+        if (group_def != nullptr) {
             auto slot = MakeParsedFieldSlotWithType(
                 tag,
                 static_cast<std::uint32_t>(scanned.value().value_offset),
@@ -1856,7 +1739,7 @@ auto DecodeFixMessageView(
                 delimiter_byte,
                 equals_byte,
                 value_sv,
-                *dictionary.find_group(tag),
+                *group_def,
                 &parsed_message,
                 RootContainer(),
                 1U,

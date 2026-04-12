@@ -19,6 +19,11 @@ constexpr std::size_t kStoreMagicBytes = 8U;
 constexpr std::size_t kStoreRecordReservedBytes = 7U;
 constexpr std::size_t kExpectedStoreFileHeaderSize = 32U;
 constexpr std::size_t kExpectedStoreRecordHeaderSize = 64U;
+constexpr std::size_t kStorePageSize = 4096U;
+
+inline auto RoundUpToPage(std::size_t size) -> std::size_t {
+    return (size + kStorePageSize - 1U) & ~(kStorePageSize - 1U);
+}
 constexpr std::array<char, kStoreMagicBytes> kStoreMagic = {'F', 'F', 'S', 'T', 'O', 'R', 'E', '1'};
 constexpr std::uint32_t kStoreVersion = 1U;
 constexpr mode_t kDefaultStoreFilePermissions = 0644;
@@ -99,6 +104,7 @@ struct MmapSessionStore::Impl {
     int fd{-1};
     std::byte* mapping{nullptr};
     std::size_t mapping_size{0};
+    std::uint64_t write_offset{0};  // logical end of data; tracks header->file_size
     std::unordered_map<std::uint64_t, std::map<std::uint32_t, std::uint64_t>> outbound_offsets;
     std::unordered_map<std::uint64_t, SessionRecoveryState> recovery_states;
 
@@ -191,7 +197,8 @@ auto MmapSessionStore::Open() -> base::Status {
 
     const auto* header = Header(*impl_);
     if (!HasStoreMagic(*header) || header->version != kStoreVersion ||
-        header->header_size != kStoreFileHeaderSize || header->file_size != impl_->mapping_size) {
+        header->header_size != kStoreFileHeaderSize ||
+        header->file_size > static_cast<std::uint64_t>(impl_->mapping_size)) {
         return base::Status::FormatError("mmap store has an invalid header");
     }
 
@@ -237,6 +244,23 @@ auto MmapSessionStore::Open() -> base::Status {
         offset = record_end;
     }
 
+    impl_->write_offset = header->file_size;
+    return base::Status::Ok();
+}
+
+auto MmapSessionStore::GrowMapping(std::size_t new_physical_size) -> base::Status {
+    if (impl_->mapping != nullptr && impl_->mapping_size != 0) {
+        ::munmap(impl_->mapping, impl_->mapping_size);
+        impl_->mapping = nullptr;
+        impl_->mapping_size = 0;
+    }
+    impl_->mapping = static_cast<std::byte*>(
+        ::mmap(nullptr, new_physical_size, PROT_READ | PROT_WRITE, MAP_SHARED, impl_->fd, 0));
+    if (impl_->mapping == MAP_FAILED) {
+        impl_->mapping = nullptr;
+        return base::Status::IoError(IoErrorMessage(path_, "unable to mmap store file"));
+    }
+    impl_->mapping_size = new_physical_size;
     return base::Status::Ok();
 }
 
@@ -255,17 +279,27 @@ auto MmapSessionStore::AppendOutboundLikeView(std::uint32_t record_type, const M
         return status;
     }
 
-    status = Open();
-    if (!status.ok()) {
-        return status;
+    if (impl_->fd < 0 || impl_->mapping == nullptr) {
+        status = Open();
+        if (!status.ok()) {
+            return status;
+        }
     }
 
-    const auto old_size = Header(*impl_)->file_size;
+    const auto old_size = impl_->write_offset;
     const auto record_size = kStoreRecordHeaderSize + record.payload.size();
     const auto new_size = old_size + record_size;
 
-    if (::ftruncate(impl_->fd, static_cast<off_t>(new_size)) != 0) {
-        return base::Status::IoError(IoErrorMessage(path_, "unable to extend mmap store"));
+    // 12.2: grow file in 4 KB pages to avoid per-record ftruncate syscalls
+    if (new_size > impl_->mapping_size) {
+        const auto new_physical_size = RoundUpToPage(new_size);
+        if (::ftruncate(impl_->fd, static_cast<off_t>(new_physical_size)) != 0) {
+            return base::Status::IoError(IoErrorMessage(path_, "unable to extend mmap store"));
+        }
+        status = GrowMapping(new_physical_size);
+        if (!status.ok()) {
+            return status;
+        }
     }
 
     StoreRecordHeader header{};
@@ -277,27 +311,15 @@ auto MmapSessionStore::AppendOutboundLikeView(std::uint32_t record_type, const M
     header.payload_size = static_cast<std::uint32_t>(record.payload.size());
     header.timestamp_ns = record.timestamp_ns;
 
-    if (::pwrite(impl_->fd, &header, sizeof(header), static_cast<off_t>(old_size)) !=
-        static_cast<ssize_t>(sizeof(header))) {
-        return base::Status::IoError(IoErrorMessage(path_, "unable to append mmap record header"));
-    }
-
+    std::memcpy(impl_->mapping + old_size, &header, sizeof(header));
     if (!record.payload.empty()) {
-        if (::pwrite(
-                impl_->fd,
-                record.payload.data(),
-                static_cast<size_t>(record.payload.size()),
-                static_cast<off_t>(old_size + kStoreRecordHeaderSize)) !=
-            static_cast<ssize_t>(record.payload.size())) {
-            return base::Status::IoError(IoErrorMessage(path_, "unable to append mmap record payload"));
-        }
+        std::memcpy(impl_->mapping + old_size + kStoreRecordHeaderSize,
+                    record.payload.data(), record.payload.size());
     }
 
-    auto file_header = *Header(*impl_);
-    file_header.file_size = new_size;
-    if (::pwrite(impl_->fd, &file_header, sizeof(file_header), 0) != static_cast<ssize_t>(sizeof(file_header))) {
-        return base::Status::IoError(IoErrorMessage(path_, "unable to update mmap store header"));
-    }
+    // Update logical file_size in the file header and cached write offset
+    reinterpret_cast<StoreFileHeader*>(impl_->mapping)->file_size = new_size;
+    impl_->write_offset = new_size;
 
     if (sync_policy_ == SyncPolicy::kEveryWrite) {
         if (::fdatasync(impl_->fd) != 0) {
@@ -305,9 +327,9 @@ auto MmapSessionStore::AppendOutboundLikeView(std::uint32_t record_type, const M
         }
     }
 
-    status = Open();
-    if (!status.ok()) {
-        return status;
+    // 12.1: update index incrementally — no need to re-scan the file
+    if (record_type == static_cast<std::uint32_t>(StoreRecordType::kOutbound)) {
+        impl_->outbound_offsets[record.session_id][record.seq_num] = old_size;
     }
 
     return base::Status::Ok();
@@ -318,17 +340,26 @@ auto MmapSessionStore::AppendRecoveryState(const SessionRecoveryState& state) ->
         return base::Status::InvalidArgument("recovery state is missing session_id");
     }
 
-    auto status = Open();
-    if (!status.ok()) {
-        return status;
+    if (impl_->fd < 0 || impl_->mapping == nullptr) {
+        auto status = Open();
+        if (!status.ok()) {
+            return status;
+        }
     }
 
-    const auto old_size = Header(*impl_)->file_size;
-    const auto record_size = kStoreRecordHeaderSize;
-    const auto new_size = old_size + record_size;
+    const auto old_size = impl_->write_offset;
+    const auto new_size = old_size + kStoreRecordHeaderSize;
 
-    if (::ftruncate(impl_->fd, static_cast<off_t>(new_size)) != 0) {
-        return base::Status::IoError(IoErrorMessage(path_, "unable to extend mmap store"));
+    // 12.2: grow file in 4 KB pages to avoid per-record ftruncate syscalls
+    if (new_size > impl_->mapping_size) {
+        const auto new_physical_size = RoundUpToPage(new_size);
+        if (::ftruncate(impl_->fd, static_cast<off_t>(new_physical_size)) != 0) {
+            return base::Status::IoError(IoErrorMessage(path_, "unable to extend mmap store"));
+        }
+        auto status = GrowMapping(new_physical_size);
+        if (!status.ok()) {
+            return status;
+        }
     }
 
     StoreRecordHeader header{};
@@ -341,16 +372,11 @@ auto MmapSessionStore::AppendRecoveryState(const SessionRecoveryState& state) ->
     header.last_outbound_ns = state.last_outbound_ns;
     header.active = state.active ? kActiveRecoveryStateValue : 0U;
 
-    if (::pwrite(impl_->fd, &header, sizeof(header), static_cast<off_t>(old_size)) !=
-        static_cast<ssize_t>(sizeof(header))) {
-        return base::Status::IoError(IoErrorMessage(path_, "unable to append mmap recovery state"));
-    }
+    std::memcpy(impl_->mapping + old_size, &header, sizeof(header));
 
-    auto file_header = *Header(*impl_);
-    file_header.file_size = new_size;
-    if (::pwrite(impl_->fd, &file_header, sizeof(file_header), 0) != static_cast<ssize_t>(sizeof(file_header))) {
-        return base::Status::IoError(IoErrorMessage(path_, "unable to update mmap store header"));
-    }
+    // Update logical file_size in the file header and cached write offset
+    reinterpret_cast<StoreFileHeader*>(impl_->mapping)->file_size = new_size;
+    impl_->write_offset = new_size;
 
     if (sync_policy_ == SyncPolicy::kEveryWrite) {
         if (::fdatasync(impl_->fd) != 0) {
@@ -358,10 +384,8 @@ auto MmapSessionStore::AppendRecoveryState(const SessionRecoveryState& state) ->
         }
     }
 
-    status = Open();
-    if (!status.ok()) {
-        return status;
-    }
+    // 12.1: update index incrementally — no need to re-scan the file
+    impl_->recovery_states[state.session_id] = state;
 
     return base::Status::Ok();
 }

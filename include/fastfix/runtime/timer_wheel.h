@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -38,16 +39,15 @@ class TimerWheel {
         for (auto& slot : slots_) {
             slot.clear();
         }
-        earliest_deadline_.reset();
+        deadline_heap_.clear();
     }
 
     auto Schedule(std::uint64_t timer_id, std::uint64_t deadline_ns, std::uint64_t now_ns) -> void {
         EnsureInitialized(now_ns);
 
-        std::optional<std::uint64_t> previous_deadline;
         auto it = timers_.find(timer_id);
         if (it != timers_.end()) {
-            previous_deadline = it->second.deadline_ns;
+            deadline_heap_.erase({it->second.deadline_ns, timer_id});
             RemoveTimer(timer_id, it->second);
         } else {
             it = timers_.emplace(timer_id, TimerRecord{}).first;
@@ -69,12 +69,7 @@ class TimerWheel {
             slots_[record.slot_index].push_back(timer_id);
         }
 
-        if (!earliest_deadline_.has_value() || deadline_ns < *earliest_deadline_) {
-            earliest_deadline_ = deadline_ns;
-        } else if (previous_deadline.has_value() && earliest_deadline_.has_value() &&
-                   *previous_deadline == *earliest_deadline_ && deadline_ns > *earliest_deadline_) {
-            RecomputeEarliestDeadline();
-        }
+        deadline_heap_.insert({deadline_ns, timer_id});
     }
 
     auto Cancel(std::uint64_t timer_id) -> void {
@@ -83,12 +78,9 @@ class TimerWheel {
             return;
         }
 
-        const auto removed_deadline = it->second.deadline_ns;
+        deadline_heap_.erase({it->second.deadline_ns, timer_id});
         RemoveTimer(timer_id, it->second);
         timers_.erase(it);
-        if (earliest_deadline_.has_value() && removed_deadline == *earliest_deadline_) {
-            RecomputeEarliestDeadline();
-        }
     }
 
     auto PopExpired(std::uint64_t now_ns, std::vector<std::uint64_t>* expired_timer_ids) -> void {
@@ -98,19 +90,16 @@ class TimerWheel {
 
         EnsureInitialized(now_ns);
 
-        bool earliest_removed = false;
         if (!immediate_timers_.empty()) {
             auto immediate = std::move(immediate_timers_);
             immediate_timers_.clear();
-            for (const auto timer_id : immediate) {
-                const auto it = timers_.find(timer_id);
+            for (const auto tid : immediate) {
+                const auto it = timers_.find(tid);
                 if (it == timers_.end() || !it->second.immediate) {
                     continue;
                 }
-                if (earliest_deadline_.has_value() && it->second.deadline_ns == *earliest_deadline_) {
-                    earliest_removed = true;
-                }
-                expired_timer_ids->push_back(timer_id);
+                deadline_heap_.erase({it->second.deadline_ns, tid});
+                expired_timer_ids->push_back(tid);
                 timers_.erase(it);
             }
         }
@@ -125,34 +114,31 @@ class TimerWheel {
 
             auto pending = std::move(slot);
             slot.clear();
-            for (const auto timer_id : pending) {
-                const auto it = timers_.find(timer_id);
+            for (const auto tid : pending) {
+                const auto it = timers_.find(tid);
                 if (it == timers_.end() || it->second.immediate) {
                     continue;
                 }
 
                 auto& record = it->second;
                 if (record.due_tick <= current_tick_) {
-                    if (earliest_deadline_.has_value() && record.deadline_ns == *earliest_deadline_) {
-                        earliest_removed = true;
-                    }
-                    expired_timer_ids->push_back(timer_id);
+                    deadline_heap_.erase({record.deadline_ns, tid});
+                    expired_timer_ids->push_back(tid);
                     timers_.erase(it);
                     continue;
                 }
 
                 record.slot_position = slot.size();
-                slot.push_back(timer_id);
+                slot.push_back(tid);
             }
-        }
-
-        if (earliest_removed) {
-            RecomputeEarliestDeadline();
         }
     }
 
     [[nodiscard]] auto NextDeadline() const -> std::optional<std::uint64_t> {
-        return earliest_deadline_;
+        if (deadline_heap_.empty()) {
+            return std::nullopt;
+        }
+        return deadline_heap_.begin()->first;
     }
 
   private:
@@ -210,16 +196,6 @@ class TimerWheel {
         container.pop_back();
     }
 
-    auto RecomputeEarliestDeadline() -> void {
-        earliest_deadline_.reset();
-        for (const auto& [timer_id, record] : timers_) {
-            static_cast<void>(timer_id);
-            if (!earliest_deadline_.has_value() || record.deadline_ns < *earliest_deadline_) {
-                earliest_deadline_ = record.deadline_ns;
-            }
-        }
-    }
-
     TimerWheelOptions options_{};
     bool initialized_{false};
     std::uint64_t base_time_ns_{0U};
@@ -228,7 +204,8 @@ class TimerWheel {
     std::unordered_map<std::uint64_t, TimerRecord> timers_;
     std::vector<std::uint64_t> immediate_timers_;
     std::vector<std::vector<std::uint64_t>> slots_;
-    std::optional<std::uint64_t> earliest_deadline_;
+    // Min-heap tracking the earliest deadline in O(log N) per update.
+    std::set<std::pair<std::uint64_t, std::uint64_t>> deadline_heap_;
 };
 
 }  // namespace fastfix::runtime

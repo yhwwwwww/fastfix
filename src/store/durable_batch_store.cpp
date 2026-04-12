@@ -656,7 +656,8 @@ auto DurableBatchSessionStore::Open() -> base::Status {
     if (options_.rollover_mode == DurableStoreRolloverMode::kLocalTime) {
         if (options_.use_system_timezone) {
             auto now = std::time(nullptr);
-            auto* local = std::localtime(&now);
+            std::tm local_tm{};
+            auto* local = localtime_r(&now, &local_tm);
             impl_->effective_utc_offset_seconds = static_cast<std::int32_t>(local->tm_gmtoff);
         } else {
             impl_->effective_utc_offset_seconds = options_.local_utc_offset_seconds;

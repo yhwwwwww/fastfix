@@ -69,7 +69,8 @@ auto ApplyOverlay(const NormalizedDictionary& baseline, const NormalizedDictiona
         if (!overlay_field.name.empty()) {
             it->name = overlay_field.name;
         }
-        if (overlay_field.value_type != ValueType::kUnknown) {
+        if (overlay_field.value_type != ValueType::kUnknown &&
+            (overlay_field.flags & static_cast<std::uint32_t>(FieldFlags::kAllowTypeOverride)) != 0U) {
             it->value_type = overlay_field.value_type;
         }
         it->flags |= overlay_field.flags;
