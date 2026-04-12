@@ -312,6 +312,30 @@ if(FASTFIX_BUILD_BENCHMARKS)
             "${PROJECT_SOURCE_DIR}/bench"
     )
     target_link_libraries(fastfix-quickfix-cpp-bench PRIVATE fastfix-vendor-quickfix Threads::Threads)
+
+    # Two-process loopback benchmark: FastFix
+    add_executable(fastfix-loopback
+        "${PROJECT_SOURCE_DIR}/bench/fastfix_loopback.cpp"
+    )
+    target_link_libraries(fastfix-loopback PRIVATE fastfix)
+    target_include_directories(fastfix-loopback PRIVATE "${FASTFIX_GENERATED_DIR}")
+    add_dependencies(fastfix-loopback fastfix-fix44-assets)
+
+    # Raw TCP RTT benchmark (no FIX protocol)
+    add_executable(tcp-rtt
+        "${PROJECT_SOURCE_DIR}/bench/tcp_rtt.cpp"
+    )
+    target_link_libraries(tcp-rtt PRIVATE Threads::Threads)
+
+    # Two-process loopback benchmark: QuickFIX
+    add_executable(quickfix-loopback
+        "${PROJECT_SOURCE_DIR}/bench/quickfix_loopback.cpp"
+    )
+    target_include_directories(quickfix-loopback
+        PRIVATE
+            "${PROJECT_SOURCE_DIR}/bench"
+    )
+    target_link_libraries(quickfix-loopback PRIVATE fastfix-vendor-quickfix Threads::Threads)
 endif()
 
 if(FASTFIX_BUILD_TESTS)
