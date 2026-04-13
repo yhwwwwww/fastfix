@@ -1,5 +1,6 @@
 #include "fastfix/codec/fix_codec.h"
 #include "fastfix/codec/compiled_decoder.h"
+#include "fastfix/codec/fast_int_format.h"
 #include "fastfix/codec/simd_scan.h"
 
 #include <algorithm>
@@ -229,6 +230,28 @@ struct InlineField {
     std::size_t next_pos;
 };
 
+// Branchless tag parser: switch on digit count, unrolled multiply.
+// Returns 0 on error (tag 0 is invalid in FIX).
+inline auto ParseTagInline(const char* data, std::size_t len) -> std::uint32_t {
+    // Convert char to digit value (unchecked).
+    auto d = [](char ch) -> std::uint32_t {
+        return static_cast<std::uint32_t>(static_cast<unsigned char>(ch)) - '0';
+    };
+    // Check a single char is an ASCII digit.
+    auto ok = [](char ch) -> bool {
+        auto v = static_cast<unsigned char>(ch);
+        return v >= '0' && v <= '9';
+    };
+    switch (len) {
+        case 1: return ok(data[0]) ? d(data[0]) : 0U;
+        case 2: if (ok(data[0]) & ok(data[1])) return d(data[0]) * 10U + d(data[1]); return 0U;
+        case 3: if (ok(data[0]) & ok(data[1]) & ok(data[2])) return d(data[0]) * 100U + d(data[1]) * 10U + d(data[2]); return 0U;
+        case 4: if (ok(data[0]) & ok(data[1]) & ok(data[2]) & ok(data[3])) return d(data[0]) * 1000U + d(data[1]) * 100U + d(data[2]) * 10U + d(data[3]); return 0U;
+        case 5: if (ok(data[0]) & ok(data[1]) & ok(data[2]) & ok(data[3]) & ok(data[4])) return d(data[0]) * 10000U + d(data[1]) * 1000U + d(data[2]) * 100U + d(data[3]) * 10U + d(data[4]); return 0U;
+        default: return 0U;
+    }
+}
+
 auto ScanNextField(
     std::span<const std::byte> bytes,
     std::size_t field_start,
@@ -238,27 +261,43 @@ auto ScanNextField(
         return base::Status::FormatError("FIX frame is missing its final delimiter");
     }
     const auto remaining = bytes.size() - field_start;
-    const auto* soh_ptr = FindByte(bytes.data() + field_start, remaining, delimiter_byte);
+    // Single SIMD scan for '=' or SOH — '=' always comes first in a valid field.
+    const auto* eq_ptr = FindEitherByte(bytes.data() + field_start, remaining, equals_byte, delimiter_byte);
+    const auto eq_offset = static_cast<std::size_t>(eq_ptr - (bytes.data() + field_start));
+    if (eq_offset >= remaining) {
+        return base::Status::FormatError("FIX frame is missing its final delimiter");
+    }
+    if (eq_offset == 0U) {
+        // First byte is SOH (empty field) or '=' (no tag) — both invalid.
+        if (*eq_ptr == delimiter_byte) {
+            return base::Status::FormatError("empty FIX field is not allowed");
+        }
+        return base::Status::FormatError("invalid FIX field syntax");
+    }
+    if (*eq_ptr == delimiter_byte) {
+        // Found SOH before '=' — no equals sign in this field.
+        return base::Status::FormatError("invalid FIX field syntax");
+    }
+    // eq_ptr points to '='. Now find SOH after the value portion.
+    const auto equals = eq_offset;  // offset of '=' relative to field_start
+    const auto after_eq = field_start + equals + 1U;
+    const auto remaining_after_eq = bytes.size() - after_eq;
+    const auto* soh_ptr = FindByte(bytes.data() + after_eq, remaining_after_eq, delimiter_byte);
     const auto soh_index = static_cast<std::size_t>(soh_ptr - bytes.data());
     if (soh_index >= bytes.size()) {
         return base::Status::FormatError("FIX frame is missing its final delimiter");
     }
-    if (soh_index == field_start) {
-        return base::Status::FormatError("empty FIX field is not allowed");
-    }
     const auto field_len = soh_index - field_start;
-    const auto* eq_ptr = FindByte(bytes.data() + field_start, field_len, equals_byte);
-    const auto equals = static_cast<std::size_t>(eq_ptr - (bytes.data() + field_start));
-    if (equals >= field_len || equals == 0U || equals == field_len - 1U) {
+    if (equals == field_len - 1U) {
         return base::Status::FormatError("invalid FIX field syntax");
     }
     const auto* field_bytes = reinterpret_cast<const char*>(bytes.data() + field_start);
-    auto tag = ParseUnsigned(std::string_view(field_bytes, equals), "field tag");
-    if (!tag.ok()) {
-        return tag.status();
+    const auto tag = ParseTagInline(field_bytes, equals);
+    if (tag == 0U) {
+        return base::Status::FormatError("invalid field tag");
     }
     return InlineField{
-        .tag = tag.value(),
+        .tag = tag,
         .start_offset = field_start,
         .value_offset = field_start + equals + 1U,
         .value_length = static_cast<std::uint32_t>(field_len - equals - 1U),
@@ -491,6 +530,53 @@ auto AppendParsedFieldSlot(
         if (qc_slot.has_value()) {
             parsed->quick_cache[static_cast<std::size_t>(*qc_slot)] = static_cast<std::uint16_t>(new_index);
         }
+    }
+    return false;
+}
+
+// Fast append for compiled decoder root-level fields.
+// Skips the container dispatch and function-call overhead of the generic path.
+// Still detects duplicates via inline hash table check.
+auto AppendParsedFieldSlotFast(
+    message::ParsedMessageData* parsed,
+    message::ParsedFieldSlot slot) -> bool {
+    const auto tag = slot.tag;
+    bool is_dup = false;
+
+    // Inline dup check for tags < 1024 (direct-address table).
+    if (tag < message::kFieldHashTableSize) {
+        const auto packed = parsed->field_hash_table[tag];
+        const auto gen = static_cast<std::uint16_t>(packed >> 16U);
+        if (gen == parsed->field_generation) {
+            // Duplicate: overwrite existing slot.
+            const auto existing = packed & 0xFFFFU;
+            parsed->field_slots[existing] = slot;
+            return true;
+        }
+    } else {
+        // Overflow scan for tags >= 1024.
+        for (std::size_t i = 0; i + 1U < parsed->field_hash_overflow.size(); i += 2U) {
+            if (parsed->field_hash_overflow[i] == static_cast<std::uint16_t>(tag)) {
+                const auto existing = static_cast<std::uint32_t>(parsed->field_hash_overflow[i + 1U]);
+                parsed->field_slots[existing] = slot;
+                return true;
+            }
+        }
+    }
+
+    const auto new_index = static_cast<std::uint32_t>(parsed->field_slots.size());
+    parsed->field_slots.push_back(slot);
+
+    auto& entry = parsed->root;
+    if (entry.first_field_index == message::kInvalidParsedIndex) {
+        entry.first_field_index = new_index;
+    }
+    ++entry.field_count;
+
+    InsertIntoRootHashTable(parsed, new_index);
+    const auto qc_slot = message::QuickCacheSlotForTag(slot.tag);
+    if (qc_slot.has_value()) {
+        parsed->quick_cache[static_cast<std::size_t>(*qc_slot)] = static_cast<std::uint16_t>(new_index);
     }
     return false;
 }
@@ -763,27 +849,7 @@ auto MakeFixedFieldFragment(std::uint32_t tag, std::string_view value, char deli
     return fragment;
 }
 
-auto ComputeChecksumSIMD(const char* data, std::size_t len) -> std::uint32_t {
-    std::uint32_t sum = 0;
-#if FASTFIX_HAS_SSE2
-    const auto zero = _mm_setzero_si128();
-    std::size_t i = 0;
-    for (; i + 16 <= len; i += 16) {
-        auto chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
-        auto sad = _mm_sad_epu8(chunk, zero);
-        sum += static_cast<std::uint32_t>(_mm_extract_epi16(sad, 0)) +
-               static_cast<std::uint32_t>(_mm_extract_epi16(sad, 4));
-    }
-    for (; i < len; ++i) {
-        sum += static_cast<unsigned char>(data[i]);
-    }
-#else
-    for (std::size_t i = 0; i < len; ++i) {
-        sum += static_cast<unsigned char>(data[i]);
-    }
-#endif
-    return sum;
-}
+// ComputeChecksumSIMD is now in simd_scan.h (fastfix::codec namespace).
 
 auto AccumulateChecksum(std::string_view text, std::uint32_t* checksum) -> void {
     if (checksum == nullptr) {
@@ -811,14 +877,16 @@ auto AppendTracked(std::string& out, std::uint32_t* checksum, char value) -> voi
     }
 }
 
-template <typename Integer>
-auto AppendIntegerDigits(std::string& out, std::uint32_t* checksum, Integer value) -> void {
-    std::array<char, kIntegerTextBufferBytes<Integer>> buffer{};
-    const auto [ptr, ec] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
-    if (ec != std::errc()) {
-        return;
-    }
-    AppendTracked(out, checksum, std::string_view(buffer.data(), static_cast<std::size_t>(ptr - buffer.data())));
+auto AppendIntegerDigits(std::string& out, std::uint32_t* checksum, std::int64_t value) -> void {
+    char buffer[20];
+    const auto len = FormatInt64(buffer, value);
+    AppendTracked(out, checksum, std::string_view(buffer, len));
+}
+
+auto AppendIntegerDigits(std::string& out, std::uint32_t* checksum, std::uint32_t value) -> void {
+    char buffer[10];
+    const auto len = FormatUint32(buffer, value);
+    AppendTracked(out, checksum, std::string_view(buffer, len));
 }
 
 auto AppendPrefixedStringField(
@@ -844,24 +912,18 @@ auto AppendPrefixedCountField(
 }
 
 auto AppendField(std::string& out, std::uint32_t tag, std::string_view value, char delimiter) -> void {
-    std::array<char, kIntegerTextBufferBytes<std::uint32_t>> tag_buf{};
-    const auto [tag_ptr, tag_ec] = std::to_chars(tag_buf.data(), tag_buf.data() + tag_buf.size(), tag);
-    if (tag_ec != std::errc()) {
-        return;
-    }
-    out.append(tag_buf.data(), static_cast<std::size_t>(tag_ptr - tag_buf.data()));
+    char tag_buf[10];
+    const auto tag_len = FormatUint32(tag_buf, tag);
+    out.append(tag_buf, tag_len);
     out.push_back('=');
     out.append(value);
     out.push_back(delimiter);
 }
 
 auto AppendField(std::string& out, std::uint32_t tag, std::int64_t value, char delimiter) -> void {
-    std::array<char, kIntegerTextBufferBytes<std::int64_t>> val_buf{};
-    const auto [val_ptr, val_ec] = std::to_chars(val_buf.data(), val_buf.data() + val_buf.size(), value);
-    if (val_ec != std::errc()) {
-        return;
-    }
-    AppendField(out, tag, std::string_view(val_buf.data(), static_cast<std::size_t>(val_ptr - val_buf.data())), delimiter);
+    char val_buf[20];
+    const auto val_len = FormatInt64(val_buf, value);
+    AppendField(out, tag, std::string_view(val_buf, val_len), delimiter);
 }
 
 auto AppendField(std::string& out, std::uint32_t tag, double value, char delimiter) -> void {
@@ -1356,11 +1418,8 @@ auto ReplaceUnsignedPlaceholder(
     std::size_t placeholder_width,
     std::uint32_t value,
     std::uint32_t* checksum) -> void {
-    std::array<char, kIntegerTextBufferBytes<std::uint32_t>> buffer{};
-    const auto [ptr, ec] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
-    if (ec != std::errc()) {
-        return;
-    }
+    char buffer[10];
+    const auto len = FormatUint32(buffer, value);
 
     const auto original = std::string_view(out.data() + offset, placeholder_width);
     if (checksum != nullptr) {
@@ -1369,10 +1428,10 @@ auto ReplaceUnsignedPlaceholder(
             original_sum += static_cast<unsigned char>(ch);
         }
         *checksum -= original_sum;
-        AccumulateChecksum(std::string_view(buffer.data(), static_cast<std::size_t>(ptr - buffer.data())), checksum);
+        AccumulateChecksum(std::string_view(buffer, len), checksum);
     }
 
-    out.replace(offset, placeholder_width, buffer.data(), static_cast<std::size_t>(ptr - buffer.data()));
+    out.replace(offset, placeholder_width, buffer, len);
 }
 
 auto CopyTextToBytes(std::string_view text) -> std::vector<std::byte> {
@@ -1464,18 +1523,14 @@ auto EncodeFixMessageGenericToBuffer(
     // Backfill body length
     const auto body_length = static_cast<std::uint32_t>(full.size() - body_start);
     {
-        std::array<char, kIntegerTextBufferBytes<std::uint32_t>> bl_buf{};
-        const auto [ptr, ec] = std::to_chars(bl_buf.data(), bl_buf.data() + bl_buf.size(), body_length);
-        if (ec != std::errc()) {
-            return base::Status::FormatError("BodyLength conversion failed");
-        }
-        const auto digits = static_cast<std::size_t>(ptr - bl_buf.data());
+        char bl_buf[10];
+        const auto digits = FormatUint32(bl_buf, body_length);
         if (digits > kBodyLengthPlaceholderWidth) {
             return base::Status::FormatError(
                 "encoded body length exceeds BodyLength placeholder width");
         }
         full.replace(body_length_offset, kBodyLengthPlaceholderWidth,
-                     bl_buf.data(), digits);
+                     bl_buf, digits);
     }
 
     // Compute checksum over entire buffer using SIMD-accelerated path
@@ -1688,10 +1743,9 @@ auto FrameEncodeTemplate::EncodeToBuffer(
 
     {
         const auto body_length = static_cast<std::uint32_t>(full.size() - body_start);
-        std::array<char, kIntegerTextBufferBytes<std::uint32_t>> bl_check{};
-        const auto [bl_ptr, bl_ec] = std::to_chars(bl_check.data(), bl_check.data() + bl_check.size(), body_length);
-        if (bl_ec != std::errc() ||
-            static_cast<std::size_t>(bl_ptr - bl_check.data()) > kBodyLengthPlaceholderWidth) {
+        char bl_check[10];
+        const auto bl_len = FormatUint32(bl_check, body_length);
+        if (bl_len > kBodyLengthPlaceholderWidth) {
             return base::Status::FormatError(
                 "encoded body length exceeds BodyLength placeholder width");
         }
@@ -2214,7 +2268,7 @@ auto DecodeFixMessageView(
                     static_cast<std::uint32_t>(scanned.value().value_offset),
                     scanned.value().value_length,
                     message::kFieldString);
-                AppendParsedFieldSlot(&parsed_message, RootContainer(), slot);
+                AppendParsedFieldSlotFast(&parsed_message, slot);
                 byte_pos = scanned.value().next_pos;
                 continue;
             }
@@ -2228,7 +2282,7 @@ auto DecodeFixMessageView(
                     static_cast<std::uint32_t>(scanned.value().value_offset),
                     scanned.value().value_length,
                     compiled_slot.field_type);
-                if (AppendParsedFieldSlot(&parsed_message, RootContainer(), slot)) {
+                if (AppendParsedFieldSlotFast(&parsed_message, slot)) {
                     SetValidationIssue(
                         &validation_issue,
                         ValidationIssueKind::kDuplicateField,
@@ -2260,7 +2314,7 @@ auto DecodeFixMessageView(
                 static_cast<std::uint32_t>(scanned.value().value_offset),
                 scanned.value().value_length,
                 compiled_slot.field_type);
-            if (AppendParsedFieldSlot(&parsed_message, RootContainer(), slot)) {
+            if (AppendParsedFieldSlotFast(&parsed_message, slot)) {
                 SetValidationIssue(
                     &validation_issue,
                     ValidationIssueKind::kDuplicateField,

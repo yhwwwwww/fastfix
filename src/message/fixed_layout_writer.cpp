@@ -11,7 +11,9 @@
 #include <utility>
 #include <vector>
 
+#include "fastfix/codec/fast_int_format.h"
 #include "fastfix/codec/fix_codec.h"
+#include "fastfix/codec/simd_scan.h"
 
 namespace fastfix::message {
 
@@ -42,11 +44,9 @@ void SetEncodeStepPrefix(FixedLayout::EncodeStep& step, std::uint32_t tag) {
 }
 
 void AppendTagToBuffer(std::string& buf, std::uint32_t tag) {
-    std::array<char, kUintBufSize> tmp{};
-    const auto [ptr, ec] = std::to_chars(tmp.data(), tmp.data() + tmp.size(), tag);
-    if (ec == std::errc()) {
-        buf.append(tmp.data(), static_cast<std::size_t>(ptr - tmp.data()));
-    }
+    char tmp[10];
+    const auto len = codec::FormatUint32(tmp, tag);
+    buf.append(tmp, len);
 }
 
 }  // namespace
@@ -168,11 +168,9 @@ auto FixedGroupEntryBuilder::set_string(std::uint32_t tag, std::string_view valu
 auto FixedGroupEntryBuilder::set_int(std::uint32_t tag, std::int64_t value) -> FixedGroupEntryBuilder& {
     AppendTagToBuffer(*buffer_, tag);
     buffer_->push_back('=');
-    std::array<char, kIntBufSize> buf{};
-    const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), value);
-    if (ec == std::errc()) {
-        buffer_->append(buf.data(), static_cast<std::size_t>(ptr - buf.data()));
-    }
+    char buf[20];
+    const auto len = codec::FormatInt64(buf, value);
+    buffer_->append(buf, len);
     buffer_->push_back(codec::kFixSoh);
     return *this;
 }
@@ -297,15 +295,12 @@ auto FixedLayoutWriter::set_int(std::uint32_t tag, std::int64_t value) -> FixedL
     const auto idx = layout_->slot_index(tag);
     if (idx >= 0) {
         const auto slot = static_cast<std::size_t>(idx);
-        std::array<char, kIntBufSize> buf{};
-        const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), value);
-        if (ec == std::errc()) {
-            const auto len = static_cast<std::size_t>(ptr - buf.data());
-            slot_ranges_[slot] = SlotRange{
-                static_cast<std::uint32_t>(slot_buffer_.size()),
-                static_cast<std::uint32_t>(len)};
-            slot_buffer_.append(buf.data(), len);
-        }
+        char buf[20];
+        const auto len = codec::FormatInt64(buf, value);
+        slot_ranges_[slot] = SlotRange{
+            static_cast<std::uint32_t>(slot_buffer_.size()),
+            static_cast<std::uint32_t>(len)};
+        slot_buffer_.append(buf, len);
     }
     return *this;
 }
@@ -391,17 +386,6 @@ auto FixedLayoutWriter::encode_to_buffer(
     const char delimiter = (options.delimiter == '\0') ? codec::kFixSoh : options.delimiter;
     auto& out = buffer->storage;
     out.clear();
-    std::uint32_t checksum = 0;
-
-    // -- Helpers (capture out & checksum by reference) --
-    auto at = [&](std::string_view text) {
-        out.append(text);
-        for (const auto ch : text) checksum += static_cast<unsigned char>(ch);
-    };
-    auto ac = [&](char ch) {
-        out.push_back(ch);
-        checksum += static_cast<unsigned char>(ch);
-    };
 
     constexpr std::size_t kBLPlaceholderWidth = 7U;
     std::size_t bl_offset = 0;
@@ -415,58 +399,56 @@ auto FixedLayoutWriter::encode_to_buffer(
         out.append(frag.header_prefix);
         bl_offset = frag.body_length_offset;
         body_start = frag.body_start_offset;
-        checksum = frag.static_checksum;  // includes header_prefix + sender_target
 
         // 4. MsgSeqNum (dynamic)
         {
             const auto seq = options.msg_seq_num == 0U ? 1U : options.msg_seq_num;
-            std::array<char, kUintBufSize> buf{};
-            const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), seq);
-            at("34=");
-            if (ec == std::errc()) at(std::string_view(buf.data(), static_cast<std::size_t>(ptr - buf.data())));
-            ac(delimiter);
+            char buf[10];
+            const auto len = codec::FormatUint32(buf, seq);
+            out.append("34=");
+            out.append(buf, len);
+            out.push_back(delimiter);
         }
 
         // 5-6. SenderCompID + TargetCompID — memcpy from pre-built fragment
-        //      (checksum already included via static_checksum)
         out.append(frag.sender_target);
     } else {
         // --- Slow path: format each header field individually ---
 
         // 1. BeginString: 8={begin_string}\x01  9=
-        at("8=");
-        at(options.begin_string);
-        ac(delimiter);
-        at("9=");
+        out.append("8=");
+        out.append(options.begin_string);
+        out.push_back(delimiter);
+        out.append("9=");
 
-        // 2. BodyLength placeholder (10 chars reserved)
+        // 2. BodyLength placeholder (7 chars reserved)
         bl_offset = out.size();
-        at(std::string_view("0000000000", kBLPlaceholderWidth));
-        ac(delimiter);
+        out.append("0000000", kBLPlaceholderWidth);
+        out.push_back(delimiter);
         body_start = out.size();
 
         // 3. MsgType
-        at(layout_->msg_type_fragment_);
+        out.append(layout_->msg_type_fragment_);
 
         // 4. MsgSeqNum
         {
             const auto seq = options.msg_seq_num == 0U ? 1U : options.msg_seq_num;
-            std::array<char, kUintBufSize> buf{};
-            const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), seq);
-            at("34=");
-            if (ec == std::errc()) at(std::string_view(buf.data(), static_cast<std::size_t>(ptr - buf.data())));
-            ac(delimiter);
+            char buf[10];
+            const auto len = codec::FormatUint32(buf, seq);
+            out.append("34=");
+            out.append(buf, len);
+            out.push_back(delimiter);
         }
 
         // 5. SenderCompID
-        at("49=");
-        at(options.sender_comp_id);
-        ac(delimiter);
+        out.append("49=");
+        out.append(options.sender_comp_id);
+        out.push_back(delimiter);
 
         // 6. TargetCompID
-        at("56=");
-        at(options.target_comp_id);
-        ac(delimiter);
+        out.append("56=");
+        out.append(options.target_comp_id);
+        out.push_back(delimiter);
     }
 
     // 7. SendingTime
@@ -474,28 +456,28 @@ auto FixedLayoutWriter::encode_to_buffer(
     const auto sending_time = options.sending_time.empty()
         ? codec::CurrentUtcTimestamp(&ts_buf)
         : options.sending_time;
-    at("52=");
-    at(sending_time);
-    ac(delimiter);
+    out.append("52=");
+    out.append(sending_time);
+    out.push_back(delimiter);
 
     // 8. DefaultApplVerID (optional)
     if (!options.default_appl_ver_id.empty()) {
-        at("1128=");
-        at(options.default_appl_ver_id);
-        ac(delimiter);
+        out.append("1128=");
+        out.append(options.default_appl_ver_id);
+        out.push_back(delimiter);
     }
 
     // 9. PossDup (optional)
     if (options.poss_dup) {
-        at("43=Y");
-        ac(delimiter);
+        out.append("43=Y");
+        out.push_back(delimiter);
     }
 
     // 10. OrigSendingTime (optional)
     if (!options.orig_sending_time.empty()) {
-        at("122=");
-        at(options.orig_sending_time);
-        ac(delimiter);
+        out.append("122=");
+        out.append(options.orig_sending_time);
+        out.push_back(delimiter);
     }
 
     // 11. Body fields + groups from encode_order_
@@ -503,35 +485,32 @@ auto FixedLayoutWriter::encode_to_buffer(
         if (step.kind == FixedLayout::EncodeStep::Kind::kField) {
             const auto& range = slot_ranges_[step.slot_index];
             if (range.length > 0) {
-                at(step.prefix());
-                at(std::string_view(slot_buffer_.data() + range.offset, range.length));
-                ac(delimiter);
+                out.append(step.prefix());
+                out.append(slot_buffer_.data() + range.offset, range.length);
+                out.push_back(delimiter);
             }
         } else {
             // Group: find in groups_ and encode pre-formatted entry bytes.
             for (const auto& g : groups_) {
                 if (g.count_tag == step.tag) {
                     // Write "TAG=count\x01"
-                    at(step.prefix());
-                    std::array<char, kUintBufSize> count_buf{};
-                    const auto [count_ptr, count_ec] = std::to_chars(
-                        count_buf.data(), count_buf.data() + count_buf.size(), g.active_count);
-                    if (count_ec == std::errc()) {
-                        at(std::string_view(count_buf.data(),
-                            static_cast<std::size_t>(count_ptr - count_buf.data())));
-                    }
-                    ac(delimiter);
+                    out.append(step.prefix());
+                    char count_buf[10];
+                    const auto count_len = codec::FormatUint32(count_buf,
+                        static_cast<std::uint32_t>(g.active_count));
+                    out.append(count_buf, count_len);
+                    out.push_back(delimiter);
                     // Write each entry's pre-formatted bytes.
                     for (std::size_t ei = 0; ei < g.active_count; ++ei) {
                         const auto& entry = g.entries[ei];
                         if (delimiter == codec::kFixSoh) {
-                            at(entry.field_bytes);
+                            out.append(entry.field_bytes);
                         } else {
                             for (const auto ch : entry.field_bytes) {
                                 if (ch == codec::kFixSoh) {
-                                    ac(delimiter);
+                                    out.push_back(delimiter);
                                 } else {
-                                    ac(ch);
+                                    out.push_back(ch);
                                 }
                             }
                         }
@@ -545,28 +524,19 @@ auto FixedLayoutWriter::encode_to_buffer(
     // 12. Replace BodyLength placeholder
     {
         const auto body_length = static_cast<std::uint32_t>(out.size() - body_start);
-        std::array<char, kUintBufSize> buf{};
-        const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), body_length);
-        if (ec != std::errc()) {
-            return base::Status::FormatError("BodyLength conversion failed");
-        }
-        const auto len = static_cast<std::size_t>(ptr - buf.data());
+        char buf[10];
+        const auto len = codec::FormatUint32(buf, body_length);
         if (len > kBLPlaceholderWidth) {
             return base::Status::FormatError(
                 "encoded body length exceeds BodyLength placeholder width");
         }
-        // Adjust checksum: subtract placeholder, add real value.
-        for (std::size_t i = 0; i < kBLPlaceholderWidth; ++i) {
-            checksum -= static_cast<unsigned char>(out[bl_offset + i]);
-        }
-        for (std::size_t i = 0; i < len; ++i) {
-            checksum += static_cast<unsigned char>(buf[i]);
-        }
-        out.replace(bl_offset, kBLPlaceholderWidth, buf.data(), len);
+        out.replace(bl_offset, kBLPlaceholderWidth, buf, len);
     }
 
-    // 13. Trailer: 10=NNN\x01  (NOT included in checksum)
-    checksum %= 256U;
+    // 13. SIMD checksum over the complete buffer (before trailer).
+    const auto checksum = codec::ComputeChecksumSIMD(out.data(), out.size()) % 256U;
+
+    // 14. Trailer: 10=NNN\x01  (NOT included in checksum)
     out.append("10=");
     std::array<char, 3> ck{};
     ck[0] = static_cast<char>('0' + ((checksum / 100U) % 10U));

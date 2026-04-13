@@ -34,6 +34,7 @@ auto MakeStoredRecord(
         .flags = record.flags,
         .payload_offset = payload_offset,
         .payload_size = payload_size,
+        .body_start_offset = record.body_start_offset,
     };
 }
 
@@ -46,6 +47,7 @@ auto MaterializeRecord(
     owned.seq_num = record.seq_num;
     owned.timestamp_ns = record.timestamp_ns;
     owned.flags = record.flags;
+    owned.body_start_offset = record.body_start_offset;
     owned.payload.insert(
         owned.payload.end(),
         payload_arena.begin() + static_cast<std::ptrdiff_t>(record.payload_offset),
@@ -65,6 +67,7 @@ auto ViewRecord(
         .payload = std::span<const std::byte>(
             payload_arena.data() + static_cast<std::ptrdiff_t>(record.payload_offset),
             record.payload_size),
+        .body_start_offset = record.body_start_offset,
     };
 }
 

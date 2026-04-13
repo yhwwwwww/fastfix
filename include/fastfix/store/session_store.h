@@ -26,6 +26,7 @@ struct MessageRecord {
     std::uint64_t timestamp_ns{0};
     std::uint16_t flags{0};
     std::vector<std::byte> payload;
+    std::uint32_t body_start_offset{0};  // byte offset where application body begins; 0 = unknown
 
     [[nodiscard]] bool is_admin() const {
         return (flags & static_cast<std::uint16_t>(MessageRecordFlags::kAdmin)) != 0;
@@ -44,6 +45,7 @@ struct MessageRecordView {
     std::uint64_t timestamp_ns{0};
     std::uint16_t flags{0};
     std::span<const std::byte> payload;
+    std::uint32_t body_start_offset{0};  // byte offset where application body begins; 0 = unknown
 
     [[nodiscard]] bool is_admin() const {
         return (flags & static_cast<std::uint16_t>(MessageRecordFlags::kAdmin)) != 0;
@@ -60,6 +62,7 @@ struct MessageRecordView {
         record.timestamp_ns = timestamp_ns;
         record.flags = flags;
         record.payload = std::vector<std::byte>(payload.begin(), payload.end());
+        record.body_start_offset = body_start_offset;
         return record;
     }
 };
@@ -97,6 +100,7 @@ inline auto MessageRecord::view() const -> MessageRecordView {
         .timestamp_ns = timestamp_ns,
         .flags = flags,
         .payload = std::span<const std::byte>(payload.data(), payload.size()),
+        .body_start_offset = body_start_offset,
     };
 }
 

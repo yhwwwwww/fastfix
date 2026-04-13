@@ -105,6 +105,70 @@ auto IsPreActivationState(SessionState state) -> bool {
     return state == SessionState::kConnected || state == SessionState::kPendingLogon;
 }
 
+// Scan the header prefix of an encoded FIX frame to find where the
+// application body begins (the byte offset after the last session-level
+// header field's SOH).  This mirrors the logic in DecodeRawPassThrough
+// but stops as soon as the first non-header field is encountered, so it
+// only touches the short header prefix rather than the full frame.
+auto ComputeBodyStartOffset(std::span<const std::byte> frame) -> std::uint32_t {
+    constexpr auto kSoh = static_cast<std::byte>('\x01');
+    constexpr auto kEquals = static_cast<std::byte>('=');
+
+    const auto* data = frame.data();
+    const auto size = frame.size();
+    std::size_t pos = 0;
+    std::size_t last_header_end = 0;
+
+    while (pos < size) {
+        // Find '='
+        std::size_t eq = pos;
+        while (eq < size && data[eq] != kEquals) {
+            ++eq;
+        }
+        if (eq >= size || eq == pos) {
+            break;
+        }
+
+        // Parse tag number
+        std::uint32_t tag = 0;
+        for (std::size_t i = pos; i < eq; ++i) {
+            const auto digit = static_cast<unsigned char>(data[i]) - '0';
+            if (digit > 9U) {
+                return static_cast<std::uint32_t>(last_header_end);
+            }
+            tag = tag * 10U + digit;
+        }
+
+        // Find SOH after value
+        std::size_t soh = eq + 1;
+        while (soh < size && data[soh] != kSoh) {
+            ++soh;
+        }
+        if (soh >= size) {
+            break;
+        }
+
+        const auto field_end = soh + 1;
+
+        // Check if this is a session header tag
+        switch (tag) {
+            case 8U: case 9U: case 10U:
+            case 34U: case 35U: case 43U:
+            case 49U: case 52U: case 56U:
+            case 97U: case 122U: case 1137U:
+                last_header_end = field_end;
+                break;
+            default:
+                // First non-header tag — body starts at the current position
+                return static_cast<std::uint32_t>(last_header_end);
+        }
+
+        pos = field_end;
+    }
+
+    return static_cast<std::uint32_t>(last_header_end);
+}
+
 auto IsActiveAdminState(SessionState state) -> bool {
     return state == SessionState::kActive || state == SessionState::kAwaitingLogout ||
            state == SessionState::kResendProcessing;
@@ -512,6 +576,8 @@ auto AdminProtocol::EncodeFrame(
             flags |= MessageRecordFlagValue(store::MessageRecordFlags::kPossDup);
         }
 
+        const auto body_offset = ComputeBodyStartOffset(encoded_frame.bytes.view());
+
         const auto snapshot = session_.Snapshot();
         status = store_->SaveOutboundViewAndRecoveryState(
             store::MessageRecordView{
@@ -520,6 +586,7 @@ auto AdminProtocol::EncodeFrame(
                 .timestamp_ns = timestamp_ns,
                 .flags = flags,
                 .payload = encoded_frame.bytes.view(),
+                .body_start_offset = body_offset,
             },
             store::SessionRecoveryState{
                 .session_id = snapshot.session_id,

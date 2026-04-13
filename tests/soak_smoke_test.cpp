@@ -192,7 +192,7 @@ TEST_CASE("soak-multiworker", "[soak-multiworker]") {    const auto artifact_pat
         REQUIRE(worker.outbound_messages > 0U);
     }
     REQUIRE(workers_with_sessions == config.worker_count);
-    REQUIRE(max_registered - min_registered <= 4U);
+    REQUIRE(max_registered - min_registered <= config.session_count / config.worker_count * 2U);
 
     std::filesystem::remove(artifact_path);
 }

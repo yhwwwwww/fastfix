@@ -1461,19 +1461,44 @@ auto LiveInitiator::SendFramesBatch(
     const session::ProtocolFrameList& frames,
     std::uint64_t timestamp_ns) -> base::Status {
     if (frames.size() <= 1U) {
-        return SendFrames(connection, frames, timestamp_ns);
-    }
-
-    std::vector<std::span<const std::byte>> segments;
-    segments.reserve(frames.size());
-    for (const auto& frame : frames) {
-        auto view = frame.bytes.view();
-        if (!view.empty()) {
-            segments.push_back(view);
+        // Check if single frame uses external_body — if so, fall through to gather path.
+        if (frames.empty() || frames[0].bytes.external_body.empty()) {
+            return SendFrames(connection, frames, timestamp_ns);
         }
     }
 
-    auto status = connection.connection.SendGather(segments, options_.io_timeout);
+    std::vector<std::span<const std::byte>> segments;
+    segments.reserve(frames.size() * 3U);
+    for (const auto& frame : frames) {
+        auto full = frame.bytes.view();
+        if (full.empty()) {
+            continue;
+        }
+        if (!frame.bytes.external_body.empty()) {
+            // Scatter-gather: [header] [external_body] [trailer]
+            const auto splice = frame.bytes.body_splice_offset;
+            segments.push_back(full.subspan(0, splice));
+            segments.push_back(frame.bytes.external_body);
+            if (splice < full.size()) {
+                segments.push_back(full.subspan(splice));
+            }
+        } else {
+            segments.push_back(full);
+        }
+    }
+
+    // Use zero-copy send when any frame has external_body (mmap-backed scatter-gather).
+    bool has_external = false;
+    for (const auto& frame : frames) {
+        if (!frame.bytes.external_body.empty()) {
+            has_external = true;
+            break;
+        }
+    }
+
+    auto status = has_external
+        ? connection.connection.SendZeroCopyGather(segments, options_.io_timeout)
+        : connection.connection.SendGather(segments, options_.io_timeout);
     if (!status.ok()) {
         return status;
     }

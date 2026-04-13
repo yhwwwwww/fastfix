@@ -794,21 +794,19 @@ int main(int argc, char** argv) {
     const auto fixed_sending_time = ToQuickFixTimestamp(business_order.transact_time);
     const auto sample_frame = BuildSampleFrame(business_order, fixed_sending_time);
 
-    const auto parse_result = RunParseBenchmark(dictionary, sample_frame, iterations);
-
     std::cout << "quickfix encode uses fixed SendingTime; quickfix-encode and quickfix-encode-buffer share the same serializer\n";
 
     const auto encode_result = RunEncodeBenchmark(business_order, fixed_sending_time, iterations);
 
-    const auto encode_buffer_result = RunEncodeBufferBenchmark(business_order, fixed_sending_time, iterations);
-
-    std::vector<LabeledResult> results;
-    results.push_back({"quickfix-parse", parse_result});
-    results.push_back({"quickfix-encode", encode_result});
-    results.push_back({"quickfix-encode-buffer", encode_buffer_result});
+    const auto parse_result = RunParseBenchmark(dictionary, sample_frame, iterations);
 
     auto session_inbound = RunQFSessionInboundBenchmark(
         dictionary, xml_path, business_order, fixed_sending_time, iterations);
+
+    // --- Shared benchmarks (aligned with FastFix compare order) ---
+    std::vector<LabeledResult> results;
+    results.push_back({"quickfix-encode", encode_result});
+    results.push_back({"quickfix-parse", parse_result});
     results.push_back({"quickfix-session-inbound", session_inbound});
 
     if (replay_iterations > 0U) {
@@ -825,6 +823,10 @@ int main(int argc, char** argv) {
     } else {
         std::cout << "quickfix-loopback skipped: --loopback 0\n";
     }
+
+    // --- QuickFIX-only benchmarks ---
+    const auto encode_buffer_result = RunEncodeBufferBenchmark(business_order, fixed_sending_time, iterations);
+    results.push_back({"quickfix-encode-buffer", encode_buffer_result});
 
     bench_support::PrintResultTable(results);
     return 0;

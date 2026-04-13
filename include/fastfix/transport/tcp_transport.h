@@ -45,6 +45,8 @@ class TcpConnection {
     auto Send(const std::vector<std::byte>& bytes, std::chrono::milliseconds timeout) -> base::Status;
     auto SendGather(std::span<const std::span<const std::byte>> segments,
                     std::chrono::milliseconds timeout) -> base::Status;
+    auto SendZeroCopyGather(std::span<const std::span<const std::byte>> segments,
+                            std::chrono::milliseconds timeout) -> base::Status;
     auto BusySend(std::span<const std::byte> bytes, std::chrono::milliseconds timeout) -> base::Status;
     auto TryReceiveFrameView() -> base::Result<std::optional<std::span<const std::byte>>>;
     auto ReceiveFrameView(std::chrono::milliseconds timeout) -> base::Result<std::span<const std::byte>>;

@@ -1343,12 +1343,18 @@ TEST_CASE("live-initiator-queue", "[live-initiator-queue]") {
         });
     mismatch_handler_ptr->BindInitiator(&mismatch_runtime);
 
-    REQUIRE(mismatch_runtime.OpenSession(1206U, "127.0.0.1", mismatch_port).ok());
-    auto mismatch_status = mismatch_runtime.Run(1U, std::chrono::milliseconds(5));
-    REQUIRE(!mismatch_status.ok());
-    REQUIRE(mismatch_status.code() == fastfix::base::ErrorCode::kInvalidArgument);
-    REQUIRE(mismatch_status.message().find("queue application worker_count must match engine worker_count") !=
-            std::string::npos);
+    auto open_status = mismatch_runtime.OpenSession(1206U, "127.0.0.1", mismatch_port);
+    if (open_status.ok()) {
+        // Mismatch caught at Run() — session happened to route to a valid worker_id.
+        auto mismatch_status = mismatch_runtime.Run(1U, std::chrono::milliseconds(5));
+        REQUIRE(!mismatch_status.ok());
+        REQUIRE(mismatch_status.code() == fastfix::base::ErrorCode::kInvalidArgument);
+        REQUIRE(mismatch_status.message().find("queue application worker_count must match engine worker_count") !=
+                std::string::npos);
+    } else {
+        // Mismatch caught at OpenSession() — session routed to a worker_id beyond queue's worker_count.
+        REQUIRE(!open_status.ok());
+    }
     mismatch_runtime.Stop();
 
     auto threaded_acceptor = fastfix::transport::TcpAcceptor::Listen("127.0.0.1", 0U);

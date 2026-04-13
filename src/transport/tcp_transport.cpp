@@ -10,6 +10,9 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#ifndef FASTFIX_DISABLE_LIBURING
+#include <liburing.h>
+#endif
 
 #include <charconv>
 #include <cstring>
@@ -370,6 +373,88 @@ auto TcpConnection::SendGather(
     }
     return base::Status::Ok();
 }
+
+#ifndef FASTFIX_DISABLE_LIBURING
+auto TcpConnection::SendZeroCopyGather(
+    std::span<const std::span<const std::byte>> segments,
+    std::chrono::milliseconds timeout) -> base::Status {
+    if (segments.empty()) {
+        return base::Status::Ok();
+    }
+    // Fallback to writev for small payloads (io_uring setup overhead not worth it).
+    std::size_t total_bytes = 0;
+    for (const auto& seg : segments) {
+        total_bytes += seg.size();
+    }
+    if (total_bytes < 4096U || segments.size() < 2U) {
+        return SendGather(segments, timeout);
+    }
+
+    struct io_uring ring{};
+    if (io_uring_queue_init(static_cast<unsigned>(segments.size()), &ring, 0) < 0) {
+        // io_uring not available — fall back to writev
+        return SendGather(segments, timeout);
+    }
+
+    // Submit one SEND_ZC SQE per segment; use MSG_MORE on all but the last.
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+        auto* sqe = io_uring_get_sqe(&ring);
+        if (sqe == nullptr) {
+            io_uring_queue_exit(&ring);
+            return SendGather(segments, timeout);
+        }
+        io_uring_prep_send_zc(sqe, fd_,
+            segments[i].data(), segments[i].size(),
+            MSG_NOSIGNAL | (i + 1 < segments.size() ? MSG_MORE : 0), 0);
+        sqe->user_data = i;
+    }
+
+    const auto submitted = io_uring_submit(&ring);
+    if (submitted < 0) {
+        io_uring_queue_exit(&ring);
+        return SendGather(segments, timeout);
+    }
+
+    // Wait for all completions (send + notification CQEs).
+    int remaining = static_cast<int>(segments.size());
+    while (remaining > 0) {
+        struct io_uring_cqe* cqe = nullptr;
+        struct __kernel_timespec ts{};
+        ts.tv_sec = timeout.count() / 1000;
+        ts.tv_nsec = (timeout.count() % 1000) * 1000000;
+        const auto ret = io_uring_wait_cqe_timeout(&ring, &cqe, &ts);
+        if (ret < 0) {
+            io_uring_queue_exit(&ring);
+            if (ret == -ETIME) {
+                return base::Status::IoError("io_uring send_zc timed out");
+            }
+            return base::Status::IoError("io_uring wait failed");
+        }
+        if (cqe->res < 0) {
+            const auto err = -cqe->res;
+            io_uring_cqe_seen(&ring, cqe);
+            io_uring_queue_exit(&ring);
+            return base::Status::IoError(
+                std::string("io_uring send_zc failed: ") + std::strerror(err));
+        }
+        // SEND_ZC produces a notification CQE (IORING_CQE_F_NOTIF) after the data CQE.
+        // Only count non-notification completions.
+        if (!(cqe->flags & IORING_CQE_F_NOTIF)) {
+            --remaining;
+        }
+        io_uring_cqe_seen(&ring, cqe);
+    }
+
+    io_uring_queue_exit(&ring);
+    return base::Status::Ok();
+}
+#else
+auto TcpConnection::SendZeroCopyGather(
+    std::span<const std::span<const std::byte>> segments,
+    std::chrono::milliseconds timeout) -> base::Status {
+    return SendGather(segments, timeout);
+}
+#endif
 
 auto TcpConnection::BusySend(std::span<const std::byte> bytes, std::chrono::milliseconds timeout) -> base::Status {
     std::size_t sent = 0;

@@ -474,6 +474,7 @@ auto MmapSessionStore::LoadOutboundRangeViews(
             .timestamp_ns = header->timestamp_ns,
             .flags = header->flags,
             .payload = std::span<const std::byte>(PayloadAt(*impl_, it->second), header->payload_size),
+            .body_start_offset = 0U,  // TODO: store body_start_offset in StoreRecordHeader when schema v2
         });
     }
 

@@ -17,7 +17,15 @@ struct EncodedFrameBytes {
     std::size_t inline_size{0U};
     std::vector<std::byte> overflow_storage;
 
+    // Scatter-gather replay support: when external_body is non-empty, the owned buffer
+    // contains [header | trailer] and external_body is spliced between them on the wire.
+    // Wire order: buf[0..body_splice_offset] + external_body + buf[body_splice_offset..end].
+    std::span<const std::byte> external_body;
+    std::size_t body_splice_offset{0U};
+
     auto assign(std::span<const std::byte> bytes) -> void {
+        external_body = {};
+        body_splice_offset = 0U;
         if (bytes.size() <= kEncodedFrameInlineCapacity) {
             inline_size = bytes.size();
             overflow_storage.clear();
@@ -37,7 +45,7 @@ struct EncodedFrameBytes {
     }
 
     [[nodiscard]] auto size() const -> std::size_t {
-        return overflow_storage.empty() ? inline_size : overflow_storage.size();
+        return (overflow_storage.empty() ? inline_size : overflow_storage.size()) + external_body.size();
     }
 
     [[nodiscard]] auto empty() const -> bool {

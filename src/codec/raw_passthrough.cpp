@@ -1,4 +1,5 @@
 #include "fastfix/codec/raw_passthrough.h"
+#include "fastfix/codec/fast_int_format.h"
 #include "fastfix/codec/simd_scan.h"
 
 #include <array>
@@ -111,81 +112,64 @@ auto DecodeRawPassThrough(
     const auto declared_body_length = ParseUint32(ValueView(data, f.value_offset, f.value_length));
     const auto body_start_offset = f.next_pos;
 
-    // Track offset of body region (after last session header field, before tag 10).
-    // We define body_begin as the position right after the last header field we've seen,
-    // and body_end as the start of tag 10.
-    std::size_t last_header_end = f.next_pos;
-    std::size_t checksum_field_start = 0;
-    bool saw_checksum = false;
+    // Locate the checksum field by scanning backwards from the end.
+    // FIX checksum is always the last field, formatted as 10=NNN<delim> (7 bytes).
+    if (data.size() < 7) {
+        return base::Status::FormatError("FIX frame too short for CheckSum");
+    }
+    if (static_cast<std::byte>('1') != data[data.size() - 7] ||
+        static_cast<std::byte>('0') != data[data.size() - 6] ||
+        static_cast<std::byte>('=') != data[data.size() - 5] ||
+        delim != data[data.size() - 1]) {
+        return base::Status::FormatError("FIX frame missing CheckSum (tag 10)");
+    }
+    const auto checksum_field_start = data.size() - 7;
 
+    if (verify_checksum) {
+        std::uint32_t actual_sum = 0;
+        for (std::size_t i = 0; i < checksum_field_start; ++i) {
+            actual_sum += std::to_integer<unsigned char>(data[i]);
+        }
+        actual_sum %= 256U;
+        const auto expected = ParseUint32(ValueView(data, data.size() - 4, 3));
+        if (actual_sum != expected) {
+            return base::Status::FormatError("CheckSum mismatch");
+        }
+    }
+
+    // Validate BodyLength: region between body_start_offset and checksum_field_start.
+    const auto actual_body_length = checksum_field_start - body_start_offset;
+    if (declared_body_length != actual_body_length) {
+        return base::Status::FormatError("BodyLength mismatch");
+    }
+
+    // Scan header fields until we hit the first non-header (application) tag.
+    // Header fields always precede body fields in a well-formed FIX message,
+    // so we can stop scanning once we see the first application-level tag.
+    std::size_t last_header_end = f.next_pos;
     std::size_t pos = f.next_pos;
-    while (pos < data.size()) {
+    while (pos < checksum_field_start) {
         f = ScanField(data, pos, delim);
         if (f.tag == 0 && f.next_pos == 0) {
             return base::Status::FormatError("malformed FIX field");
         }
-        const auto val = ValueView(data, f.value_offset, f.value_length);
 
-        if (f.tag == 10U) {
-            checksum_field_start = pos;
-            saw_checksum = true;
-
-            if (verify_checksum) {
-                std::uint32_t actual_sum = 0;
-                for (std::size_t i = 0; i < checksum_field_start; ++i) {
-                    actual_sum += std::to_integer<unsigned char>(data[i]);
-                }
-                actual_sum %= 256U;
-                const auto expected = ParseUint32(val);
-                if (actual_sum != expected) {
-                    return base::Status::FormatError("CheckSum mismatch");
-                }
-            }
-            pos = f.next_pos;
+        if (!IsSessionHeaderTag(f.tag)) {
+            // First non-header field: body starts here; stop scanning.
             break;
         }
 
+        const auto val = ValueView(data, f.value_offset, f.value_length);
         switch (f.tag) {
-            case 35U:
-                view.msg_type = val;
-                last_header_end = f.next_pos;
-                break;
-            case 34U:
-                view.msg_seq_num = ParseUint32(val);
-                last_header_end = f.next_pos;
-                break;
-            case 49U:
-                view.sender_comp_id = val;
-                last_header_end = f.next_pos;
-                break;
-            case 56U:
-                view.target_comp_id = val;
-                last_header_end = f.next_pos;
-                break;
-            case 52U:
-                view.sending_time = val;
-                last_header_end = f.next_pos;
-                break;
-            default:
-                if (IsSessionHeaderTag(f.tag)) {
-                    last_header_end = f.next_pos;
-                }
-                break;
+            case 35U: view.msg_type = val; break;
+            case 34U: view.msg_seq_num = ParseUint32(val); break;
+            case 49U: view.sender_comp_id = val; break;
+            case 56U: view.target_comp_id = val; break;
+            case 52U: view.sending_time = val; break;
+            default: break;
         }
+        last_header_end = f.next_pos;
         pos = f.next_pos;
-    }
-
-    if (!saw_checksum) {
-        return base::Status::FormatError("FIX frame missing CheckSum (tag 10)");
-    }
-    if (pos != data.size()) {
-        return base::Status::FormatError("FIX frame has trailing data after CheckSum");
-    }
-
-    // Validate BodyLength
-    const auto actual_body_length = checksum_field_start - body_start_offset;
-    if (declared_body_length != actual_body_length) {
-        return base::Status::FormatError("BodyLength mismatch");
     }
 
     // raw_body is everything between last_header_end and checksum_field_start.
@@ -245,13 +229,10 @@ auto EncodeForwarded(
 
     // 6. Write 34=<seq_num>SOH
     {
-        std::array<char, kIntBufSize<std::uint32_t>> buf{};
-        auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), options.msg_seq_num);
-        if (ec != std::errc()) {
-            return base::Status::FormatError("failed to format MsgSeqNum");
-        }
+        char buf[10];
+        const auto len = FormatUint32(buf, options.msg_seq_num);
         out.append("34=");
-        out.append(buf.data(), static_cast<std::size_t>(ptr - buf.data()));
+        out.append(buf, len);
         out.push_back(soh);
     }
 
@@ -296,16 +277,12 @@ auto EncodeForwarded(
     // 11. Fill in BodyLength
     const auto body_length = static_cast<std::uint32_t>(out.size() - body_start);
     {
-        std::array<char, kIntBufSize<std::uint32_t>> buf{};
-        auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), body_length);
-        if (ec != std::errc()) {
-            return base::Status::FormatError("failed to format BodyLength");
-        }
-        const auto digits = static_cast<std::size_t>(ptr - buf.data());
-        if (digits > kBodyLengthPlaceholderWidth) {
+        char buf[10];
+        const auto len = FormatUint32(buf, body_length);
+        if (len > kBodyLengthPlaceholderWidth) {
             return base::Status::FormatError("BodyLength exceeds placeholder width");
         }
-        out.replace(body_length_offset, kBodyLengthPlaceholderWidth, buf.data(), digits);
+        out.replace(body_length_offset, kBodyLengthPlaceholderWidth, buf, len);
     }
 
     // 12. Compute and append 10=<checksum>SOH
@@ -375,13 +352,10 @@ auto EncodeReplay(
 
     // 6. 34=<seq_num>SOH
     {
-        std::array<char, kIntBufSize<std::uint32_t>> buf{};
-        auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), options.msg_seq_num);
-        if (ec != std::errc()) {
-            return base::Status::FormatError("failed to format MsgSeqNum");
-        }
+        char buf[10];
+        const auto len = FormatUint32(buf, options.msg_seq_num);
         out.append("34=");
-        out.append(buf.data(), static_cast<std::size_t>(ptr - buf.data()));
+        out.append(buf, len);
         out.push_back(soh);
     }
 
@@ -417,16 +391,12 @@ auto EncodeReplay(
     // 12. Backfill BodyLength
     const auto body_length = static_cast<std::uint32_t>(out.size() - body_start);
     {
-        std::array<char, kIntBufSize<std::uint32_t>> buf{};
-        auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), body_length);
-        if (ec != std::errc()) {
-            return base::Status::FormatError("failed to format BodyLength");
-        }
-        const auto digits = static_cast<std::size_t>(ptr - buf.data());
-        if (digits > kBodyLengthPlaceholderWidth) {
+        char buf[10];
+        const auto len = FormatUint32(buf, body_length);
+        if (len > kBodyLengthPlaceholderWidth) {
             return base::Status::FormatError("BodyLength exceeds placeholder width");
         }
-        out.replace(body_length_offset, kBodyLengthPlaceholderWidth, buf.data(), digits);
+        out.replace(body_length_offset, kBodyLengthPlaceholderWidth, buf, len);
     }
 
     // 13. Compute and append 10=<checksum>SOH
@@ -447,31 +417,7 @@ auto EncodeReplay(
     return base::Status::Ok();
 }
 
-namespace {
-
-auto ComputeChecksumSIMD(const char* data, std::size_t len) -> std::uint32_t {
-    std::uint32_t sum = 0;
-#if FASTFIX_HAS_SSE2
-    const auto zero = _mm_setzero_si128();
-    std::size_t i = 0;
-    for (; i + 16 <= len; i += 16) {
-        auto chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
-        auto sad = _mm_sad_epu8(chunk, zero);
-        sum += static_cast<std::uint32_t>(_mm_extract_epi16(sad, 0)) +
-               static_cast<std::uint32_t>(_mm_extract_epi16(sad, 4));
-    }
-    for (; i < len; ++i) {
-        sum += static_cast<unsigned char>(data[i]);
-    }
-#else
-    for (std::size_t i = 0; i < len; ++i) {
-        sum += static_cast<unsigned char>(data[i]);
-    }
-#endif
-    return sum;
-}
-
-}  // namespace
+// ComputeChecksumSIMD is now in simd_scan.h (fastfix::codec namespace).
 
 auto EncodeReplayInto(
     const RawPassThroughView& stored,
@@ -486,11 +432,12 @@ auto EncodeReplayInto(
 
     const char soh = options.delimiter == '\0' ? kFixSoh : options.delimiter;
 
-    // Estimate total size: header (~120 bytes max) + raw_body + checksum (7 bytes)
+    // Estimate buffer size: header + trailer, plus body if not zero-copy
     const auto estimated_size = 128U + options.sender_comp_id.size() +
         options.target_comp_id.size() + options.begin_string.size() +
         options.default_appl_ver_id.size() + options.sending_time.size() +
-        options.orig_sending_time.size() + stored.raw_body.size() + stored.msg_type.size();
+        options.orig_sending_time.size() + stored.msg_type.size() +
+        (options.zero_copy_body ? 0U : stored.raw_body.size());
 
     // Choose storage: inline or overflow
     char* buf;
@@ -503,18 +450,21 @@ auto EncodeReplayInto(
         buf = reinterpret_cast<char*>(out->overflow_storage.data());
     }
 
-    // Use a simple append helper
+    // Incremental checksum — accumulate as we write each byte of the header.
+    // FIX checksum = sum of ALL bytes before the 10= field (including 8=, 9=).
+    std::uint32_t header_checksum = 0;
     std::size_t pos = 0;
+
     auto append_sv = [&](std::string_view sv) {
         std::memcpy(buf + pos, sv.data(), sv.size());
+        for (std::size_t i = 0; i < sv.size(); ++i) {
+            header_checksum += static_cast<unsigned char>(sv[i]);
+        }
         pos += sv.size();
     };
     auto append_char = [&](char ch) {
         buf[pos++] = ch;
-    };
-    auto append_bytes = [&](const std::byte* data, std::size_t len) {
-        std::memcpy(buf + pos, data, len);
-        pos += len;
+        header_checksum += static_cast<unsigned char>(ch);
     };
 
     // 1. 8=<begin_string>SOH
@@ -524,10 +474,12 @@ auto EncodeReplayInto(
     append_sv(begin_string);
     append_char(soh);
 
-    // 2. 9=<placeholder>SOH  (use kBodyLengthPlaceholderWidth=7 to match EncodeReplay)
+    // 2. 9=<placeholder>SOH — write "9=" tracked, then placeholder untracked (will adjust later)
     append_sv("9=");
     const auto body_length_offset = pos;
-    append_sv("0000000");
+    // Write placeholder without tracking — we'll add the real digits' sum after backfill
+    std::memcpy(buf + pos, "0000000", 7);
+    pos += 7;
     append_char(soh);
     const auto body_start = pos;
 
@@ -548,13 +500,10 @@ auto EncodeReplayInto(
 
     // 6. 34=<seq_num>SOH
     {
-        std::array<char, kIntBufSize<std::uint32_t>> num_buf{};
-        auto [ptr, ec] = std::to_chars(num_buf.data(), num_buf.data() + num_buf.size(), options.msg_seq_num);
-        if (ec != std::errc()) {
-            return base::Status::FormatError("failed to format MsgSeqNum");
-        }
+        char num_buf[10];
+        const auto num_len = FormatUint32(num_buf, options.msg_seq_num);
         append_sv("34=");
-        append_sv(std::string_view(num_buf.data(), static_cast<std::size_t>(ptr - num_buf.data())));
+        append_sv(std::string_view(num_buf, num_len));
         append_char(soh);
     }
 
@@ -581,36 +530,50 @@ auto EncodeReplayInto(
         append_char(soh);
     }
 
-    // 11. Splice raw body bytes unchanged
-    if (!stored.raw_body.empty()) {
-        append_bytes(stored.raw_body.data(), stored.raw_body.size());
+    // 11. Body handling: zero-copy scatter-gather or inline copy
+    std::uint32_t body_checksum = 0;
+    const auto body_data_size = stored.raw_body.size();
+    if (body_data_size > 0) {
+        body_checksum = ComputeChecksumSIMD(
+            reinterpret_cast<const char*>(stored.raw_body.data()),
+            body_data_size);
     }
 
-    // 12. Backfill BodyLength
-    const auto body_length = static_cast<std::uint32_t>(pos - body_start);
+    std::size_t splice_offset = 0;
+    if (options.zero_copy_body) {
+        // Zero-copy path: body stays at its source address (e.g., mmap).
+        // Record splice point; trailer written next in buf.
+        splice_offset = pos;
+    } else {
+        // Inline path: copy body into buf.
+        if (body_data_size > 0) {
+            std::memcpy(buf + pos, stored.raw_body.data(), body_data_size);
+            pos += body_data_size;
+        }
+    }
+
+    // 12. Backfill BodyLength with zero-padded 7-digit format and add its digit sum.
+    const auto body_length = options.zero_copy_body
+        ? static_cast<std::uint32_t>(pos - body_start + body_data_size)
+        : static_cast<std::uint32_t>(pos - body_start);
     {
-        std::array<char, kIntBufSize<std::uint32_t>> num_buf{};
-        auto [ptr, ec] = std::to_chars(num_buf.data(), num_buf.data() + num_buf.size(), body_length);
-        if (ec != std::errc()) {
-            return base::Status::FormatError("failed to format BodyLength");
+        char bl_buf[7];
+        bl_buf[0] = '0' + static_cast<char>((body_length / 1000000U) % 10U);
+        bl_buf[1] = '0' + static_cast<char>((body_length / 100000U) % 10U);
+        bl_buf[2] = '0' + static_cast<char>((body_length / 10000U) % 10U);
+        bl_buf[3] = '0' + static_cast<char>((body_length / 1000U) % 10U);
+        bl_buf[4] = '0' + static_cast<char>((body_length / 100U) % 10U);
+        bl_buf[5] = '0' + static_cast<char>((body_length / 10U) % 10U);
+        bl_buf[6] = '0' + static_cast<char>(body_length % 10U);
+        std::memcpy(buf + body_length_offset, bl_buf, 7);
+        // Add the actual digit bytes to the checksum (placeholder was not tracked)
+        for (int i = 0; i < 7; ++i) {
+            header_checksum += static_cast<unsigned char>(bl_buf[i]);
         }
-        const auto digits = static_cast<std::size_t>(ptr - num_buf.data());
-        if (digits > kBodyLengthPlaceholderWidth) {
-            return base::Status::FormatError("BodyLength exceeds placeholder width");
-        }
-        // Shift body content if digits < placeholder width
-        if (digits < kBodyLengthPlaceholderWidth) {
-            const auto shift = kBodyLengthPlaceholderWidth - digits;
-            std::memmove(buf + body_length_offset + digits,
-                         buf + body_length_offset + kBodyLengthPlaceholderWidth,
-                         pos - (body_length_offset + kBodyLengthPlaceholderWidth));
-            pos -= shift;
-        }
-        std::memcpy(buf + body_length_offset, num_buf.data(), digits);
     }
 
-    // 13. Compute and append 10=<checksum>SOH using SIMD-accelerated path
-    std::uint32_t checksum = ComputeChecksumSIMD(buf, pos) % 256U;
+    // 13. Combine: header (incremental) + body (SIMD), no full-buffer rescan
+    std::uint32_t checksum = (header_checksum + body_checksum) % 256U;
 
     buf[pos++] = '1';
     buf[pos++] = '0';
@@ -620,11 +583,19 @@ auto EncodeReplayInto(
     buf[pos++] = static_cast<char>('0' + (checksum % 10U));
     buf[pos++] = soh;
 
-    // Finalize size
+    // Finalize
     if (estimated_size <= session::kEncodedFrameInlineCapacity) {
         out->inline_size = pos;
     } else {
         out->overflow_storage.resize(pos);
+    }
+
+    if (options.zero_copy_body && body_data_size > 0) {
+        out->external_body = stored.raw_body;
+        out->body_splice_offset = splice_offset;
+    } else {
+        out->external_body = {};
+        out->body_splice_offset = 0;
     }
 
     return base::Status::Ok();

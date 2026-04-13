@@ -16,6 +16,7 @@ class MemorySessionStore : public SessionStore {
         std::uint16_t flags{0};
         std::size_t payload_offset{0};
         std::size_t payload_size{0};
+        std::uint32_t body_start_offset{0};
     };
 
     auto SaveOutbound(const MessageRecord& record) -> base::Status override;

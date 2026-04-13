@@ -94,4 +94,33 @@ inline auto FindEitherByte(const std::byte* data, std::size_t len, std::byte a, 
 #endif
 }
 
+/// SIMD-accelerated byte-sum checksum used by FIX encode and decode paths.
+/// Returns the raw sum (caller applies % 256 as needed).
+inline auto ComputeChecksumSIMD(const char* data, std::size_t len) -> std::uint32_t {
+    std::uint32_t sum = 0;
+#if FASTFIX_HAS_SSE2
+    const auto zero = _mm_setzero_si128();
+    std::size_t i = 0;
+    for (; i + 16 <= len; i += 16) {
+        auto chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
+        auto sad = _mm_sad_epu8(chunk, zero);
+        sum += static_cast<std::uint32_t>(_mm_extract_epi16(sad, 0)) +
+               static_cast<std::uint32_t>(_mm_extract_epi16(sad, 4));
+    }
+    for (; i < len; ++i) {
+        sum += static_cast<unsigned char>(data[i]);
+    }
+#else
+    for (std::size_t i = 0; i < len; ++i) {
+        sum += static_cast<unsigned char>(data[i]);
+    }
+#endif
+    return sum;
+}
+
+/// Overload for std::byte pointers.
+inline auto ComputeChecksumSIMD(const std::byte* data, std::size_t len) -> std::uint32_t {
+    return ComputeChecksumSIMD(reinterpret_cast<const char*>(data), len);
+}
+
 }  // namespace fastfix::codec

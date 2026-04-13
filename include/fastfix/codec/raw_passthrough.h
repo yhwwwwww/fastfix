@@ -59,6 +59,10 @@ struct ReplayOptions {
 
     // Delimiter (default SOH)
     char delimiter{kFixSoh};
+
+    // When true, body bytes are referenced via external_body (zero-copy scatter-gather).
+    // The caller must ensure the body memory outlives the send. Suitable for mmap-backed stores.
+    bool zero_copy_body{false};
 };
 
 auto DecodeRawPassThrough(

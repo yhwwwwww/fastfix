@@ -174,6 +174,7 @@ auto RunEncodeBenchmark(
     BenchmarkMeasurement measurement;
     fastfix::codec::EncodeBuffer encode_buffer;
     fastfix::generated::profile_4400::NewOrderSingleWriter writer(layout.value());
+    writer.bind_session(base_options.begin_string, base_options.sender_comp_id, base_options.target_comp_id);
     auto options = base_options;
     for (std::uint32_t index = 0; index < iterations; ++index) {
         const auto sample_started = std::chrono::steady_clock::now();
@@ -1005,24 +1006,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::vector<LabeledResult> results;
-    results.push_back({"encode", std::move(encode_result).value()});
-
-    BenchmarkResult peek_result;
-    peek_result.samples_ns.reserve(iterations);
-    BenchmarkMeasurement peek_measurement;
-    for (std::uint32_t index = 0; index < iterations; ++index) {
-        const auto sample_started = std::chrono::steady_clock::now();
-        auto header = fastfix::codec::PeekSessionHeaderView(warmup.value());
-        if (!header.ok()) {
-            std::cerr << header.status().message() << '\n';
-            return 1;
-        }
-        peek_result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
-    }
-    peek_measurement.Finish(peek_result);
-    results.push_back({"peek", std::move(peek_result)});
-
     auto compiled_decoders = fastfix::codec::CompiledDecoderTable::Build(dictionary.value());
 
     BenchmarkResult parse_result;
@@ -1042,7 +1025,6 @@ int main(int argc, char** argv) {
     }
     parse_measurement.Finish(parse_result);
     static_cast<void>(parse_sink);
-    results.push_back({"parse", std::move(parse_result)});
 
     auto session_benchmark =
         RunSessionBenchmark(dictionary.value(), iterations, begin_string, default_appl_ver_id);
@@ -1050,6 +1032,11 @@ int main(int argc, char** argv) {
         std::cerr << session_benchmark.status().message() << '\n';
         return 1;
     }
+
+    // --- Shared benchmarks (aligned with QuickFIX compare order) ---
+    std::vector<LabeledResult> results;
+    results.push_back({"encode", std::move(encode_result).value()});
+    results.push_back({"parse", std::move(parse_result)});
     results.push_back({"session-inbound", std::move(session_benchmark).value()});
 
     if (replay_iterations > 0U) {
@@ -1078,6 +1065,22 @@ int main(int argc, char** argv) {
     } else {
         std::cout << "loopback skipped: --loopback 0\n";
     }
+
+    // --- FastFix-only benchmarks ---
+    BenchmarkResult peek_result;
+    peek_result.samples_ns.reserve(iterations);
+    BenchmarkMeasurement peek_measurement;
+    for (std::uint32_t index = 0; index < iterations; ++index) {
+        const auto sample_started = std::chrono::steady_clock::now();
+        auto header = fastfix::codec::PeekSessionHeaderView(warmup.value());
+        if (!header.ok()) {
+            std::cerr << header.status().message() << '\n';
+            return 1;
+        }
+        peek_result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
+    }
+    peek_measurement.Finish(peek_result);
+    results.push_back({"peek", std::move(peek_result)});
 
     bench_support::PrintResultTable(results);
     return 0;

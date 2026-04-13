@@ -508,25 +508,45 @@ auto LiveSessionWorker::SendFramesBatch(
     const session::ProtocolFrameList& frames,
     std::uint64_t timestamp_ns) -> base::Status {
     if (frames.size() <= 1U) {
-        return SendFrames(connection, frames, timestamp_ns);
-    }
-
-    // Build segment array for writev
-    std::vector<std::span<const std::byte>> segments;
-    segments.reserve(frames.size());
-    for (const auto& frame : frames) {
-        auto view = frame.bytes.view();
-        if (!view.empty()) {
-            segments.push_back(view);
+        if (frames.empty() || frames[0].bytes.external_body.empty()) {
+            return SendFrames(connection, frames, timestamp_ns);
         }
     }
 
-    auto status = connection.connection.SendGather(segments, options_.io_timeout);
+    std::vector<std::span<const std::byte>> segments;
+    segments.reserve(frames.size() * 3U);
+    for (const auto& frame : frames) {
+        auto full = frame.bytes.view();
+        if (full.empty()) {
+            continue;
+        }
+        if (!frame.bytes.external_body.empty()) {
+            const auto splice = frame.bytes.body_splice_offset;
+            segments.push_back(full.subspan(0, splice));
+            segments.push_back(frame.bytes.external_body);
+            if (splice < full.size()) {
+                segments.push_back(full.subspan(splice));
+            }
+        } else {
+            segments.push_back(full);
+        }
+    }
+
+    bool has_external = false;
+    for (const auto& frame : frames) {
+        if (!frame.bytes.external_body.empty()) {
+            has_external = true;
+            break;
+        }
+    }
+
+    auto status = has_external
+        ? connection.connection.SendZeroCopyGather(segments, options_.io_timeout)
+        : connection.connection.SendGather(segments, options_.io_timeout);
     if (!status.ok()) {
         return status;
     }
 
-    // Record metrics for all frames
     for (const auto& frame : frames) {
         RecordOutboundMetrics(*connection.session, frame);
     }
