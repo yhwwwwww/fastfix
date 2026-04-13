@@ -252,6 +252,24 @@ inline auto ParseTagInline(const char* data, std::size_t len) -> std::uint32_t {
     }
 }
 
+inline constexpr std::size_t kScanNextFieldShortValueBytes = 16U;
+
+auto PrepareDecodeOutput(
+    DecodedMessageView* output,
+    std::span<const std::byte> bytes) -> base::Result<message::ParsedMessageData*> {
+    if (output == nullptr) {
+        return base::Status::InvalidArgument("decoded output is null");
+    }
+
+    auto& parsed_message = output->message.mutable_data();
+    parsed_message.ResetForNewDecode();
+    parsed_message.raw = bytes;
+    output->header = {};
+    output->raw = bytes;
+    output->validation_issue = {};
+    return &parsed_message;
+}
+
 auto ScanNextField(
     std::span<const std::byte> bytes,
     std::size_t field_start,
@@ -282,7 +300,15 @@ auto ScanNextField(
     const auto equals = eq_offset;  // offset of '=' relative to field_start
     const auto after_eq = field_start + equals + 1U;
     const auto remaining_after_eq = bytes.size() - after_eq;
-    const auto* soh_ptr = FindByte(bytes.data() + after_eq, remaining_after_eq, delimiter_byte);
+    const auto short_scan_len = std::min(remaining_after_eq, kScanNextFieldShortValueBytes);
+    const auto* value_start = bytes.data() + after_eq;
+    auto* soh_ptr = const_cast<std::byte*>(FindByteShortScalar(value_start, short_scan_len, delimiter_byte));
+    if (soh_ptr == value_start + short_scan_len) {
+        soh_ptr = const_cast<std::byte*>(FindByte(
+            value_start + short_scan_len,
+            remaining_after_eq - short_scan_len,
+            delimiter_byte));
+    }
     const auto soh_index = static_cast<std::size_t>(soh_ptr - bytes.data());
     if (soh_index >= bytes.size()) {
         return base::Status::FormatError("FIX frame is missing its final delimiter");
@@ -541,7 +567,6 @@ auto AppendParsedFieldSlotFast(
     message::ParsedMessageData* parsed,
     message::ParsedFieldSlot slot) -> bool {
     const auto tag = slot.tag;
-    bool is_dup = false;
 
     // Inline dup check for tags < 1024 (direct-address table).
     if (tag < message::kFieldHashTableSize) {
@@ -1868,7 +1893,14 @@ auto EncodeFixMessage(
 auto DecodeFixMessageView(
     std::span<const std::byte> bytes,
     const profile::NormalizedDictionaryView& dictionary,
-    char delimiter) -> base::Result<DecodedMessageView> {
+    DecodedMessageView* output,
+    char delimiter) -> base::Status {
+    auto prepared = PrepareDecodeOutput(output, bytes);
+    if (!prepared.ok()) {
+        return prepared.status();
+    }
+    auto* parsed_message = prepared.value();
+
     const char normalized_delimiter = NormalizeDelimiter(delimiter);
     const auto delimiter_byte = static_cast<std::byte>(static_cast<unsigned char>(normalized_delimiter));
     const auto equals_byte = static_cast<std::byte>('=');
@@ -1902,8 +1934,6 @@ auto DecodeFixMessageView(
 
     const auto body_start_offset = field1.value().next_pos;
 
-    message::ParsedMessageData parsed_message;
-    parsed_message.raw = bytes;
     SessionHeaderView header;
     ValidationIssue validation_issue;
     header.begin_string = std::string_view(
@@ -1951,7 +1981,7 @@ auto DecodeFixMessageView(
         }
 
         if (tag == 35U) {
-            parsed_message.msg_type = value_sv;
+            parsed_message->msg_type = value_sv;
             header.msg_type = value_sv;
             cached_message_def = dictionary.find_message(header.msg_type);
             cached_rules = cached_message_def != nullptr
@@ -1972,7 +2002,7 @@ auto DecodeFixMessageView(
                 static_cast<std::uint32_t>(scanned.value().value_offset),
                 scanned.value().value_length,
                 dictionary);
-            AppendParsedFieldSlot(&parsed_message, RootContainer(), slot);
+            AppendParsedFieldSlot(parsed_message, RootContainer(), slot);
             byte_pos = scanned.value().next_pos;
             continue;
         }
@@ -2025,7 +2055,7 @@ auto DecodeFixMessageView(
                 static_cast<std::uint32_t>(scanned.value().value_offset),
                 scanned.value().value_length,
                 ResolveFieldTypeWithDef(tag, field_def));
-            AppendParsedFieldSlot(&parsed_message, RootContainer(), slot);
+            AppendParsedFieldSlot(parsed_message, RootContainer(), slot);
             auto next_pos = ParseParsedGroupEntries(
                 dictionary,
                 bytes,
@@ -2034,7 +2064,7 @@ auto DecodeFixMessageView(
                 equals_byte,
                 value_sv,
                 *group_def,
-                &parsed_message,
+                parsed_message,
                 RootContainer(),
                 1U,
                 &validation_issue);
@@ -2050,7 +2080,7 @@ auto DecodeFixMessageView(
             static_cast<std::uint32_t>(scanned.value().value_offset),
             scanned.value().value_length,
             ResolveFieldTypeWithDef(tag, field_def));
-        AppendParsedFieldSlot(&parsed_message, RootContainer(), slot);
+        AppendParsedFieldSlot(parsed_message, RootContainer(), slot);
         byte_pos = scanned.value().next_pos;
     }
 
@@ -2095,11 +2125,21 @@ auto DecodeFixMessageView(
         return base::Status::FormatError("CheckSum mismatch");
     }
 
+    output->header = std::move(header);
+    output->raw = bytes;
+    output->validation_issue = std::move(validation_issue);
+    return base::Status::Ok();
+}
+
+auto DecodeFixMessageView(
+    std::span<const std::byte> bytes,
+    const profile::NormalizedDictionaryView& dictionary,
+    char delimiter) -> base::Result<DecodedMessageView> {
     DecodedMessageView decoded;
-    decoded.message = message::ParsedMessage(std::move(parsed_message));
-    decoded.header = std::move(header);
-    decoded.raw = bytes;
-    decoded.validation_issue = std::move(validation_issue);
+    auto status = DecodeFixMessageView(bytes, dictionary, &decoded, delimiter);
+    if (!status.ok()) {
+        return status;
+    }
     return decoded;
 }
 
@@ -2107,7 +2147,14 @@ auto DecodeFixMessageView(
     std::span<const std::byte> bytes,
     const profile::NormalizedDictionaryView& dictionary,
     const CompiledDecoderTable& compiled_decoders,
-    char delimiter) -> base::Result<DecodedMessageView> {
+    DecodedMessageView* output,
+    char delimiter) -> base::Status {
+    auto prepared = PrepareDecodeOutput(output, bytes);
+    if (!prepared.ok()) {
+        return prepared.status();
+    }
+    auto* parsed_message = prepared.value();
+
     const char normalized_delimiter = NormalizeDelimiter(delimiter);
     const auto delimiter_byte = static_cast<std::byte>(static_cast<unsigned char>(normalized_delimiter));
     const auto equals_byte = static_cast<std::byte>('=');
@@ -2141,8 +2188,6 @@ auto DecodeFixMessageView(
 
     const auto body_start_offset = field1.value().next_pos;
 
-    message::ParsedMessageData parsed_message;
-    parsed_message.raw = bytes;
     SessionHeaderView header;
     ValidationIssue validation_issue;
     header.begin_string = std::string_view(
@@ -2187,7 +2232,7 @@ auto DecodeFixMessageView(
         }
 
         if (tag == 35U) {
-            parsed_message.msg_type = value_sv;
+            parsed_message->msg_type = value_sv;
             header.msg_type = value_sv;
             compiled = compiled_decoders.find(header.msg_type);
             // Fall back to generic path if the compiled decoder could not
@@ -2200,7 +2245,7 @@ auto DecodeFixMessageView(
                 static_cast<std::uint32_t>(scanned.value().value_offset),
                 scanned.value().value_length,
                 message::kFieldString);
-            AppendParsedFieldSlot(&parsed_message, RootContainer(), slot);
+            AppendParsedFieldSlot(parsed_message, RootContainer(), slot);
             byte_pos = scanned.value().next_pos;
             continue;
         }
@@ -2239,7 +2284,7 @@ auto DecodeFixMessageView(
                     static_cast<std::uint32_t>(scanned.value().value_offset),
                     scanned.value().value_length,
                     ResolveFieldTypeWithDef(tag, nullptr));
-                if (AppendParsedFieldSlot(&parsed_message, RootContainer(), slot)) {
+                if (AppendParsedFieldSlot(parsed_message, RootContainer(), slot)) {
                     SetValidationIssue(
                         &validation_issue,
                         ValidationIssueKind::kDuplicateField,
@@ -2268,7 +2313,7 @@ auto DecodeFixMessageView(
                     static_cast<std::uint32_t>(scanned.value().value_offset),
                     scanned.value().value_length,
                     message::kFieldString);
-                AppendParsedFieldSlotFast(&parsed_message, slot);
+                AppendParsedFieldSlotFast(parsed_message, slot);
                 byte_pos = scanned.value().next_pos;
                 continue;
             }
@@ -2282,7 +2327,7 @@ auto DecodeFixMessageView(
                     static_cast<std::uint32_t>(scanned.value().value_offset),
                     scanned.value().value_length,
                     compiled_slot.field_type);
-                if (AppendParsedFieldSlotFast(&parsed_message, slot)) {
+                if (AppendParsedFieldSlotFast(parsed_message, slot)) {
                     SetValidationIssue(
                         &validation_issue,
                         ValidationIssueKind::kDuplicateField,
@@ -2297,7 +2342,7 @@ auto DecodeFixMessageView(
                     equals_byte,
                     value_sv,
                     *compiled_slot.group_def,
-                    &parsed_message,
+                    parsed_message,
                     RootContainer(),
                     1U,
                     &validation_issue);
@@ -2314,7 +2359,7 @@ auto DecodeFixMessageView(
                 static_cast<std::uint32_t>(scanned.value().value_offset),
                 scanned.value().value_length,
                 compiled_slot.field_type);
-            if (AppendParsedFieldSlotFast(&parsed_message, slot)) {
+            if (AppendParsedFieldSlotFast(parsed_message, slot)) {
                 SetValidationIssue(
                     &validation_issue,
                     ValidationIssueKind::kDuplicateField,
@@ -2331,7 +2376,7 @@ auto DecodeFixMessageView(
             static_cast<std::uint32_t>(scanned.value().value_offset),
             scanned.value().value_length,
             message::kFieldString);
-        AppendParsedFieldSlot(&parsed_message, RootContainer(), slot);
+        AppendParsedFieldSlot(parsed_message, RootContainer(), slot);
         byte_pos = scanned.value().next_pos;
     }
 
@@ -2376,11 +2421,22 @@ auto DecodeFixMessageView(
         return base::Status::FormatError("CheckSum mismatch");
     }
 
+    output->header = std::move(header);
+    output->raw = bytes;
+    output->validation_issue = std::move(validation_issue);
+    return base::Status::Ok();
+}
+
+auto DecodeFixMessageView(
+    std::span<const std::byte> bytes,
+    const profile::NormalizedDictionaryView& dictionary,
+    const CompiledDecoderTable& compiled_decoders,
+    char delimiter) -> base::Result<DecodedMessageView> {
     DecodedMessageView decoded;
-    decoded.message = message::ParsedMessage(std::move(parsed_message));
-    decoded.header = std::move(header);
-    decoded.raw = bytes;
-    decoded.validation_issue = std::move(validation_issue);
+    auto status = DecodeFixMessageView(bytes, dictionary, compiled_decoders, &decoded, delimiter);
+    if (!status.ok()) {
+        return status;
+    }
     return decoded;
 }
 

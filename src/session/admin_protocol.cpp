@@ -884,19 +884,20 @@ auto AdminProtocol::OnTransportClosed() -> base::Status {
 }
 
 auto AdminProtocol::OnInbound(std::span<const std::byte> frame, std::uint64_t timestamp_ns) -> base::Result<ProtocolEvent> {
-    auto decoded = codec::DecodeFixMessageView(frame, dictionary_, decode_table_);
-    if (!decoded.ok()) {
-        return decoded.status();
+    auto decode_status = codec::DecodeFixMessageView(frame, dictionary_, decode_table_, &inbound_decode_scratch_);
+    if (!decode_status.ok()) {
+        return decode_status;
     }
-    auto event = OnInbound(decoded.value(), timestamp_ns);
+    auto event = OnInbound(inbound_decode_scratch_, timestamp_ns);
     if (!event.ok()) {
         return event.status();
     }
     if (event.value().application_messages.size() == 1U) {
         auto& message = event.value().application_messages.front();
         if (message.valid() && !message.owns_message()) {
-            auto& decoded_value = decoded.value();
-            event.value().AdoptParsedApplicationMessage(std::move(decoded_value.message), decoded_value.raw);
+            event.value().AdoptParsedApplicationMessage(
+                std::move(inbound_decode_scratch_.message),
+                inbound_decode_scratch_.raw);
         }
     } else {
         event.value().MaterializeApplicationMessages();
@@ -905,19 +906,24 @@ auto AdminProtocol::OnInbound(std::span<const std::byte> frame, std::uint64_t ti
 }
 
 auto AdminProtocol::OnInbound(std::vector<std::byte>&& frame, std::uint64_t timestamp_ns) -> base::Result<ProtocolEvent> {
-    auto decoded = codec::DecodeFixMessageView(std::span<const std::byte>(frame.data(), frame.size()), dictionary_, decode_table_);
-    if (!decoded.ok()) {
-        return decoded.status();
+    auto decode_status = codec::DecodeFixMessageView(
+        std::span<const std::byte>(frame.data(), frame.size()),
+        dictionary_,
+        decode_table_,
+        &inbound_decode_scratch_);
+    if (!decode_status.ok()) {
+        return decode_status;
     }
-    auto event = OnInbound(decoded.value(), timestamp_ns);
+    auto event = OnInbound(inbound_decode_scratch_, timestamp_ns);
     if (!event.ok()) {
         return event.status();
     }
     if (event.value().application_messages.size() == 1U) {
         auto& message = event.value().application_messages.front();
         if (message.valid() && !message.owns_message()) {
-            auto& decoded_value = decoded.value();
-            event.value().AdoptParsedApplicationMessage(std::move(decoded_value.message), std::move(frame));
+            event.value().AdoptParsedApplicationMessage(
+                std::move(inbound_decode_scratch_.message),
+                std::move(frame));
         }
     } else {
         event.value().MaterializeApplicationMessages();

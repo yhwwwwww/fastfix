@@ -279,9 +279,22 @@ auto DecodeFixMessage(
 auto DecodeFixMessageView(
     std::span<const std::byte> bytes,
     const profile::NormalizedDictionaryView& dictionary,
+    DecodedMessageView* output,
+    char delimiter = kFixSoh) -> base::Status;
+
+auto DecodeFixMessageView(
+    std::span<const std::byte> bytes,
+    const profile::NormalizedDictionaryView& dictionary,
     char delimiter = kFixSoh) -> base::Result<DecodedMessageView>;
 
 class CompiledDecoderTable;
+
+auto DecodeFixMessageView(
+    std::span<const std::byte> bytes,
+    const profile::NormalizedDictionaryView& dictionary,
+    const CompiledDecoderTable& compiled_decoders,
+    DecodedMessageView* output,
+    char delimiter = kFixSoh) -> base::Status;
 
 auto DecodeFixMessageView(
     std::span<const std::byte> bytes,

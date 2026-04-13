@@ -112,6 +112,42 @@ TEST_CASE("fix-codec", "[fix-codec]") {
     REQUIRE((*raw_parties)[0].field_at(0U).value().value == "PARTY-1");
     REQUIRE(!message.view().raw_group(453U).has_value());
 
+    fastfix::codec::DecodedMessageView reusable_decoded;
+    auto reusable_status = fastfix::codec::DecodeFixMessageView(
+        encoded.value(),
+        dictionary.value(),
+        &reusable_decoded);
+    REQUIRE(reusable_status.ok());
+    REQUIRE(reusable_decoded.header.msg_type == "D");
+    REQUIRE(reusable_decoded.message.view().group(453U).has_value());
+
+    fastfix::message::MessageBuilder cancel_builder("F");
+    cancel_builder.set_string(35U, "F")
+        .set_string(49U, "BUY")
+        .set_string(56U, "SELL")
+        .set_string(11U, "ORD-2")
+        .set_string(41U, "ORD-1")
+        .set_string(55U, "MSFT");
+    options.msg_seq_num = 2U;
+    options.sending_time = "20260402-12:00:00.001";
+    auto cancel_encoded = fastfix::codec::EncodeFixMessage(
+        std::move(cancel_builder).build(),
+        dictionary.value(),
+        options);
+    REQUIRE(cancel_encoded.ok());
+
+    reusable_status = fastfix::codec::DecodeFixMessageView(
+        cancel_encoded.value(),
+        dictionary.value(),
+        &reusable_decoded);
+    REQUIRE(reusable_status.ok());
+    REQUIRE(reusable_decoded.header.msg_type == "F");
+    REQUIRE(reusable_decoded.header.msg_seq_num == 2U);
+    REQUIRE(reusable_decoded.message.view().msg_type() == "F");
+    REQUIRE(reusable_decoded.message.view().get_string(41U).value() == "ORD-1");
+    REQUIRE(!reusable_decoded.message.view().group(453U).has_value());
+    REQUIRE(reusable_decoded.raw.size() == cancel_encoded.value().size());
+
     fastfix::message::MessageRef parsed_owned_ref;
     {
         auto decoded_for_ref = fastfix::codec::DecodeFixMessageView(encoded.value(), dictionary.value());

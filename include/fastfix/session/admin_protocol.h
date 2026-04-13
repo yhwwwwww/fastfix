@@ -581,6 +581,7 @@ class AdminProtocol {
     std::optional<base::Status> initialization_error_;
     codec::PrecompiledTemplateTable encode_templates_;
     codec::CompiledDecoderTable decode_table_;
+    codec::DecodedMessageView inbound_decode_scratch_;
     codec::EncodeBuffer encode_buffer_;
     store::MessageRecordViewRange replay_range_buffer_;
     std::array<std::shared_ptr<ProtocolFrameList>, kReplayFrameBufferPoolSize> replay_frame_buffers_{};

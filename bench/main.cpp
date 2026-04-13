@@ -1012,14 +1012,19 @@ int main(int argc, char** argv) {
     parse_result.samples_ns.reserve(iterations);
     BenchmarkMeasurement parse_measurement;
     double parse_sink = 0.0;
+    fastfix::codec::DecodedMessageView parse_decoded;
     for (std::uint32_t index = 0; index < iterations; ++index) {
         const auto sample_started = std::chrono::steady_clock::now();
-        auto decoded = fastfix::codec::DecodeFixMessageView(warmup.value(), dictionary.value(), compiled_decoders);
-        if (!decoded.ok()) {
-            std::cerr << decoded.status().message() << '\n';
+        auto decode_status = fastfix::codec::DecodeFixMessageView(
+            warmup.value(),
+            dictionary.value(),
+            compiled_decoders,
+            &parse_decoded);
+        if (!decode_status.ok()) {
+            std::cerr << decode_status.message() << '\n';
             return 1;
         }
-        const auto extracted = ExtractOrderFromMessageView(decoded.value().message.view());
+        const auto extracted = ExtractOrderFromMessageView(parse_decoded.message.view());
         parse_result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
         parse_sink += extracted.order_qty;
     }
