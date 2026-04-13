@@ -925,11 +925,37 @@ auto EncodeMessageBody(
     const message::MessageData& data,
     char delimiter,
     bool skip_standard_header) -> void;
+auto EncodeMessageBody(
+    std::string& out,
+    const message::MessageData& data,
+    const profile::NormalizedDictionaryView& dictionary,
+    std::span<const profile::FieldRuleRecord> rules,
+    char delimiter,
+    bool skip_standard_header) -> void;
 
 auto EncodeGroupData(std::string& out, const message::GroupData& group, char delimiter) -> void {
     AppendField(out, group.count_tag, static_cast<std::int64_t>(group.entries.size()), delimiter);
     for (const auto& entry : group.entries) {
         EncodeMessageBody(out, entry, delimiter, false);
+    }
+}
+
+auto EncodeGroupData(
+    std::string& out,
+    const message::GroupData& group,
+    const profile::NormalizedDictionaryView& dictionary,
+    char delimiter) -> void {
+    AppendField(out, group.count_tag, static_cast<std::int64_t>(group.entries.size()), delimiter);
+    const auto* group_def = dictionary.find_group(group.count_tag);
+    if (group_def != nullptr) {
+        auto group_rules = dictionary.group_field_rules(*group_def);
+        for (const auto& entry : group.entries) {
+            EncodeMessageBody(out, entry, dictionary, group_rules, delimiter, false);
+        }
+    } else {
+        for (const auto& entry : group.entries) {
+            EncodeMessageBody(out, entry, delimiter, false);
+        }
     }
 }
 
@@ -947,6 +973,13 @@ auto EncodeGroupData(std::string& out, message::GroupView group, char delimiter)
 auto EncodeMessageBody(
     std::string& out,
     message::MessageView view,
+    char delimiter,
+    bool skip_standard_header) -> void;
+auto EncodeMessageBody(
+    std::string& out,
+    message::MessageView view,
+    const profile::NormalizedDictionaryView& dictionary,
+    std::span<const profile::FieldRuleRecord> rules,
     char delimiter,
     bool skip_standard_header) -> void;
 
@@ -1003,6 +1036,72 @@ auto EncodeGroups(std::string& out, const std::vector<message::GroupData>& group
 
 auto EncodeMessageBody(
     std::string& out,
+    const message::MessageData& data,
+    const profile::NormalizedDictionaryView& dictionary,
+    std::span<const profile::FieldRuleRecord> rules,
+    char delimiter,
+    bool skip_standard_header) -> void {
+    // Emit fields and groups in dictionary rule order.
+    for (const auto& rule : rules) {
+        const auto tag = rule.tag;
+        if (tag == 8U || tag == 9U || tag == 10U) {
+            continue;
+        }
+        if (skip_standard_header && (tag == 35U || tag == 34U || tag == 49U || tag == 56U ||
+                                     tag == 52U || tag == 43U)) {
+            continue;
+        }
+
+        // Check if this tag is a group count field.
+        const auto group_it = std::find_if(data.groups.begin(), data.groups.end(),
+            [&](const auto& g) { return g.count_tag == tag; });
+        if (group_it != data.groups.end()) {
+            EncodeGroupData(out, *group_it, dictionary, delimiter);
+            continue;
+        }
+
+        // Otherwise look for a scalar field.
+        const auto field_it = std::find_if(data.fields.begin(), data.fields.end(),
+            [&](const auto& f) { return f.tag == tag; });
+        if (field_it != data.fields.end()) {
+            EncodeFieldValue(out, *field_it, delimiter);
+        }
+    }
+
+    // Sweep extra fields not covered by dictionary rules.
+    for (const auto& field : data.fields) {
+        if (field.tag == 8U || field.tag == 9U || field.tag == 10U) {
+            continue;
+        }
+        if (HasGroupCountTag(data.groups, field.tag)) {
+            continue;
+        }
+        if (skip_standard_header && (field.tag == 35U || field.tag == 34U || field.tag == 49U || field.tag == 56U ||
+                                     field.tag == 52U || field.tag == 43U)) {
+            continue;
+        }
+        // Skip if already emitted by the rules pass.
+        bool in_rules = std::any_of(rules.begin(), rules.end(),
+            [&](const auto& r) { return r.tag == field.tag; });
+        if (in_rules) {
+            continue;
+        }
+        EncodeFieldValue(out, field, delimiter);
+    }
+
+    // Sweep extra groups not covered by dictionary rules.
+    for (const auto& group : data.groups) {
+        bool in_rules = std::any_of(rules.begin(), rules.end(),
+            [&](const auto& r) { return r.tag == group.count_tag; });
+        if (in_rules) {
+            continue;
+        }
+        EncodeGroupData(out, group, dictionary, delimiter);
+    }
+}
+
+auto EncodeMessageBody(
+    std::string& out,
     message::MessageView view,
     char delimiter,
     bool skip_standard_header) -> void {
@@ -1035,6 +1134,99 @@ auto EncodeGroupData(std::string& out, message::GroupView group, char delimiter)
     AppendField(out, group.count_tag(), static_cast<std::int64_t>(group.size()), delimiter);
     for (const auto entry : group) {
         EncodeMessageBody(out, entry, delimiter, false);
+    }
+}
+
+auto EncodeGroupData(
+    std::string& out,
+    message::GroupView group,
+    const profile::NormalizedDictionaryView& dictionary,
+    char delimiter) -> void {
+    AppendField(out, group.count_tag(), static_cast<std::int64_t>(group.size()), delimiter);
+    const auto* group_def = dictionary.find_group(group.count_tag());
+    if (group_def != nullptr) {
+        auto group_rules = dictionary.group_field_rules(*group_def);
+        for (const auto entry : group) {
+            EncodeMessageBody(out, entry, dictionary, group_rules, delimiter, false);
+        }
+    } else {
+        for (const auto entry : group) {
+            EncodeMessageBody(out, entry, delimiter, false);
+        }
+    }
+}
+
+auto EncodeMessageBody(
+    std::string& out,
+    message::MessageView view,
+    const profile::NormalizedDictionaryView& dictionary,
+    std::span<const profile::FieldRuleRecord> rules,
+    char delimiter,
+    bool skip_standard_header) -> void {
+    // Emit fields and groups in dictionary rule order.
+    for (const auto& rule : rules) {
+        const auto tag = rule.tag;
+        if (tag == 8U || tag == 9U || tag == 10U) {
+            continue;
+        }
+        if (skip_standard_header && (tag == 35U || tag == 34U || tag == 49U || tag == 56U ||
+                                     tag == 52U || tag == 43U)) {
+            continue;
+        }
+
+        // Check if this tag is a group.
+        const auto group = view.group(tag);
+        if (group.has_value()) {
+            EncodeGroupData(out, *group, dictionary, delimiter);
+            continue;
+        }
+
+        // Otherwise look for a scalar field.
+        if (HasGroupCountTag(view, tag)) {
+            continue;
+        }
+        const auto field = view.find_field_view(tag);
+        if (field.has_value()) {
+            EncodeFieldValue(out, *field, delimiter);
+        }
+    }
+
+    // Sweep extra fields not covered by dictionary rules.
+    for (std::size_t index = 0; index < view.field_count(); ++index) {
+        const auto field = view.field_at(index);
+        if (!field.has_value()) {
+            continue;
+        }
+        if (field->tag == 8U || field->tag == 9U || field->tag == 10U) {
+            continue;
+        }
+        if (HasGroupCountTag(view, field->tag)) {
+            continue;
+        }
+        if (skip_standard_header && (field->tag == 35U || field->tag == 34U || field->tag == 49U || field->tag == 56U ||
+                                     field->tag == 52U || field->tag == 43U)) {
+            continue;
+        }
+        bool in_rules = std::any_of(rules.begin(), rules.end(),
+            [&](const auto& r) { return r.tag == field->tag; });
+        if (in_rules) {
+            continue;
+        }
+        EncodeFieldValue(out, *field, delimiter);
+    }
+
+    // Sweep extra groups not covered by dictionary rules.
+    for (std::size_t index = 0; index < view.group_count(); ++index) {
+        const auto group = view.group_at(index);
+        if (!group.has_value()) {
+            continue;
+        }
+        bool in_rules = std::any_of(rules.begin(), rules.end(),
+            [&](const auto& r) { return r.tag == group->count_tag(); });
+        if (in_rules) {
+            continue;
+        }
+        EncodeGroupData(out, *group, dictionary, delimiter);
     }
 }
 
@@ -1189,6 +1381,7 @@ auto WriteFourDigits(char* out, int value) -> void {
 
 auto EncodeFixMessageGenericToBuffer(
     message::MessageView message,
+    const profile::NormalizedDictionaryView& dictionary,
     const EncodeOptions& options,
     EncodeBuffer* buffer) -> base::Status {
     if (buffer == nullptr) {
@@ -1237,7 +1430,14 @@ auto EncodeFixMessageGenericToBuffer(
         AppendField(full, 122U, options.orig_sending_time, delimiter);
     }
 
-    EncodeMessageBody(full, message, delimiter, true);
+    // Look up dictionary rules for this message type.
+    const auto* msg_def = msg_type.empty() ? nullptr : dictionary.find_message(msg_type);
+    if (msg_def != nullptr) {
+        auto rules = dictionary.message_field_rules(*msg_def);
+        EncodeMessageBody(full, message, dictionary, rules, delimiter, true);
+    } else {
+        EncodeMessageBody(full, message, delimiter, true);
+    }
 
     // Backfill body length
     const auto body_length = static_cast<std::uint32_t>(full.size() - body_start);
@@ -1509,7 +1709,7 @@ auto EncodeFixMessageToBuffer(
     const profile::NormalizedDictionaryView& dictionary,
     const EncodeOptions& options,
     EncodeBuffer* buffer) -> base::Status {
-    return EncodeFixMessageGenericToBuffer(message, options, buffer);
+    return EncodeFixMessageGenericToBuffer(message, dictionary, options, buffer);
 }
 
 auto EncodeFixMessageToBuffer(
@@ -1536,7 +1736,7 @@ auto EncodeFixMessageToBuffer(
             }
         }
     }
-    return EncodeFixMessageGenericToBuffer(message, options, buffer);
+    return EncodeFixMessageGenericToBuffer(message, dictionary, options, buffer);
 }
 
 auto PrecompiledTemplateTable::Build(

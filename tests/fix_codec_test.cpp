@@ -215,6 +215,7 @@ TEST_CASE("fix-codec", "[fix-codec]") {
     REQUIRE(symbol != std::string::npos);
     REQUIRE(parties != std::string::npos);
     REQUIRE(extra != std::string::npos);
+    // Generic encode uses dictionary rule order: ClOrdID < Parties < Symbol, extras last.
     REQUIRE(cl_ord_id < parties);
     REQUIRE(parties < symbol);
     REQUIRE(symbol < extra);
@@ -871,3 +872,4 @@ TEST_CASE("fix-codec: deeply nested groups beyond kMaxGroupNestingDepth", "[fix-
     auto deep_decoded_view = fastfix::codec::DecodeFixMessageView(deep_wire, deep_dictionary.value());
     REQUIRE(!deep_decoded_view.ok());  // View path must also reject
 }
+
