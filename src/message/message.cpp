@@ -102,16 +102,29 @@ auto ParsedFieldView(const ParsedMessageData& data, const ParsedFieldSlot& slot)
 
 auto FindParsedFieldInRoot(const ParsedMessageData& data, std::uint32_t tag)
     -> const ParsedFieldSlot* {
-    auto probe = static_cast<std::uint16_t>(tag % kFieldHashTableSize);
-    for (std::size_t i = 0; i < kFieldHashTableSize; ++i) {
-        const auto slot_index = data.field_hash_table[probe];
-        if (slot_index == kInvalidHashSlot) {
-            return nullptr;
+    // Check quick cache first for session-critical tags.
+    const auto qc_slot = QuickCacheSlotForTag(tag);
+    if (qc_slot.has_value()) {
+        const auto idx = data.quick_cache[static_cast<std::size_t>(*qc_slot)];
+        if (idx != kInvalidHashSlot) {
+            return &data.field_slots[idx];
         }
-        if (data.field_slots[slot_index].tag == tag) {
-            return &data.field_slots[slot_index];
+        return nullptr;
+    }
+
+    if (tag < kFieldHashTableSize) {
+        const auto packed = data.field_hash_table[tag];
+        const auto gen = static_cast<std::uint16_t>(packed >> 16U);
+        if (gen == data.field_generation) {
+            return &data.field_slots[packed & 0xFFFFU];
         }
-        probe = static_cast<std::uint16_t>((probe + 1U) % kFieldHashTableSize);
+        return nullptr;
+    }
+    // Overflow scan for tags >= 1024.
+    for (std::size_t i = 0; i + 1U < data.field_hash_overflow.size(); i += 2U) {
+        if (data.field_hash_overflow[i] == static_cast<std::uint16_t>(tag)) {
+            return &data.field_slots[data.field_hash_overflow[i + 1U]];
+        }
     }
     return nullptr;
 }

@@ -621,12 +621,12 @@ auto AdminProtocol::RejectInbound(
     const codec::DecodedMessageView& decoded,
     std::uint32_t ref_tag_id,
     std::uint32_t reject_reason,
-    std::string text,
+    std::string_view text,
     std::uint64_t timestamp_ns,
     bool disconnect) -> base::Result<ProtocolEvent> {
     ProtocolEvent event;
     if (disconnect && decoded.header.msg_type == "A") {
-        auto logout = BeginLogout(std::move(text), timestamp_ns);
+        auto logout = BeginLogout(std::string(text), timestamp_ns);
         if (!logout.ok()) {
             return logout.status();
         }
@@ -640,7 +640,7 @@ auto AdminProtocol::RejectInbound(
         decoded.message.view().msg_type(),
         ref_tag_id,
         reject_reason,
-        std::move(text),
+        std::string(text),
         timestamp_ns);
     if (!reject.ok()) {
         return reject.status();
@@ -725,13 +725,12 @@ auto AdminProtocol::ReplayOutbound(
         replay_opts.msg_seq_num = record->seq_num;
         replay_opts.orig_sending_time = parsed.value().sending_time;
 
-        status = codec::EncodeReplay(parsed.value(), replay_opts, &encode_buffer_);
+        EncodedFrame frame;
+        status = codec::EncodeReplayInto(parsed.value(), replay_opts, &frame.bytes);
         if (!status.ok()) {
             return status;
         }
 
-        EncodedFrame frame;
-        frame.bytes.assign(encode_buffer_.bytes());
         frame.msg_type = std::string(parsed.value().msg_type);
         frame.admin = false;
         frames->push_back(std::move(frame));
@@ -808,6 +807,8 @@ auto AdminProtocol::OnTransportClosed() -> base::Status {
 
     outstanding_test_request_id_.clear();
     logout_sent_ = false;
+    test_request_sent_ns_ = 0U;
+    logout_sent_ns_ = 0U;
     status = session_.OnTransportClosed();
     if (!status.ok()) {
         return status;
@@ -976,6 +977,9 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
     }
 
     status = session_.ObserveInboundSeq(decoded.header.msg_seq_num);
+    if (session_.ConsumeResendCompleted()) {
+        outstanding_test_request_id_.clear();
+    }
     if (!status.ok()) {
         if (decoded.header.msg_seq_num > snapshot_before.next_in_seq && phase_violation_text.has_value()) {
             status = session_.RecordInboundActivity(timestamp_ns);
@@ -1093,6 +1097,7 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
         const auto test_request_id = GetStringView(view, 112U);
         if (!test_request_id.empty() && test_request_id == outstanding_test_request_id_) {
             outstanding_test_request_id_.clear();
+            test_request_sent_ns_ = 0U;
         }
         return event;
     }
@@ -1219,15 +1224,26 @@ auto AdminProtocol::OnTimer(std::uint64_t timestamp_ns) -> base::Result<Protocol
     }
 
     const auto interval_ns = std::max<std::uint64_t>(1U, config_.heartbeat_interval_seconds) * kNanosPerSecond;
-    if (!outstanding_test_request_id_.empty() &&
-        snapshot.last_inbound_ns != 0U && timestamp_ns > snapshot.last_inbound_ns + interval_ns) {
+
+    // Logout timeout: disconnect if counterparty does not complete logout within one interval.
+    if (snapshot.state == SessionState::kAwaitingLogout && logout_sent_ns_ != 0U &&
+        timestamp_ns > logout_sent_ns_ + interval_ns) {
         event.disconnect = true;
         return event;
     }
 
+    // TestRequest timeout: disconnect if no response within one interval of sending TestRequest.
+    if (!outstanding_test_request_id_.empty() && test_request_sent_ns_ != 0U &&
+        timestamp_ns > test_request_sent_ns_ + interval_ns) {
+        event.disconnect = true;
+        return event;
+    }
+
+    // Send TestRequest after 2*interval of inbound silence (only if not already waiting for one).
     if (snapshot.last_inbound_ns != 0U && timestamp_ns > snapshot.last_inbound_ns + (interval_ns * 2U) &&
         outstanding_test_request_id_.empty()) {
         outstanding_test_request_id_ = std::to_string(timestamp_ns);
+        test_request_sent_ns_ = timestamp_ns;
         auto test_request = BuildTestRequestFrame(timestamp_ns, outstanding_test_request_id_);
         if (!test_request.ok()) {
             return test_request.status();
@@ -1236,6 +1252,7 @@ auto AdminProtocol::OnTimer(std::uint64_t timestamp_ns) -> base::Result<Protocol
         return event;
     }
 
+    // Regular heartbeat when no outbound activity for one interval.
     if (snapshot.last_outbound_ns == 0U || timestamp_ns > snapshot.last_outbound_ns + interval_ns) {
         auto heartbeat = BuildHeartbeatFrame(timestamp_ns, {});
         if (!heartbeat.ok()) {
@@ -1267,8 +1284,12 @@ auto AdminProtocol::NextTimerDeadline(std::uint64_t timestamp_ns) const -> std::
         }
     };
 
-    if (!outstanding_test_request_id_.empty() && snapshot.last_inbound_ns != 0U) {
-        update_deadline(snapshot.last_inbound_ns + interval_ns);
+    if (snapshot.state == SessionState::kAwaitingLogout && logout_sent_ns_ != 0U) {
+        update_deadline(logout_sent_ns_ + interval_ns);
+    }
+
+    if (!outstanding_test_request_id_.empty() && test_request_sent_ns_ != 0U) {
+        update_deadline(test_request_sent_ns_ + interval_ns);
     } else if (snapshot.last_inbound_ns != 0U) {
         update_deadline(snapshot.last_inbound_ns + (interval_ns * 2U));
     }
@@ -1338,6 +1359,7 @@ auto AdminProtocol::BeginLogout(std::string text, std::uint64_t timestamp_ns) ->
         builder.set_string(58U, std::move(text));
     }
     logout_sent_ = true;
+    logout_sent_ns_ = timestamp_ns;
     return EncodeFrame(std::move(builder).build(), true, timestamp_ns, true, false, true, 0U);
 }
 

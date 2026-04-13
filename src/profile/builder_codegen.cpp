@@ -70,6 +70,30 @@ auto SetterArgType(ValueType type) -> std::string_view {
     }
 }
 
+auto GetterReturnType(ValueType type) -> std::string_view {
+    switch (type) {
+        case ValueType::kString:    return "std::optional<std::string_view>";
+        case ValueType::kInt:       return "std::optional<std::int64_t>";
+        case ValueType::kChar:      return "std::optional<char>";
+        case ValueType::kFloat:     return "std::optional<double>";
+        case ValueType::kBoolean:   return "std::optional<bool>";
+        case ValueType::kTimestamp: return "std::optional<std::string_view>";
+        default:                    return "std::optional<std::string_view>";
+    }
+}
+
+auto GetterMethodName(ValueType type) -> std::string_view {
+    switch (type) {
+        case ValueType::kString:    return "get_string";
+        case ValueType::kInt:       return "get_int";
+        case ValueType::kChar:      return "get_char";
+        case ValueType::kFloat:     return "get_float";
+        case ValueType::kBoolean:   return "get_boolean";
+        case ValueType::kTimestamp: return "get_string";
+        default:                    return "get_string";
+    }
+}
+
 }  // namespace
 
 auto GenerateCppBuildersHeader(
@@ -120,6 +144,84 @@ auto GenerateCppBuildersHeader(
             }
         }
         out << "}  // namespace Tag\n\n";
+    }
+
+    // ── Enum constants ──
+    bool has_enums = false;
+    for (const auto& field : dictionary.fields) {
+        if (!field.enum_values.empty()) {
+            has_enums = true;
+            break;
+        }
+    }
+    if (has_enums) {
+        out << "namespace Enum {\n\n";
+        for (const auto& field : dictionary.fields) {
+            if (field.enum_values.empty()) continue;
+            const auto is_char_type = (field.value_type == ValueType::kChar);
+            const auto is_int_type = (field.value_type == ValueType::kInt);
+            if (is_char_type) {
+                out << "namespace " << field.name << " {\n";
+                for (const auto& ev : field.enum_values) {
+                    std::string safe_name;
+                    for (char ch : ev.name) {
+                        if (std::isalnum(static_cast<unsigned char>(ch))) {
+                            safe_name.push_back(ch);
+                        } else {
+                            safe_name.push_back('_');
+                        }
+                    }
+                    if (!safe_name.empty() && std::isdigit(static_cast<unsigned char>(safe_name[0]))) {
+                        safe_name = "k" + safe_name;
+                    }
+                    if (ev.value.size() == 1) {
+                        out << "inline constexpr char " << safe_name
+                            << " = '" << ev.value[0] << "';\n";
+                    } else {
+                        out << "inline constexpr std::string_view " << safe_name
+                            << " = \"" << ev.value << "\";\n";
+                    }
+                }
+                out << "}  // namespace " << field.name << "\n\n";
+            } else if (is_int_type) {
+                out << "namespace " << field.name << " {\n";
+                for (const auto& ev : field.enum_values) {
+                    std::string safe_name;
+                    for (char ch : ev.name) {
+                        if (std::isalnum(static_cast<unsigned char>(ch))) {
+                            safe_name.push_back(ch);
+                        } else {
+                            safe_name.push_back('_');
+                        }
+                    }
+                    if (!safe_name.empty() && std::isdigit(static_cast<unsigned char>(safe_name[0]))) {
+                        safe_name = "k" + safe_name;
+                    }
+                    out << "inline constexpr std::int64_t " << safe_name
+                        << " = " << ev.value << ";\n";
+                }
+                out << "}  // namespace " << field.name << "\n\n";
+            } else {
+                out << "namespace " << field.name << " {\n";
+                for (const auto& ev : field.enum_values) {
+                    std::string safe_name;
+                    for (char ch : ev.name) {
+                        if (std::isalnum(static_cast<unsigned char>(ch))) {
+                            safe_name.push_back(ch);
+                        } else {
+                            safe_name.push_back('_');
+                        }
+                    }
+                    if (!safe_name.empty() && std::isdigit(static_cast<unsigned char>(safe_name[0]))) {
+                        safe_name = "k" + safe_name;
+                    }
+                    out << "inline constexpr std::string_view " << safe_name
+                        << " = \"" << ev.value << "\";\n";
+                }
+                out << "}  // namespace " << field.name << "\n\n";
+            }
+        }
+        out << "}  // namespace Enum\n\n";
     }
 
     // ── Group entry writers ──
@@ -262,6 +364,175 @@ auto WriteCppBuildersHeader(
     out.write(header.value().data(), static_cast<std::streamsize>(header.value().size()));
     if (!out.good()) {
         return base::Status::IoError("unable to write generated builder header: '" + path.string() + "'");
+    }
+
+    return base::Status::Ok();
+}
+
+auto GenerateCppReadersHeader(
+    const NormalizedDictionary& dictionary,
+    std::string_view namespace_name) -> base::Result<std::string> {
+    const auto ns = namespace_name.empty()
+        ? DefaultNamespaceName(dictionary) : std::string(namespace_name);
+
+    std::unordered_map<std::uint32_t, const FieldDef*> field_by_tag;
+    for (const auto& f : dictionary.fields) {
+        field_by_tag[f.tag] = &f;
+    }
+
+    std::unordered_map<std::uint32_t, const GroupDef*> group_by_tag;
+    for (const auto& g : dictionary.groups) {
+        group_by_tag[g.count_tag] = &g;
+    }
+
+    std::ostringstream out;
+
+    // File header
+    out << "#pragma once\n\n"
+        << "#include <cstdint>\n"
+        << "#include <optional>\n"
+        << "#include <string_view>\n\n"
+        << "#include \"fastfix/message/message.h\"\n\n"
+        << "// Generated by fastfix-dictgen — do not edit.\n\n"
+        << "namespace " << ns << " {\n\n";
+
+    // Group entry views
+    for (const auto& group : dictionary.groups) {
+        const auto class_name = group.name + "EntryView";
+        out << "class " << class_name << " {\n"
+            << "  public:\n"
+            << "    explicit " << class_name
+            << "(message::RawGroupEntryView entry)\n"
+            << "        : entry_(entry) {}\n\n";
+
+        for (const auto& rule : group.field_rules) {
+            auto it = field_by_tag.find(rule.tag);
+            if (it == field_by_tag.end()) continue;
+            const auto& field = *it->second;
+            const auto snake = CamelToSnake(field.name);
+            const auto ret_type = GetterReturnType(field.value_type);
+            const auto method = GetterMethodName(field.value_type);
+
+            out << "    [[nodiscard]] auto " << snake << "() const -> "
+                << ret_type << " {\n"
+                << "        return entry_." << method << "("
+                << field.tag << "U);\n"
+                << "    }\n\n";
+        }
+
+        out << "  private:\n"
+            << "    message::RawGroupEntryView entry_;\n"
+            << "};\n\n";
+    }
+
+    // Group views
+    for (const auto& group : dictionary.groups) {
+        const auto class_name = group.name + "View";
+        const auto entry_class = group.name + "EntryView";
+        out << "class " << class_name << " {\n"
+            << "  public:\n"
+            << "    explicit " << class_name
+            << "(message::RawGroupView group)\n"
+            << "        : group_(group) {}\n\n"
+            << "    [[nodiscard]] auto size() const -> std::size_t {\n"
+            << "        return group_.size();\n"
+            << "    }\n\n"
+            << "    [[nodiscard]] auto operator[](std::size_t index) const -> "
+            << entry_class << " {\n"
+            << "        return " << entry_class << "(group_[index]);\n"
+            << "    }\n\n"
+            << "  private:\n"
+            << "    message::RawGroupView group_;\n"
+            << "};\n\n";
+    }
+
+    // Per-message view classes
+    for (const auto& msg : dictionary.messages) {
+        const auto class_name = msg.name + "View";
+        out << "class " << class_name << " {\n"
+            << "  public:\n"
+            << "    static constexpr std::string_view kMsgType = \""
+            << msg.msg_type << "\";\n\n"
+            << "    explicit " << class_name
+            << "(message::MessageView view)\n"
+            << "        : view_(view) {}\n\n"
+            << "    [[nodiscard]] auto valid() const -> bool {\n"
+            << "        return view_.valid();\n"
+            << "    }\n\n"
+            << "    [[nodiscard]] auto raw() const -> message::MessageView {\n"
+            << "        return view_;\n"
+            << "    }\n\n";
+
+        // Field accessors (skip session-managed and group count tags)
+        for (const auto& rule : msg.field_rules) {
+            if (IsEncodeManagedTag(rule.tag)) continue;
+            if (group_by_tag.count(rule.tag)) continue;
+
+            auto it = field_by_tag.find(rule.tag);
+            if (it == field_by_tag.end()) continue;
+            const auto& field = *it->second;
+            const auto snake = CamelToSnake(field.name);
+            const auto ret_type = GetterReturnType(field.value_type);
+            const auto method = GetterMethodName(field.value_type);
+
+            out << "    [[nodiscard]] auto " << snake << "() const -> "
+                << ret_type << " {\n"
+                << "        return view_." << method << "("
+                << field.tag << "U);\n"
+                << "    }\n\n";
+        }
+
+        // Group accessors
+        for (const auto& rule : msg.field_rules) {
+            auto git = group_by_tag.find(rule.tag);
+            if (git == group_by_tag.end()) continue;
+            const auto& group = *git->second;
+            const auto snake_group = CamelToSnake(group.name);
+            const auto group_view_class = group.name + "View";
+
+            out << "    [[nodiscard]] auto " << snake_group
+                << "() const -> std::optional<" << group_view_class << "> {\n"
+                << "        auto g = view_.raw_group("
+                << group.count_tag << "U);\n"
+                << "        if (!g.has_value()) return std::nullopt;\n"
+                << "        return " << group_view_class << "(*g);\n"
+                << "    }\n\n";
+        }
+
+        out << "  private:\n"
+            << "    message::MessageView view_;\n"
+            << "};\n\n";
+    }
+
+    out << "}  // namespace " << ns << "\n";
+    return out.str();
+}
+
+auto WriteCppReadersHeader(
+    const std::filesystem::path& path,
+    const NormalizedDictionary& dictionary,
+    std::string_view namespace_name) -> base::Status {
+    auto header = GenerateCppReadersHeader(dictionary, namespace_name);
+    if (!header.ok()) {
+        return header.status();
+    }
+
+    if (const auto parent = path.parent_path(); !parent.empty()) {
+        std::error_code error;
+        std::filesystem::create_directories(parent, error);
+        if (error) {
+            return base::Status::IoError("unable to create reader output directory: '" + parent.string() + "'");
+        }
+    }
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        return base::Status::IoError("unable to open generated reader header for writing: '" + path.string() + "'");
+    }
+
+    out.write(header.value().data(), static_cast<std::streamsize>(header.value().size()));
+    if (!out.good()) {
+        return base::Status::IoError("unable to write generated reader header: '" + path.string() + "'");
     }
 
     return base::Status::Ok();

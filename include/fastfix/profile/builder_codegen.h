@@ -19,4 +19,13 @@ auto WriteCppBuildersHeader(
     const NormalizedDictionary& dictionary,
     std::string_view namespace_name = {}) -> base::Status;
 
+auto GenerateCppReadersHeader(
+    const NormalizedDictionary& dictionary,
+    std::string_view namespace_name = {}) -> base::Result<std::string>;
+
+auto WriteCppReadersHeader(
+    const std::filesystem::path& path,
+    const NormalizedDictionary& dictionary,
+    std::string_view namespace_name = {}) -> base::Status;
+
 }  // namespace fastfix::profile

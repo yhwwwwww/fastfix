@@ -139,6 +139,11 @@ class InlineSplitVector {
     }
 
     auto clear() -> void {
+        if constexpr (!std::is_trivially_destructible_v<T>) {
+            for (std::size_t i = 0; i < inline_size_; ++i) {
+                inline_storage_[i] = T{};
+            }
+        }
         inline_size_ = 0U;
         overflow_.clear();
     }

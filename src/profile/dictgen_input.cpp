@@ -20,6 +20,7 @@ constexpr char kDictgenFieldRuleModeSeparator = ':';
 constexpr std::string_view kProfileIdKey = "profile_id";
 constexpr std::string_view kSchemaHashKey = "schema_hash";
 constexpr std::string_view kFieldEntryKind = "field";
+constexpr std::string_view kEnumEntryKind = "enum";
 constexpr std::string_view kMessageEntryKind = "message";
 constexpr std::string_view kGroupEntryKind = "group";
 constexpr std::string_view kHeaderEntryKind = "header";
@@ -330,6 +331,24 @@ auto ParseDictionaryLines(const std::vector<std::string>& lines)
                 return field.status();
             }
             dictionary.fields.push_back(std::move(field).value());
+            continue;
+        }
+
+        if (parts[0] == kEnumEntryKind) {
+            if (parts.size() != 4U) {
+                return base::Status::InvalidArgument("enum entries must have 4 parts");
+            }
+            auto tag = ParseU32(parts[1]);
+            if (!tag.ok()) {
+                return tag.status();
+            }
+            // Find the field and append the enum entry
+            for (auto& field : dictionary.fields) {
+                if (field.tag == tag.value()) {
+                    field.enum_values.push_back({std::string(parts[2]), std::string(parts[3])});
+                    break;
+                }
+            }
             continue;
         }
 

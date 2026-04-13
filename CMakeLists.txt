@@ -37,8 +37,10 @@ set(FASTFIX_FIX44_XML "${FASTFIX_QUICKFIX_ROOT}/spec/FIX44.xml")
 set(FASTFIX_FIX44_FFD "${FASTFIX_BENCH_OUTPUT_DIR}/quickfix_FIX44.ffd")
 set(FASTFIX_FIX44_ART "${FASTFIX_BENCH_OUTPUT_DIR}/quickfix_FIX44.art")
 set(FASTFIX_FIX44_BUILDERS "${FASTFIX_GENERATED_DIR}/fix44_builders.h")
+set(FASTFIX_FIX44_READERS "${FASTFIX_GENERATED_DIR}/fix44_readers.h")
 set(FASTFIX_SAMPLE_ART "${FASTFIX_OUTPUT_ROOT}/sample-basic.art")
 set(FASTFIX_SAMPLE_BUILDERS "${FASTFIX_GENERATED_DIR}/sample_basic_builders.h")
+set(FASTFIX_SAMPLE_READERS "${FASTFIX_GENERATED_DIR}/sample_basic_readers.h")
 
 file(MAKE_DIRECTORY "${FASTFIX_GENERATED_DIR}")
 file(MAKE_DIRECTORY "${FASTFIX_BENCH_OUTPUT_DIR}")
@@ -182,6 +184,7 @@ add_custom_command(
         "${FASTFIX_FIX44_FFD}"
         "${FASTFIX_FIX44_ART}"
         "${FASTFIX_FIX44_BUILDERS}"
+        "${FASTFIX_FIX44_READERS}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${FASTFIX_BENCH_OUTPUT_DIR}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${FASTFIX_GENERATED_DIR}"
     COMMAND $<TARGET_FILE:fastfix-xml2ffd>
@@ -192,6 +195,7 @@ add_custom_command(
         --input "${FASTFIX_FIX44_FFD}"
         --output "${FASTFIX_FIX44_ART}"
         --cpp-builders "${FASTFIX_FIX44_BUILDERS}"
+        --cpp-readers "${FASTFIX_FIX44_READERS}"
     DEPENDS
         fastfix-xml2ffd
         fastfix-dictgen
@@ -203,12 +207,14 @@ add_custom_target(fastfix-fix44-assets
         "${FASTFIX_FIX44_FFD}"
         "${FASTFIX_FIX44_ART}"
         "${FASTFIX_FIX44_BUILDERS}"
+        "${FASTFIX_FIX44_READERS}"
 )
 
 add_custom_command(
     OUTPUT
         "${FASTFIX_SAMPLE_ART}"
         "${FASTFIX_SAMPLE_BUILDERS}"
+        "${FASTFIX_SAMPLE_READERS}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${FASTFIX_OUTPUT_ROOT}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${FASTFIX_GENERATED_DIR}"
     COMMAND $<TARGET_FILE:fastfix-dictgen>
@@ -216,6 +222,7 @@ add_custom_command(
         --merge "${PROJECT_SOURCE_DIR}/samples/basic_overlay.ffd"
         --output "${FASTFIX_SAMPLE_ART}"
         --cpp-builders "${FASTFIX_SAMPLE_BUILDERS}"
+        --cpp-readers "${FASTFIX_SAMPLE_READERS}"
     DEPENDS
         fastfix-dictgen
         "${PROJECT_SOURCE_DIR}/samples/basic_profile.ffd"
@@ -226,6 +233,7 @@ add_custom_target(fastfix-sample-assets
     DEPENDS
         "${FASTFIX_SAMPLE_ART}"
         "${FASTFIX_SAMPLE_BUILDERS}"
+        "${FASTFIX_SAMPLE_READERS}"
 )
 
 add_custom_target(fastfix-generated-assets

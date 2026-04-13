@@ -120,13 +120,26 @@ auto BuildProfileArtifact(const NormalizedDictionary& dictionary)
 
     std::vector<FieldDefRecord> field_defs;
     field_defs.reserve(dictionary.fields.size());
+    std::vector<EnumValueRecord> enum_records;
     for (const auto& field : dictionary.fields) {
+        const auto enum_offset = static_cast<std::uint32_t>(enum_records.size());
+        const auto enum_count = static_cast<std::uint16_t>(field.enum_values.size());
         field_defs.push_back(FieldDefRecord{
             .tag = field.tag,
             .name_offset = strings.Intern(field.name),
             .value_type = static_cast<std::uint32_t>(field.value_type),
             .flags = field.flags,
+            .enum_offset = enum_offset,
+            .enum_count = enum_count,
+            .reserved0 = 0,
         });
+        for (const auto& ev : field.enum_values) {
+            enum_records.push_back(EnumValueRecord{
+                .field_tag = field.tag,
+                .value_offset = strings.Intern(ev.value),
+                .name_offset = strings.Intern(ev.name),
+            });
+        }
     }
 
     std::vector<FieldRuleRecord> message_rules;
@@ -302,6 +315,13 @@ auto BuildProfileArtifact(const NormalizedDictionary& dictionary)
         .bytes = SerializeEntries<FieldRuleRecord>(trailer_rules),
         .entry_count = trailer_rules.size(),
         .entry_size = sizeof(FieldRuleRecord),
+    });
+
+    pending_sections.push_back(PendingSection{
+        .kind = SectionKind::kEnumValues,
+        .bytes = SerializeEntries<EnumValueRecord>(enum_records),
+        .entry_count = enum_records.size(),
+        .entry_size = sizeof(EnumValueRecord),
     });
 
     std::vector<ArtifactSection> sections;

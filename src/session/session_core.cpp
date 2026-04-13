@@ -28,6 +28,8 @@ auto SessionKeyHash::operator()(const SessionKey& key) const -> std::size_t {
     seed = CombineHash(seed, std::hash<std::string>{}(key.target_comp_id));
     seed = CombineHash(seed, HashOptional(key.sender_sub_id));
     seed = CombineHash(seed, HashOptional(key.target_sub_id));
+    seed = CombineHash(seed, HashOptional(key.sender_location_id));
+    seed = CombineHash(seed, HashOptional(key.target_location_id));
     seed = CombineHash(seed, HashOptional(key.session_qualifier));
     return seed;
 }
@@ -36,12 +38,27 @@ SessionCore::SessionCore(SessionConfig config)
     : config_(std::move(config)) {
 }
 
-auto SessionCore::OnTransportConnected() -> base::Status {
+auto SessionCore::BeginConnect() -> base::Status {
     if (state_ != SessionState::kDisconnected) {
-        return base::Status::InvalidArgument("transport can only connect from the disconnected state");
+        return base::Status::InvalidArgument("connect can only begin from the disconnected state");
+    }
+
+    state_ = SessionState::kConnecting;
+    return base::Status::Ok();
+}
+
+auto SessionCore::OnTransportConnected() -> base::Status {
+    if (state_ != SessionState::kDisconnected && state_ != SessionState::kConnecting) {
+        return base::Status::InvalidArgument("transport can only connect from the disconnected or connecting state");
     }
 
     state_ = SessionState::kConnected;
+    return base::Status::Ok();
+}
+
+auto SessionCore::Close() -> base::Status {
+    pending_resend_.reset();
+    state_ = SessionState::kClosed;
     return base::Status::Ok();
 }
 
@@ -103,6 +120,7 @@ auto SessionCore::AdvanceInboundExpectedSeq(std::uint32_t next_in_seq) -> base::
         next_in_seq_ > pending_resend_->end_seq) {
         pending_resend_.reset();
         state_ = resume_state_;
+        resend_completed_ = true;
     }
     return base::Status::Ok();
 }
@@ -127,7 +145,9 @@ auto SessionCore::BeginLogout() -> base::Status {
 }
 
 auto SessionCore::OnTransportClosed() -> base::Status {
-    state_ = SessionState::kDisconnected;
+    if (state_ != SessionState::kClosed) {
+        state_ = SessionState::kDisconnected;
+    }
     return base::Status::Ok();
 }
 
@@ -195,6 +215,7 @@ auto SessionCore::CompleteResend() -> base::Status {
 
     pending_resend_.reset();
     state_ = resume_state_;
+    resend_completed_ = true;
     return base::Status::Ok();
 }
 

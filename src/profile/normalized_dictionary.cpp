@@ -125,6 +125,21 @@ auto NormalizedDictionaryView::FromProfile(LoadedProfile profile) -> base::Resul
     view.message_field_rules_ = message_field_rules;
     view.group_field_rules_ = group_field_rules;
 
+    // Load header field rules (optional — many artifacts omit them).
+    if (const auto section = view.profile_.fixed_section<FieldRuleRecord>(SectionKind::kHeaderFieldRules); section.has_value()) {
+        view.header_field_rules_ = *section;
+    }
+
+    // Load trailer field rules (optional).
+    if (const auto section = view.profile_.fixed_section<FieldRuleRecord>(SectionKind::kTrailerFieldRules); section.has_value()) {
+        view.trailer_field_rules_ = *section;
+    }
+
+    // Load enum values (optional).
+    if (const auto section = view.profile_.fixed_section<EnumValueRecord>(SectionKind::kEnumValues); section.has_value()) {
+        view.enum_values_ = *section;
+    }
+
     // Build field index sorted by tag for binary search.
     {
         const auto& entries = view.field_defs_.entries();

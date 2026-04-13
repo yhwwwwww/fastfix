@@ -18,7 +18,10 @@ inline constexpr std::size_t kIntBufSize =
 
 auto ParseUint32(std::string_view text) -> std::uint32_t {
     std::uint32_t value = 0;
-    std::from_chars(text.data(), text.data() + text.size(), value);
+    auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (ec != std::errc() || ptr != text.data() + text.size()) {
+        return 0;
+    }
     return value;
 }
 
@@ -203,7 +206,7 @@ auto EncodeForwarded(
         return base::Status::InvalidArgument("inbound view is not valid");
     }
 
-    const char soh = kFixSoh;
+    const char soh = options.delimiter == '\0' ? kFixSoh : options.delimiter;
     auto& out = buffer->storage;
     out.clear();
 
@@ -257,7 +260,20 @@ auto EncodeForwarded(
     out.append(options.sending_time);
     out.push_back(soh);
 
-    // 8. Optional: 115=<on_behalf_of_comp_id>SOH
+    // 8. Optional: 43=Y SOH (PossDupFlag)
+    if (options.poss_dup) {
+        out.append("43=Y");
+        out.push_back(soh);
+    }
+
+    // 9. Optional: 122=<orig_sending_time>SOH
+    if (!options.orig_sending_time.empty()) {
+        out.append("122=");
+        out.append(options.orig_sending_time);
+        out.push_back(soh);
+    }
+
+    // 10. Optional: 115=<on_behalf_of_comp_id>SOH
     if (!options.on_behalf_of_comp_id.empty()) {
         out.append("115=");
         out.append(options.on_behalf_of_comp_id);
@@ -321,7 +337,7 @@ auto EncodeReplay(
         return base::Status::InvalidArgument("stored view is not valid");
     }
 
-    const char soh = kFixSoh;
+    const char soh = options.delimiter == '\0' ? kFixSoh : options.delimiter;
     auto& out = buffer->storage;
     out.clear();
 
@@ -385,9 +401,9 @@ auto EncodeReplay(
         out.push_back(soh);
     }
 
-    // 10. Optional 1128=<default_appl_ver_id>SOH
+    // 10. Optional 1137=<default_appl_ver_id>SOH
     if (!options.default_appl_ver_id.empty()) {
-        out.append("1128=");
+        out.append("1137=");
         out.append(options.default_appl_ver_id);
         out.push_back(soh);
     }
@@ -427,6 +443,189 @@ auto EncodeReplay(
     out.append("10=");
     out.append(cksum.data(), 3);
     out.push_back(soh);
+
+    return base::Status::Ok();
+}
+
+namespace {
+
+auto ComputeChecksumSIMD(const char* data, std::size_t len) -> std::uint32_t {
+    std::uint32_t sum = 0;
+#if FASTFIX_HAS_SSE2
+    const auto zero = _mm_setzero_si128();
+    std::size_t i = 0;
+    for (; i + 16 <= len; i += 16) {
+        auto chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
+        auto sad = _mm_sad_epu8(chunk, zero);
+        sum += static_cast<std::uint32_t>(_mm_extract_epi16(sad, 0)) +
+               static_cast<std::uint32_t>(_mm_extract_epi16(sad, 4));
+    }
+    for (; i < len; ++i) {
+        sum += static_cast<unsigned char>(data[i]);
+    }
+#else
+    for (std::size_t i = 0; i < len; ++i) {
+        sum += static_cast<unsigned char>(data[i]);
+    }
+#endif
+    return sum;
+}
+
+}  // namespace
+
+auto EncodeReplayInto(
+    const RawPassThroughView& stored,
+    const ReplayOptions& options,
+    session::EncodedFrameBytes* out) -> base::Status {
+    if (out == nullptr) {
+        return base::Status::InvalidArgument("output is null");
+    }
+    if (!stored.valid) {
+        return base::Status::InvalidArgument("stored view is not valid");
+    }
+
+    const char soh = options.delimiter == '\0' ? kFixSoh : options.delimiter;
+
+    // Estimate total size: header (~120 bytes max) + raw_body + checksum (7 bytes)
+    const auto estimated_size = 128U + options.sender_comp_id.size() +
+        options.target_comp_id.size() + options.begin_string.size() +
+        options.default_appl_ver_id.size() + options.sending_time.size() +
+        options.orig_sending_time.size() + stored.raw_body.size() + stored.msg_type.size();
+
+    // Choose storage: inline or overflow
+    char* buf;
+    if (estimated_size <= session::kEncodedFrameInlineCapacity) {
+        buf = reinterpret_cast<char*>(out->inline_storage.data());
+        out->overflow_storage.clear();
+    } else {
+        out->inline_size = 0;
+        out->overflow_storage.resize(estimated_size + 64);
+        buf = reinterpret_cast<char*>(out->overflow_storage.data());
+    }
+
+    // Use a simple append helper
+    std::size_t pos = 0;
+    auto append_sv = [&](std::string_view sv) {
+        std::memcpy(buf + pos, sv.data(), sv.size());
+        pos += sv.size();
+    };
+    auto append_char = [&](char ch) {
+        buf[pos++] = ch;
+    };
+    auto append_bytes = [&](const std::byte* data, std::size_t len) {
+        std::memcpy(buf + pos, data, len);
+        pos += len;
+    };
+
+    // 1. 8=<begin_string>SOH
+    const auto begin_string = options.begin_string.empty()
+        ? stored.begin_string : options.begin_string;
+    append_sv("8=");
+    append_sv(begin_string);
+    append_char(soh);
+
+    // 2. 9=<placeholder>SOH  (use kBodyLengthPlaceholderWidth=7 to match EncodeReplay)
+    append_sv("9=");
+    const auto body_length_offset = pos;
+    append_sv("0000000");
+    append_char(soh);
+    const auto body_start = pos;
+
+    // 3. 35=<msg_type>SOH
+    append_sv("35=");
+    append_sv(stored.msg_type);
+    append_char(soh);
+
+    // 4. 49=<sender>SOH
+    append_sv("49=");
+    append_sv(options.sender_comp_id);
+    append_char(soh);
+
+    // 5. 56=<target>SOH
+    append_sv("56=");
+    append_sv(options.target_comp_id);
+    append_char(soh);
+
+    // 6. 34=<seq_num>SOH
+    {
+        std::array<char, kIntBufSize<std::uint32_t>> num_buf{};
+        auto [ptr, ec] = std::to_chars(num_buf.data(), num_buf.data() + num_buf.size(), options.msg_seq_num);
+        if (ec != std::errc()) {
+            return base::Status::FormatError("failed to format MsgSeqNum");
+        }
+        append_sv("34=");
+        append_sv(std::string_view(num_buf.data(), static_cast<std::size_t>(ptr - num_buf.data())));
+        append_char(soh);
+    }
+
+    // 7. 52=<sending_time>SOH
+    append_sv("52=");
+    append_sv(options.sending_time);
+    append_char(soh);
+
+    // 8. 43=Y SOH
+    append_sv("43=Y");
+    append_char(soh);
+
+    // 9. 122=<orig_sending_time>SOH
+    if (!options.orig_sending_time.empty()) {
+        append_sv("122=");
+        append_sv(options.orig_sending_time);
+        append_char(soh);
+    }
+
+    // 10. Optional 1137=<default_appl_ver_id>SOH
+    if (!options.default_appl_ver_id.empty()) {
+        append_sv("1137=");
+        append_sv(options.default_appl_ver_id);
+        append_char(soh);
+    }
+
+    // 11. Splice raw body bytes unchanged
+    if (!stored.raw_body.empty()) {
+        append_bytes(stored.raw_body.data(), stored.raw_body.size());
+    }
+
+    // 12. Backfill BodyLength
+    const auto body_length = static_cast<std::uint32_t>(pos - body_start);
+    {
+        std::array<char, kIntBufSize<std::uint32_t>> num_buf{};
+        auto [ptr, ec] = std::to_chars(num_buf.data(), num_buf.data() + num_buf.size(), body_length);
+        if (ec != std::errc()) {
+            return base::Status::FormatError("failed to format BodyLength");
+        }
+        const auto digits = static_cast<std::size_t>(ptr - num_buf.data());
+        if (digits > kBodyLengthPlaceholderWidth) {
+            return base::Status::FormatError("BodyLength exceeds placeholder width");
+        }
+        // Shift body content if digits < placeholder width
+        if (digits < kBodyLengthPlaceholderWidth) {
+            const auto shift = kBodyLengthPlaceholderWidth - digits;
+            std::memmove(buf + body_length_offset + digits,
+                         buf + body_length_offset + kBodyLengthPlaceholderWidth,
+                         pos - (body_length_offset + kBodyLengthPlaceholderWidth));
+            pos -= shift;
+        }
+        std::memcpy(buf + body_length_offset, num_buf.data(), digits);
+    }
+
+    // 13. Compute and append 10=<checksum>SOH using SIMD-accelerated path
+    std::uint32_t checksum = ComputeChecksumSIMD(buf, pos) % 256U;
+
+    buf[pos++] = '1';
+    buf[pos++] = '0';
+    buf[pos++] = '=';
+    buf[pos++] = static_cast<char>('0' + ((checksum / 100U) % 10U));
+    buf[pos++] = static_cast<char>('0' + ((checksum / 10U) % 10U));
+    buf[pos++] = static_cast<char>('0' + (checksum % 10U));
+    buf[pos++] = soh;
+
+    // Finalize size
+    if (estimated_size <= session::kEncodedFrameInlineCapacity) {
+        out->inline_size = pos;
+    } else {
+        out->overflow_storage.resize(pos);
+    }
 
     return base::Status::Ok();
 }

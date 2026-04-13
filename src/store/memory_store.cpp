@@ -253,4 +253,28 @@ auto MemorySessionStore::LoadRecoveryState(std::uint64_t session_id) const
     return it->second.recovery;
 }
 
+auto MemorySessionStore::Rollover() -> base::Status {
+    for (auto& [session_id, session] : sessions_) {
+        // Rebuild payload arena with only live payloads from outbound + inbound records.
+        std::vector<std::byte> new_arena;
+        new_arena.reserve(session.payload_arena.size() / 2U);
+
+        auto compact_records = [&](std::vector<StoredMessageRecord>& records) {
+            for (auto& record : records) {
+                const auto new_offset = new_arena.size();
+                new_arena.insert(
+                    new_arena.end(),
+                    session.payload_arena.begin() + static_cast<std::ptrdiff_t>(record.payload_offset),
+                    session.payload_arena.begin() + static_cast<std::ptrdiff_t>(record.payload_offset + record.payload_size));
+                record.payload_offset = new_offset;
+            }
+        };
+
+        compact_records(session.outbound);
+        compact_records(session.inbound);
+        session.payload_arena = std::move(new_arena);
+    }
+    return base::Status::Ok();
+}
+
 }  // namespace fastfix::store

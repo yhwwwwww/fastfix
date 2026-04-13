@@ -503,6 +503,38 @@ auto LiveSessionWorker::SendFrames(ConnectionState& connection,
     return base::Status::Ok();
 }
 
+auto LiveSessionWorker::SendFramesBatch(
+    ConnectionState& connection,
+    const session::ProtocolFrameList& frames,
+    std::uint64_t timestamp_ns) -> base::Status {
+    if (frames.size() <= 1U) {
+        return SendFrames(connection, frames, timestamp_ns);
+    }
+
+    // Build segment array for writev
+    std::vector<std::span<const std::byte>> segments;
+    segments.reserve(frames.size());
+    for (const auto& frame : frames) {
+        auto view = frame.bytes.view();
+        if (!view.empty()) {
+            segments.push_back(view);
+        }
+    }
+
+    auto status = connection.connection.SendGather(segments, options_.io_timeout);
+    if (!status.ok()) {
+        return status;
+    }
+
+    // Record metrics for all frames
+    for (const auto& frame : frames) {
+        RecordOutboundMetrics(*connection.session, frame);
+    }
+    connection.last_progress_ns = timestamp_ns;
+    last_progress_ns_.store(timestamp_ns);
+    return base::Status::Ok();
+}
+
 auto LiveSessionWorker::LoadSessionSnapshot(std::uint64_t session_id) const
     -> base::Result<session::SessionSnapshot> {
     std::lock_guard lock(control_mutex_);
@@ -677,11 +709,11 @@ auto LiveSessionWorker::FindConnectionBySessionId(WorkerShardState& shard,
 }
 
 auto LiveSessionWorker::MarkConnectionForClose(ConnectionState& connection,
-                                               std::string reason,
+                                               std::string_view reason,
                                                bool count_completion) -> void {
     connection.close_requested = true;
     connection.count_completion = connection.count_completion || count_completion;
-    connection.close_reason = std::move(reason);
+    connection.close_reason = std::string(reason);
 }
 
 auto LiveSessionWorker::EnsureManagedQueueRunnerStarted() -> base::Status {

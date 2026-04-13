@@ -1061,6 +1061,52 @@ auto DurableBatchSessionStore::Rollover() -> base::Status {
         }
     }
 
+    // Compact recovery log: rewrite only the latest state per session.
+    if (impl_->recovery_fd >= 0 && !impl_->recovery_states.empty()) {
+        CloseFd(impl_->recovery_fd);
+        impl_->recovery_size = 0;
+
+        int fd = ::open(impl_->recovery_path.c_str(), O_RDWR | O_TRUNC, 0644);
+        if (fd < 0) {
+            return base::Status::IoError(
+                IoErrorMessage(impl_->recovery_path, "unable to truncate recovery log"));
+        }
+        auto rec_header = BuildFileHeader(kRecoveryMagic, 0U);
+        if (!WriteExact(fd, &rec_header, sizeof(rec_header), 0U)) {
+            CloseFd(fd);
+            return base::Status::IoError(
+                IoErrorMessage(impl_->recovery_path, "unable to write recovery log header"));
+        }
+        std::uint64_t offset = sizeof(StoreFileHeader);
+        for (const auto& [sid, state] : impl_->recovery_states) {
+            RecoveryRecord record{};
+            record.session_id = state.session_id;
+            record.next_in_seq = state.next_in_seq;
+            record.next_out_seq = state.next_out_seq;
+            record.last_inbound_ns = state.last_inbound_ns;
+            record.last_outbound_ns = state.last_outbound_ns;
+            record.active = state.active ? 1U : 0U;
+            if (!WriteExact(fd, &record, sizeof(record), offset)) {
+                CloseFd(fd);
+                return base::Status::IoError(
+                    IoErrorMessage(impl_->recovery_path, "unable to write compacted recovery record"));
+            }
+            offset += sizeof(record);
+        }
+        if (!SyncFileHeader(fd, &rec_header, offset)) {
+            CloseFd(fd);
+            return base::Status::IoError(
+                IoErrorMessage(impl_->recovery_path, "unable to update compacted recovery header"));
+        }
+        auto sync_status = SyncDataFile(fd);
+        if (!sync_status.ok()) {
+            CloseFd(fd);
+            return sync_status;
+        }
+        impl_->recovery_fd = fd;
+        impl_->recovery_size = offset;
+    }
+
     return base::Status::Ok();
 }
 
@@ -1088,7 +1134,8 @@ auto DurableBatchSessionStore::LoadOutboundRange(
         return base::Status::InvalidArgument("invalid outbound load range");
     }
 
-    auto status = const_cast<DurableBatchSessionStore*>(this)->Flush();
+    auto status = impl_->pending_entries.empty() ? base::Status::Ok()
+        : const_cast<DurableBatchSessionStore*>(this)->Flush();
     if (!status.ok()) {
         return status;
     }
@@ -1152,7 +1199,8 @@ auto DurableBatchSessionStore::LoadOutboundRangeViews(
         return base::Status::InvalidArgument("invalid outbound load range");
     }
 
-    auto status = const_cast<DurableBatchSessionStore*>(this)->Flush();
+    auto status = impl_->pending_entries.empty() ? base::Status::Ok()
+        : const_cast<DurableBatchSessionStore*>(this)->Flush();
     if (!status.ok()) {
         return status;
     }
@@ -1229,7 +1277,8 @@ auto DurableBatchSessionStore::SaveRecoveryState(const SessionRecoveryState& sta
 
 auto DurableBatchSessionStore::LoadRecoveryState(std::uint64_t session_id) const
     -> base::Result<SessionRecoveryState> {
-    auto status = const_cast<DurableBatchSessionStore*>(this)->Flush();
+    auto status = impl_->pending_entries.empty() ? base::Status::Ok()
+        : const_cast<DurableBatchSessionStore*>(this)->Flush();
     if (!status.ok()) {
         return status;
     }

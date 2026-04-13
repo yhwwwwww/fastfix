@@ -8,6 +8,7 @@
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <charconv>
@@ -301,6 +302,73 @@ auto TcpConnection::Send(std::span<const std::byte> bytes, std::chrono::millisec
 
 auto TcpConnection::Send(const std::vector<std::byte>& bytes, std::chrono::milliseconds timeout) -> base::Status {
     return Send(std::span<const std::byte>(bytes.data(), bytes.size()), timeout);
+}
+
+auto TcpConnection::SendGather(
+    std::span<const std::span<const std::byte>> segments,
+    std::chrono::milliseconds timeout) -> base::Status {
+    if (segments.empty()) {
+        return base::Status::Ok();
+    }
+    if (segments.size() == 1U) {
+        return Send(segments[0], timeout);
+    }
+
+    if (epoll_fd_ < 0) {
+        epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
+        if (epoll_fd_ < 0) return base::Status::IoError("epoll_create1 failed");
+    }
+    const auto timeout_ms = timeout.count() > std::numeric_limits<int>::max()
+                                ? std::numeric_limits<int>::max()
+                                : static_cast<int>(timeout.count());
+
+    // Build iovec array
+    std::vector<struct iovec> iov(segments.size());
+    std::size_t total_bytes = 0;
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+        iov[i].iov_base = const_cast<void*>(static_cast<const void*>(segments[i].data()));
+        iov[i].iov_len = segments[i].size();
+        total_bytes += segments[i].size();
+    }
+
+    std::size_t sent = 0;
+    std::size_t current_iov = 0;
+    while (sent < total_bytes) {
+        int poll_ret = EpollWaitFd(fd_, EPOLLOUT, timeout_ms);
+        if (poll_ret == 0) {
+            return base::Status::IoError("socket operation timed out");
+        }
+        if (poll_ret < 0) {
+            return base::Status::IoError("socket closed or errored while polling");
+        }
+
+        const auto remaining_iovs = static_cast<int>(iov.size() - current_iov);
+        const auto rc = ::writev(fd_, &iov[current_iov], remaining_iovs);
+        if (rc < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            return base::Status::IoError(std::string("writev failed: ") + std::strerror(errno));
+        }
+        if (rc == 0) {
+            return base::Status::IoError("peer closed the socket during send");
+        }
+
+        sent += static_cast<std::size_t>(rc);
+
+        // Advance iov pointers past fully-sent segments
+        auto remaining = static_cast<std::size_t>(rc);
+        while (current_iov < iov.size() && remaining >= iov[current_iov].iov_len) {
+            remaining -= iov[current_iov].iov_len;
+            ++current_iov;
+        }
+        // Adjust partially-sent segment
+        if (remaining > 0 && current_iov < iov.size()) {
+            iov[current_iov].iov_base = static_cast<char*>(iov[current_iov].iov_base) + remaining;
+            iov[current_iov].iov_len -= remaining;
+        }
+    }
+    return base::Status::Ok();
 }
 
 auto TcpConnection::BusySend(std::span<const std::byte> bytes, std::chrono::milliseconds timeout) -> base::Status {

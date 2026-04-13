@@ -1,6 +1,8 @@
 #pragma once
 
+#include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace fastfix::base {
@@ -18,13 +20,29 @@ enum class ErrorCode {
 
 class Status {
   public:
-    Status() = default;
+    Status() noexcept = default;
 
     Status(ErrorCode code, std::string message)
-        : code_(code), message_(std::move(message)) {
+        : code_(code), message_(std::make_unique<std::string>(std::move(message))) {
     }
 
-    [[nodiscard]] static Status Ok() {
+    Status(const Status& other)
+        : code_(other.code_),
+          message_(other.message_ ? std::make_unique<std::string>(*other.message_) : nullptr) {
+    }
+
+    Status& operator=(const Status& other) {
+        if (this != &other) {
+            code_ = other.code_;
+            message_ = other.message_ ? std::make_unique<std::string>(*other.message_) : nullptr;
+        }
+        return *this;
+    }
+
+    Status(Status&&) noexcept = default;
+    Status& operator=(Status&&) noexcept = default;
+
+    [[nodiscard]] static Status Ok() noexcept {
         return {};
     }
 
@@ -56,25 +74,25 @@ class Status {
         return {ErrorCode::kAlreadyExists, std::move(message)};
     }
 
-    [[nodiscard]] bool ok() const {
+    [[nodiscard]] bool ok() const noexcept {
         return code_ == ErrorCode::kOk;
     }
 
-    [[nodiscard]] ErrorCode code() const {
+    [[nodiscard]] ErrorCode code() const noexcept {
         return code_;
     }
 
-    [[nodiscard]] const std::string& message() const {
-        return message_;
+    [[nodiscard]] std::string_view message() const noexcept {
+        return message_ ? std::string_view(*message_) : std::string_view();
     }
 
-    explicit operator bool() const {
+    explicit operator bool() const noexcept {
         return ok();
     }
 
   private:
     ErrorCode code_{ErrorCode::kOk};
-    std::string message_;
+    std::unique_ptr<std::string> message_;
 };
 
 }  // namespace fastfix::base

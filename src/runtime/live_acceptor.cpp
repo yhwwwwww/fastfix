@@ -1519,7 +1519,7 @@ auto LiveAcceptor::HandleProtocolEvent(
     ConnectionState& connection,
     const session::ProtocolEvent& event,
     std::uint64_t timestamp_ns) -> base::Status {
-    auto status = SendFrames(connection, event.outbound_frames, timestamp_ns);
+    auto status = SendFramesBatch(connection, event.outbound_frames, timestamp_ns);
     if (!status.ok()) {
         return status;
     }
@@ -1737,6 +1737,36 @@ auto LiveAcceptor::SendFrames(
             return status;
         }
     }
+    return base::Status::Ok();
+}
+
+auto LiveAcceptor::SendFramesBatch(
+    ConnectionState& connection,
+    const session::ProtocolFrameList& frames,
+    std::uint64_t timestamp_ns) -> base::Status {
+    if (frames.size() <= 1U) {
+        return SendFrames(connection, frames, timestamp_ns);
+    }
+
+    std::vector<std::span<const std::byte>> segments;
+    segments.reserve(frames.size());
+    for (const auto& frame : frames) {
+        auto view = frame.bytes.view();
+        if (!view.empty()) {
+            segments.push_back(view);
+        }
+    }
+
+    auto status = connection.connection.SendGather(segments, options_.io_timeout);
+    if (!status.ok()) {
+        return status;
+    }
+
+    for (const auto& frame : frames) {
+        RecordOutboundMetrics(*connection.session, frame);
+    }
+    connection.last_progress_ns = timestamp_ns;
+    last_progress_ns_.store(timestamp_ns);
     return base::Status::Ok();
 }
 
@@ -1988,11 +2018,11 @@ auto LiveAcceptor::CloseConnection(WorkerShardState& shard, std::size_t connecti
     last_progress_ns_.store(timestamp_ns);
 }
 
-auto LiveAcceptor::MarkConnectionForClose(ConnectionState& connection, std::string reason, bool count_completion)
+auto LiveAcceptor::MarkConnectionForClose(ConnectionState& connection, std::string_view reason, bool count_completion)
     -> void {
     connection.close_requested = true;
     connection.count_completion = connection.count_completion || count_completion;
-    connection.close_reason = std::move(reason);
+    connection.close_reason = std::string(reason);
 }
 
 auto LiveAcceptor::MakeStore(const CounterpartyConfig& counterparty) const

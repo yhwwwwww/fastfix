@@ -10,7 +10,7 @@
 namespace {
 
 auto PrintUsage() -> void {
-    std::cout << "usage: fastfix-dictgen --input <dictionary.ffd> [--merge <overlay.ffd> ...] --output <profile.art> [--cpp-builders <generated.hpp>]\n";
+    std::cout << "usage: fastfix-dictgen --input <dictionary.ffd> [--merge <overlay.ffd> ...] --output <profile.art> [--cpp-builders <generated.hpp>] [--cpp-readers <generated.hpp>]\n";
 }
 
 auto ResolveProjectPath(const std::filesystem::path& path) -> std::filesystem::path {
@@ -27,6 +27,7 @@ int main(int argc, char** argv) {
     std::filesystem::path input_path;
     std::filesystem::path output_path;
     std::filesystem::path builder_output_path;
+    std::filesystem::path reader_output_path;
     std::vector<std::filesystem::path> merge_paths;
 
     for (int index = 1; index < argc; ++index) {
@@ -47,6 +48,10 @@ int main(int argc, char** argv) {
             builder_output_path = argv[++index];
             continue;
         }
+        if (arg == "--cpp-readers" && index + 1 < argc) {
+            reader_output_path = argv[++index];
+            continue;
+        }
         PrintUsage();
         return 1;
     }
@@ -60,6 +65,9 @@ int main(int argc, char** argv) {
     output_path = ResolveProjectPath(output_path);
     if (!builder_output_path.empty()) {
         builder_output_path = ResolveProjectPath(builder_output_path);
+    }
+    if (!reader_output_path.empty()) {
+        reader_output_path = ResolveProjectPath(reader_output_path);
     }
     for (auto& merge_path : merge_paths) {
         merge_path = ResolveProjectPath(merge_path);
@@ -111,12 +119,23 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (!reader_output_path.empty()) {
+        const auto reader_status = fastfix::profile::WriteCppReadersHeader(reader_output_path, merged);
+        if (!reader_status.ok()) {
+            std::cerr << reader_status.message() << '\n';
+            return 1;
+        }
+    }
+
     std::cout << "generated artifact '" << output_path.string() << "' with "
               << merged.fields.size() << " fields, "
               << merged.messages.size() << " messages, and "
               << merged.groups.size() << " groups";
     if (!builder_output_path.empty()) {
         std::cout << "; generated builder header '" << builder_output_path.string() << "'";
+    }
+    if (!reader_output_path.empty()) {
+        std::cout << "; generated reader header '" << reader_output_path.string() << "'";
     }
     std::cout << '\n';
     return 0;

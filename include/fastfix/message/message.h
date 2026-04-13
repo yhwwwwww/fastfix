@@ -75,10 +75,41 @@ struct FieldValue {
 
   inline constexpr std::uint32_t kInvalidParsedIndex = std::numeric_limits<std::uint32_t>::max();
   inline constexpr std::uint16_t kInvalidHashSlot = 0xFFFFU;
-  inline constexpr std::size_t kFieldHashTableSize = 64U;
+  inline constexpr std::size_t kFieldHashTableSize = 1024U;
   inline constexpr std::size_t kParsedFieldSlotInlineCapacity = 32U;
   inline constexpr std::size_t kParsedEntryInlineCapacity = 4U;
   inline constexpr std::size_t kParsedGroupInlineCapacity = 4U;
+
+  /// Quick cache for session-critical tags. Index by QuickCacheSlot enum.
+  enum class QuickCacheSlot : std::uint8_t {
+      kBeginString = 0,   // tag 8
+      kBodyLength = 1,    // tag 9
+      kMsgType = 2,       // tag 35
+      kMsgSeqNum = 3,     // tag 34
+      kSenderCompID = 4,  // tag 49
+      kTargetCompID = 5,  // tag 56
+      kSendingTime = 6,   // tag 52
+      kCheckSum = 7,      // tag 10
+      kCount = 8
+  };
+
+  inline constexpr std::size_t kQuickCacheSize = static_cast<std::size_t>(QuickCacheSlot::kCount);
+
+  /// Returns the quick-cache slot for a session tag, or nullopt if the tag
+  /// is not one of the 8 cached session tags.
+  [[nodiscard]] inline auto QuickCacheSlotForTag(std::uint32_t tag) -> std::optional<QuickCacheSlot> {
+      switch (tag) {
+          case 8U:  return QuickCacheSlot::kBeginString;
+          case 9U:  return QuickCacheSlot::kBodyLength;
+          case 35U: return QuickCacheSlot::kMsgType;
+          case 34U: return QuickCacheSlot::kMsgSeqNum;
+          case 49U: return QuickCacheSlot::kSenderCompID;
+          case 56U: return QuickCacheSlot::kTargetCompID;
+          case 52U: return QuickCacheSlot::kSendingTime;
+          case 10U: return QuickCacheSlot::kCheckSum;
+          default:  return std::nullopt;
+      }
+  }
 
   struct ParsedFieldSlot {
     std::uint32_t tag{0};
@@ -98,6 +129,7 @@ struct FieldValue {
     std::uint32_t first_field_index{kInvalidParsedIndex};
     std::uint16_t field_count{0};
     std::uint32_t first_group{kInvalidParsedIndex};
+    std::uint32_t last_group{kInvalidParsedIndex};
     std::uint16_t group_count{0};
     std::uint32_t next_entry{kInvalidParsedIndex};
   };
@@ -105,6 +137,7 @@ struct FieldValue {
   struct ParsedGroupFrame {
     std::uint32_t count_tag{0};
     std::uint32_t first_entry{kInvalidParsedIndex};
+    std::uint32_t last_entry{kInvalidParsedIndex};
     std::uint16_t entry_count{0};
     std::uint16_t depth{0};
     std::uint32_t next_group{kInvalidParsedIndex};
@@ -117,10 +150,38 @@ struct FieldValue {
     base::InlineSplitVector<ParsedFieldSlot, kParsedFieldSlotInlineCapacity> field_slots;
     base::InlineSplitVector<ParsedEntryData, kParsedEntryInlineCapacity> entries;
     base::InlineSplitVector<ParsedGroupFrame, kParsedGroupInlineCapacity> groups;
-    std::array<std::uint16_t, kFieldHashTableSize> field_hash_table;
+    /// Direct-address lookup table for root-level fields.  For tags 0..1023
+    /// the index IS the tag number.  Each entry packs a 16-bit generation
+    /// counter (high half) and a 16-bit slot index (low half) into a uint32_t.
+    /// A lookup is valid only when the stored generation matches
+    /// `field_generation`.  Tags >= 1024 fall back to `field_hash_overflow`.
+    std::array<std::uint32_t, kFieldHashTableSize> field_hash_table{};
+    std::vector<std::uint16_t> field_hash_overflow;
+    std::uint16_t field_generation{1};
+    std::array<std::uint16_t, kQuickCacheSize> quick_cache;
 
     ParsedMessageData() {
-      field_hash_table.fill(kInvalidHashSlot);
+      // field_hash_table is zero-initialized; generation 0 in every entry
+      // won't match field_generation == 1, so no explicit fill is needed.
+      quick_cache.fill(kInvalidHashSlot);
+    }
+
+    /// Prepare for reuse without clearing the 4 KB direct-address table.
+    /// Just bumps the generation counter (and handles wrap-around).
+    auto ResetForNewDecode() -> void {
+      ++field_generation;
+      if (field_generation == 0U) {
+        // Wrapped around to 0 which matches zero-initialized entries.
+        field_hash_table.fill(0U);
+        field_generation = 1U;
+      }
+      field_hash_overflow.clear();
+      quick_cache.fill(kInvalidHashSlot);
+      msg_type = {};
+      root = {};
+      field_slots.clear();
+      entries.clear();
+      groups.clear();
     }
   };
 
@@ -477,6 +538,8 @@ class MessageView {
     [[nodiscard]] auto get_boolean(std::uint32_t tag) const -> std::optional<bool>;
     [[nodiscard]] auto group(std::uint32_t count_tag) const -> std::optional<GroupView>;
     [[nodiscard]] auto raw_group(std::uint32_t count_tag) const -> std::optional<RawGroupView>;
+    /// Check the quick cache before falling back to the full hash lookup.
+    [[nodiscard]] auto find_quick_cached(std::uint32_t tag) const -> std::optional<FieldView>;
 
   private:
     const MessageData* data_{nullptr};

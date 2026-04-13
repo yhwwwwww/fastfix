@@ -6,12 +6,14 @@ namespace fastfix::session {
 
 enum class SessionState {
     kDisconnected = 0,
+    kConnecting,
     kConnected,
     kPendingLogon,
     kRecovering,
     kActive,
     kResendProcessing,
     kAwaitingLogout,
+    kClosed,
 };
 
 struct ResendRange {

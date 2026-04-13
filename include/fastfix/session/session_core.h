@@ -56,7 +56,9 @@ class SessionCore {
         return state_;
     }
 
+    auto BeginConnect() -> base::Status;
     auto OnTransportConnected() -> base::Status;
+    auto Close() -> base::Status;
     auto BeginRecovery() -> base::Status;
     auto FinishRecovery() -> base::Status;
     auto BeginLogon() -> base::Status;
@@ -101,6 +103,16 @@ class SessionCore {
         return pending_resend_;
     }
 
+    /// Returns true (once) after resend processing completes, allowing AdminProtocol
+    /// to know when to take post-resend actions. Consumes the flag.
+    [[nodiscard]] auto ConsumeResendCompleted() -> bool {
+        if (resend_completed_) {
+            resend_completed_ = false;
+            return true;
+        }
+        return false;
+    }
+
     [[nodiscard]] auto Snapshot() const -> SessionSnapshot;
     [[nodiscard]] auto handle(std::uint32_t worker_id) const -> SessionHandle;
 
@@ -113,6 +125,7 @@ class SessionCore {
     std::uint64_t last_inbound_ns_{0};
     std::uint64_t last_outbound_ns_{0};
     std::optional<ResendRange> pending_resend_{};
+    bool resend_completed_{false};
     DayCutConfig day_cut_config_{};
     std::int32_t last_day_cut_date_{-1};  // Julian-style day number to avoid re-triggering
     const TransportSessionProfile* transport_profile_{nullptr};

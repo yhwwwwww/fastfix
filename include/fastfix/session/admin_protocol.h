@@ -16,6 +16,7 @@
 
 #include "fastfix/base/result.h"
 #include "fastfix/codec/compiled_decoder.h"
+#include "fastfix/session/encoded_frame.h"
 #include "fastfix/codec/fix_codec.h"
 #include "fastfix/message/message.h"
 #include "fastfix/profile/normalized_dictionary.h"
@@ -25,51 +26,6 @@
 #include "fastfix/store/session_store.h"
 
 namespace fastfix::session {
-
-inline constexpr std::size_t kEncodedFrameInlineCapacity = 768U;
-
-struct EncodedFrameBytes {
-    std::array<std::byte, kEncodedFrameInlineCapacity> inline_storage{};
-    std::size_t inline_size{0U};
-    std::vector<std::byte> overflow_storage;
-
-    auto assign(std::span<const std::byte> bytes) -> void {
-        if (bytes.size() <= kEncodedFrameInlineCapacity) {
-            inline_size = bytes.size();
-            overflow_storage.clear();
-            std::copy(bytes.begin(), bytes.end(), inline_storage.begin());
-            return;
-        }
-
-        inline_size = 0U;
-        overflow_storage.assign(bytes.begin(), bytes.end());
-    }
-
-    [[nodiscard]] auto view() const -> std::span<const std::byte> {
-        if (!overflow_storage.empty()) {
-            return std::span<const std::byte>(overflow_storage.data(), overflow_storage.size());
-        }
-        return std::span<const std::byte>(inline_storage.data(), inline_size);
-    }
-
-    [[nodiscard]] auto size() const -> std::size_t {
-        return overflow_storage.empty() ? inline_size : overflow_storage.size();
-    }
-
-    [[nodiscard]] auto empty() const -> bool {
-        return size() == 0U;
-    }
-
-    operator std::span<const std::byte>() const {
-        return view();
-    }
-};
-
-struct EncodedFrame {
-    EncodedFrameBytes bytes;
-    std::string msg_type;
-    bool admin{false};
-};
 
 inline constexpr std::size_t kProtocolEventOutboundFrameInlineCapacity = 4U;
 using ProtocolFrameList = base::InlineSplitVector<EncodedFrame, kProtocolEventOutboundFrameInlineCapacity>;
@@ -591,7 +547,7 @@ class AdminProtocol {
         const codec::DecodedMessageView& decoded,
         std::uint32_t ref_tag_id,
         std::uint32_t reject_reason,
-        std::string text,
+        std::string_view text,
         std::uint64_t timestamp_ns,
         bool disconnect) -> base::Result<ProtocolEvent>;
     auto ValidateCompIds(
@@ -620,6 +576,8 @@ class AdminProtocol {
     SessionCore session_;
     std::string outstanding_test_request_id_;
     bool logout_sent_{false};
+    std::uint64_t test_request_sent_ns_{0};
+    std::uint64_t logout_sent_ns_{0};
     std::optional<base::Status> initialization_error_;
     codec::PrecompiledTemplateTable encode_templates_;
     codec::CompiledDecoderTable decode_table_;

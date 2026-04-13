@@ -17,8 +17,8 @@ namespace {
 
 auto PrintUsage() -> void {
     std::cerr << "usage:\n"
-              << "  fastfix-xml2ffd --xml <FIX44.xml> --output <output.ffd> --profile-id <uint64> [--cpp-builders <output.h>]\n"
-              << "  fastfix-xml2ffd --input <baseline.ffd> [--input <overlay.ffd> ...] --cpp-builders <output.h>\n";
+              << "  fastfix-xml2ffd --xml <FIX44.xml> --output <output.ffd> --profile-id <uint64> [--cpp-builders <output.h>] [--cpp-readers <output.h>]\n"
+              << "  fastfix-xml2ffd --input <baseline.ffd> [--input <overlay.ffd> ...] --cpp-builders <output.h> [--cpp-readers <output.h>]\n";
 }
 
 auto ResolveProjectPath(const std::filesystem::path& path) -> std::filesystem::path {
@@ -45,6 +45,7 @@ int main(int argc, char** argv) {
     std::filesystem::path xml_path;
     std::filesystem::path output_path;
     std::filesystem::path builder_output_path;
+    std::filesystem::path reader_output_path;
     std::vector<std::filesystem::path> input_paths;
     std::uint64_t profile_id = 0;
 
@@ -70,6 +71,10 @@ int main(int argc, char** argv) {
             builder_output_path = argv[++index];
             continue;
         }
+        if (arg == "--cpp-readers" && index + 1 < argc) {
+            reader_output_path = argv[++index];
+            continue;
+        }
         PrintUsage();
         return 1;
     }
@@ -93,8 +98,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (input_mode && builder_output_path.empty()) {
-        std::cerr << "error: --input mode requires --cpp-builders\n";
+    if (input_mode && builder_output_path.empty() && reader_output_path.empty()) {
+        std::cerr << "error: --input mode requires --cpp-builders or --cpp-readers\n";
         return 1;
     }
 
@@ -126,12 +131,11 @@ int main(int argc, char** argv) {
         std::cout << "generated dictionary '" << output_path.string() << "'\n";
     }
 
-    // Phase 2: Generate C++ header (if requested)
-    if (!builder_output_path.empty()) {
-        builder_output_path = ResolveProjectPath(builder_output_path);
+    // Phase 2: Build normalized dictionary (if codegen is requested)
+    fastfix::profile::NormalizedDictionary dictionary;
+    const bool need_dictionary = !builder_output_path.empty() || !reader_output_path.empty();
 
-        fastfix::profile::NormalizedDictionary dictionary;
-
+    if (need_dictionary) {
         if (xml_mode) {
             // Use the .ffd text we just generated
             auto parsed = fastfix::profile::LoadNormalizedDictionaryText(ffd_text);
@@ -167,6 +171,11 @@ int main(int argc, char** argv) {
                 dictionary = std::move(merged).value();
             }
         }
+    }
+
+    // Phase 3: Generate C++ builder header (if requested)
+    if (!builder_output_path.empty()) {
+        builder_output_path = ResolveProjectPath(builder_output_path);
 
         if (const auto parent = builder_output_path.parent_path(); !parent.empty()) {
             std::filesystem::create_directories(parent);
@@ -178,6 +187,22 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cout << "generated builder header '" << builder_output_path.string() << "'\n";
+    }
+
+    // Phase 4: Generate C++ reader header (if requested)
+    if (!reader_output_path.empty()) {
+        reader_output_path = ResolveProjectPath(reader_output_path);
+
+        if (const auto parent = reader_output_path.parent_path(); !parent.empty()) {
+            std::filesystem::create_directories(parent);
+        }
+
+        const auto status = fastfix::profile::WriteCppReadersHeader(reader_output_path, dictionary);
+        if (!status.ok()) {
+            std::cerr << "error: " << status.message() << '\n';
+            return 1;
+        }
+        std::cout << "generated reader header '" << reader_output_path.string() << "'\n";
     }
 
     return 0;

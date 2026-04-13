@@ -62,7 +62,7 @@ class DurableBatchSessionStore : public SessionStore {
 
     std::filesystem::path root_;
     DurableBatchStoreOptions options_;
-    std::unique_ptr<Impl> impl_;
+    mutable std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace fastfix::store

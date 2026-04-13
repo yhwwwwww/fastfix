@@ -47,6 +47,9 @@ class MemorySessionStore : public SessionStore {
     auto LoadRecoveryState(std::uint64_t session_id) const
         -> base::Result<SessionRecoveryState> override;
 
+    /// Compact payload arenas by rebuilding with only live payloads.
+    auto Rollover() -> base::Status override;
+
   private:
     static constexpr std::size_t kInitialRecordCapacity = 128U;
     static constexpr std::size_t kInitialPayloadArenaBytes = 16U * 1024U;

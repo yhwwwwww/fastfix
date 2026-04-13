@@ -50,6 +50,9 @@ struct FieldDefRecord {
     std::uint32_t name_offset;
     std::uint32_t value_type;
     std::uint32_t flags;
+    std::uint32_t enum_offset;    // index into EnumValueRecord section
+    std::uint16_t enum_count;
+    std::uint16_t reserved0;
 };
 
 struct FieldRuleRecord {
@@ -97,9 +100,15 @@ struct TemplateDescriptorEntry {
     std::uint32_t first_field_rule_index;
     std::uint32_t flags;
 };
+
+struct EnumValueRecord {
+    std::uint32_t field_tag;
+    std::uint32_t value_offset;   // string table offset for enum value
+    std::uint32_t name_offset;    // string table offset for description
+};
 #pragma pack(pop)
 
-static_assert(sizeof(FieldDefRecord) == 16);
+static_assert(sizeof(FieldDefRecord) == 24);
 static_assert(sizeof(FieldRuleRecord) == 8);
 static_assert(sizeof(MessageDefRecord) == 24);
 static_assert(sizeof(GroupDefRecord) == 32);
@@ -107,12 +116,19 @@ static_assert(sizeof(AdminRuleEntry) == 8);
 static_assert(sizeof(ValidationRuleEntry) == 12);
 static_assert(sizeof(LookupTableEntry) == 4);
 static_assert(sizeof(TemplateDescriptorEntry) == 16);
+static_assert(sizeof(EnumValueRecord) == 12);
+
+struct EnumEntry {
+    std::string value;  // The enum value (e.g., "1", "2", "B")
+    std::string name;   // The description/name (e.g., "BUY", "SELL")
+};
 
 struct FieldDef {
     std::uint32_t tag{0};
     std::string name;
     ValueType value_type{ValueType::kUnknown};
     std::uint32_t flags{0};
+    std::vector<EnumEntry> enum_values;
 };
 
 struct FieldRule {
@@ -217,6 +233,18 @@ class NormalizedDictionaryView {
     [[nodiscard]] auto message_field_rules(const MessageDefRecord& record) const -> std::span<const FieldRuleRecord>;
     [[nodiscard]] auto group_field_rules(const GroupDefRecord& record) const -> std::span<const FieldRuleRecord>;
 
+    [[nodiscard]] auto header_field_rules() const -> std::span<const FieldRuleRecord> {
+        return header_field_rules_.entries();
+    }
+
+    [[nodiscard]] auto trailer_field_rules() const -> std::span<const FieldRuleRecord> {
+        return trailer_field_rules_.entries();
+    }
+
+    [[nodiscard]] auto enum_values() const -> std::span<const EnumValueRecord> {
+        return enum_values_.entries();
+    }
+
   private:
     struct TagIndexEntry {
         std::uint32_t key;
@@ -241,6 +269,9 @@ class NormalizedDictionaryView {
     FixedSectionView<GroupDefRecord> group_defs_;
     FixedSectionView<FieldRuleRecord> message_field_rules_;
     FixedSectionView<FieldRuleRecord> group_field_rules_;
+    FixedSectionView<FieldRuleRecord> header_field_rules_;
+    FixedSectionView<FieldRuleRecord> trailer_field_rules_;
+    FixedSectionView<EnumValueRecord> enum_values_;
 
     std::vector<TagIndexEntry> field_index_;
     std::vector<TagIndexEntry> group_index_;

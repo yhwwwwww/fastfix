@@ -60,4 +60,38 @@ inline auto FindByte(const std::byte* data, std::size_t len, std::byte needle) -
 #endif
 }
 
+/// Dual-target SIMD scan: finds the first occurrence of either byte a or byte b.
+/// Returns a pointer to the first match, or data + len if neither is found.
+/// The caller can inspect which byte was found by comparing *result == a or *result == b.
+inline auto FindEitherByte(const std::byte* data, std::size_t len, std::byte a, std::byte b) -> const std::byte* {
+#if FASTFIX_HAS_SSE2
+    const auto target_a = _mm_set1_epi8(static_cast<char>(a));
+    const auto target_b = _mm_set1_epi8(static_cast<char>(b));
+    std::size_t i = 0;
+    for (; i + 16 <= len; i += 16) {
+        auto chunk = _mm_loadu_si128(reinterpret_cast<const __m128i_u*>(data + i));
+        auto cmp_a = _mm_cmpeq_epi8(chunk, target_a);
+        auto cmp_b = _mm_cmpeq_epi8(chunk, target_b);
+        int mask = _mm_movemask_epi8(_mm_or_si128(cmp_a, cmp_b));
+        if (mask != 0) {
+            return data + i + __builtin_ctz(static_cast<unsigned>(mask));
+        }
+    }
+    // Scalar tail
+    for (; i < len; ++i) {
+        if (data[i] == a || data[i] == b) {
+            return data + i;
+        }
+    }
+    return data + len;
+#else
+    for (std::size_t i = 0; i < len; ++i) {
+        if (data[i] == a || data[i] == b) {
+            return data + i;
+        }
+    }
+    return data + len;
+#endif
+}
+
 }  // namespace fastfix::codec

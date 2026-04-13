@@ -30,6 +30,7 @@ enum class SectionKind : std::uint32_t {
     kGroupFieldRules = 10,
     kHeaderFieldRules = 11,
     kTrailerFieldRules = 12,
+    kEnumValues = 13,
 };
 
 enum class ArtifactFlags : std::uint32_t {

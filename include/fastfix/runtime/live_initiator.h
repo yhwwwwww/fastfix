@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -165,6 +166,10 @@ class LiveInitiator {
         ConnectionState& connection,
         const session::ProtocolFrameList& frames,
         std::uint64_t timestamp_ns) -> base::Status;
+    auto SendFramesBatch(
+        ConnectionState& connection,
+        const session::ProtocolFrameList& frames,
+        std::uint64_t timestamp_ns) -> base::Status;
     auto LoadSessionSnapshot(std::uint64_t session_id) const -> base::Result<session::SessionSnapshot>;
     auto RegisterSessionSubscriber(std::uint64_t session_id, std::size_t queue_capacity)
         -> base::Result<session::SessionSubscription>;
@@ -178,7 +183,7 @@ class LiveInitiator {
     auto FindConnectionById(WorkerShardState& shard, std::uint64_t connection_id) -> ConnectionState*;
     auto FindConnectionBySessionId(WorkerShardState& shard, std::uint64_t session_id) -> ConnectionState*;
     auto CloseConnection(WorkerShardState& shard, std::size_t connection_index, std::uint64_t timestamp_ns) -> void;
-    auto MarkConnectionForClose(ConnectionState& connection, std::string reason, bool count_completion) -> void;
+    auto MarkConnectionForClose(ConnectionState& connection, std::string_view reason, bool count_completion) -> void;
     auto EnsureManagedQueueRunnerStarted() -> base::Status;
     auto StopManagedQueueRunner() -> base::Status;
     auto ResetWorkerShards(std::uint32_t worker_count) -> base::Status;

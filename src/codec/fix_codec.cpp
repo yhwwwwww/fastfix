@@ -419,23 +419,25 @@ auto FindParsedFieldIndex(
     const message::ParsedMessageData& parsed,
     ParsedContainerRef container,
     std::uint32_t tag) -> std::uint32_t {
-    const auto& entry = ResolveContainer(parsed, container);
     if (container.root) {
-        // Use hash table for root
-        auto probe = static_cast<std::uint16_t>(tag % message::kFieldHashTableSize);
-        for (std::size_t i = 0; i < message::kFieldHashTableSize; ++i) {
-            const auto slot_index = parsed.field_hash_table[probe];
-            if (slot_index == message::kInvalidHashSlot) {
-                return message::kInvalidParsedIndex;
+        if (tag < message::kFieldHashTableSize) {
+            const auto packed = parsed.field_hash_table[tag];
+            const auto gen = static_cast<std::uint16_t>(packed >> 16U);
+            if (gen == parsed.field_generation) {
+                return packed & 0xFFFFU;
             }
-            if (parsed.field_slots[slot_index].tag == tag) {
-                return static_cast<std::uint32_t>(slot_index);
+            return message::kInvalidParsedIndex;
+        }
+        // Overflow scan for tags >= 1024.
+        for (std::size_t i = 0; i + 1U < parsed.field_hash_overflow.size(); i += 2U) {
+            if (parsed.field_hash_overflow[i] == static_cast<std::uint16_t>(tag)) {
+                return static_cast<std::uint32_t>(parsed.field_hash_overflow[i + 1U]);
             }
-            probe = static_cast<std::uint16_t>((probe + 1U) % message::kFieldHashTableSize);
         }
         return message::kInvalidParsedIndex;
     }
     // For group entries, linear scan over contiguous range
+    const auto& entry = ResolveContainer(parsed, container);
     if (entry.first_field_index == message::kInvalidParsedIndex || entry.field_count == 0U) {
         return message::kInvalidParsedIndex;
     }
@@ -452,13 +454,14 @@ auto InsertIntoRootHashTable(
     message::ParsedMessageData* parsed,
     std::uint32_t slot_index) -> void {
     const auto tag = parsed->field_slots[slot_index].tag;
-    auto probe = static_cast<std::uint16_t>(tag % message::kFieldHashTableSize);
-    for (std::size_t i = 0; i < message::kFieldHashTableSize; ++i) {
-        if (parsed->field_hash_table[probe] == message::kInvalidHashSlot) {
-            parsed->field_hash_table[probe] = static_cast<std::uint16_t>(slot_index);
-            return;
-        }
-        probe = static_cast<std::uint16_t>((probe + 1U) % message::kFieldHashTableSize);
+    if (tag < message::kFieldHashTableSize) {
+        parsed->field_hash_table[tag] =
+            (static_cast<std::uint32_t>(parsed->field_generation) << 16U) |
+            (slot_index & 0xFFFFU);
+    } else {
+        // Overflow: store tag (uint16) then slot_index (uint16).
+        parsed->field_hash_overflow.push_back(static_cast<std::uint16_t>(tag));
+        parsed->field_hash_overflow.push_back(static_cast<std::uint16_t>(slot_index));
     }
 }
 
@@ -483,6 +486,11 @@ auto AppendParsedFieldSlot(
 
     if (container.root) {
         InsertIntoRootHashTable(parsed, new_index);
+        // Populate quick cache for session-critical tags.
+        const auto qc_slot = message::QuickCacheSlotForTag(slot.tag);
+        if (qc_slot.has_value()) {
+            parsed->quick_cache[static_cast<std::size_t>(*qc_slot)] = static_cast<std::uint16_t>(new_index);
+        }
     }
     return false;
 }
@@ -541,6 +549,7 @@ auto EnsureParsedGroup(
     parsed->groups.push_back(message::ParsedGroupFrame{
         .count_tag = count_tag,
         .first_entry = message::kInvalidParsedIndex,
+        .last_entry = message::kInvalidParsedIndex,
         .entry_count = 0U,
         .depth = depth,
         .next_group = message::kInvalidParsedIndex,
@@ -550,12 +559,9 @@ auto EnsureParsedGroup(
     if (entry.first_group == message::kInvalidParsedIndex) {
         entry.first_group = new_index;
     } else {
-        auto tail = entry.first_group;
-        while (parsed->groups[tail].next_group != message::kInvalidParsedIndex) {
-            tail = parsed->groups[tail].next_group;
-        }
-        parsed->groups[tail].next_group = new_index;
+        parsed->groups[entry.last_group].next_group = new_index;
     }
+    entry.last_group = new_index;
     ++entry.group_count;
     return new_index;
 }
@@ -568,13 +574,9 @@ auto AppendParsedEntry(message::ParsedMessageData* parsed, std::uint32_t group_i
     if (group.first_entry == message::kInvalidParsedIndex) {
         group.first_entry = new_index;
     } else {
-        // Walk the linked list to find the last entry.
-        auto tail = group.first_entry;
-        while (parsed->entries[tail].next_entry != message::kInvalidParsedIndex) {
-            tail = parsed->entries[tail].next_entry;
-        }
-        parsed->entries[tail].next_entry = new_index;
+        parsed->entries[group.last_entry].next_entry = new_index;
     }
+    group.last_entry = new_index;
     ++group.entry_count;
     return new_index;
 }
@@ -761,13 +763,33 @@ auto MakeFixedFieldFragment(std::uint32_t tag, std::string_view value, char deli
     return fragment;
 }
 
+auto ComputeChecksumSIMD(const char* data, std::size_t len) -> std::uint32_t {
+    std::uint32_t sum = 0;
+#if FASTFIX_HAS_SSE2
+    const auto zero = _mm_setzero_si128();
+    std::size_t i = 0;
+    for (; i + 16 <= len; i += 16) {
+        auto chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + i));
+        auto sad = _mm_sad_epu8(chunk, zero);
+        sum += static_cast<std::uint32_t>(_mm_extract_epi16(sad, 0)) +
+               static_cast<std::uint32_t>(_mm_extract_epi16(sad, 4));
+    }
+    for (; i < len; ++i) {
+        sum += static_cast<unsigned char>(data[i]);
+    }
+#else
+    for (std::size_t i = 0; i < len; ++i) {
+        sum += static_cast<unsigned char>(data[i]);
+    }
+#endif
+    return sum;
+}
+
 auto AccumulateChecksum(std::string_view text, std::uint32_t* checksum) -> void {
     if (checksum == nullptr) {
         return;
     }
-    for (const auto ch : text) {
-        *checksum += static_cast<unsigned char>(ch);
-    }
+    *checksum += ComputeChecksumSIMD(text.data(), text.size());
 }
 
 auto AccumulateAppendedRange(const std::string& out, std::size_t start_offset, std::uint32_t* checksum) -> void {
@@ -1456,12 +1478,8 @@ auto EncodeFixMessageGenericToBuffer(
                      bl_buf.data(), digits);
     }
 
-    // Compute checksum over entire buffer so far (same approach as post-hoc scan)
-    std::uint32_t checksum = 0;
-    for (const auto ch : full) {
-        checksum += static_cast<unsigned char>(ch);
-    }
-    checksum %= 256U;
+    // Compute checksum over entire buffer using SIMD-accelerated path
+    std::uint32_t checksum = ComputeChecksumSIMD(full.data(), full.size()) % 256U;
 
     // Append 10=XXX<SOH> without ostringstream
     std::array<char, 3> cksum_digits{};
@@ -1904,28 +1922,29 @@ auto DecodeFixMessageView(
             byte_pos = scanned.value().next_pos;
             continue;
         }
-        if (tag == 34U) {
-            auto parsed = ParseUnsigned(value_sv, "MsgSeqNum");
-            if (!parsed.ok()) {
-                return parsed.status();
+        switch (tag) {
+            case 34U: {
+                auto parsed = ParseUnsigned(value_sv, "MsgSeqNum");
+                if (!parsed.ok()) {
+                    return parsed.status();
+                }
+                header.msg_seq_num = parsed.value();
+                break;
             }
-            header.msg_seq_num = parsed.value();
-        } else if (tag == 49U) {
-            header.sender_comp_id = value_sv;
-        } else if (tag == 56U) {
-            header.target_comp_id = value_sv;
-        } else if (tag == 52U) {
-            header.sending_time = value_sv;
-        } else if (tag == 122U) {
-            header.orig_sending_time = value_sv;
-        } else if (tag == 1137U) {
-            header.default_appl_ver_id = value_sv;
-        } else if (tag == 43U) {
-            auto parsed = ParseBoolean(value_sv, "PossDupFlag");
-            if (!parsed.ok()) {
-                return parsed.status();
+            case 49U: header.sender_comp_id = value_sv; break;
+            case 56U: header.target_comp_id = value_sv; break;
+            case 52U: header.sending_time = value_sv; break;
+            case 122U: header.orig_sending_time = value_sv; break;
+            case 1137U: header.default_appl_ver_id = value_sv; break;
+            case 43U: {
+                auto parsed = ParseBoolean(value_sv, "PossDupFlag");
+                if (!parsed.ok()) {
+                    return parsed.status();
+                }
+                header.poss_dup = parsed.value();
+                break;
             }
-            header.poss_dup = parsed.value();
+            default: break;
         }
 
         // Single find_field per field — used for both validation and type resolution.
@@ -2133,28 +2152,29 @@ auto DecodeFixMessageView(
         }
 
         // Header field extraction — same for both paths.
-        if (tag == 34U) {
-            auto parsed = ParseUnsigned(value_sv, "MsgSeqNum");
-            if (!parsed.ok()) {
-                return parsed.status();
+        switch (tag) {
+            case 34U: {
+                auto parsed = ParseUnsigned(value_sv, "MsgSeqNum");
+                if (!parsed.ok()) {
+                    return parsed.status();
+                }
+                header.msg_seq_num = parsed.value();
+                break;
             }
-            header.msg_seq_num = parsed.value();
-        } else if (tag == 49U) {
-            header.sender_comp_id = value_sv;
-        } else if (tag == 56U) {
-            header.target_comp_id = value_sv;
-        } else if (tag == 52U) {
-            header.sending_time = value_sv;
-        } else if (tag == 122U) {
-            header.orig_sending_time = value_sv;
-        } else if (tag == 1137U) {
-            header.default_appl_ver_id = value_sv;
-        } else if (tag == 43U) {
-            auto parsed = ParseBoolean(value_sv, "PossDupFlag");
-            if (!parsed.ok()) {
-                return parsed.status();
+            case 49U: header.sender_comp_id = value_sv; break;
+            case 56U: header.target_comp_id = value_sv; break;
+            case 52U: header.sending_time = value_sv; break;
+            case 122U: header.orig_sending_time = value_sv; break;
+            case 1137U: header.default_appl_ver_id = value_sv; break;
+            case 43U: {
+                auto parsed = ParseBoolean(value_sv, "PossDupFlag");
+                if (!parsed.ok()) {
+                    return parsed.status();
+                }
+                header.poss_dup = parsed.value();
+                break;
             }
-            header.poss_dup = parsed.value();
+            default: break;
         }
 
         // ---- FAST PATH: compiled decoder available ----
@@ -2170,7 +2190,7 @@ auto DecodeFixMessageView(
                         &validation_issue,
                         ValidationIssueKind::kDuplicateField,
                         tag,
-                        "field " + std::to_string(tag) + " appears more than once");
+                        std::string{});
                 }
                 byte_pos = scanned.value().next_pos;
                 continue;

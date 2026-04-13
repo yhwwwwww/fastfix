@@ -30,6 +30,7 @@ struct FieldInfo {
     std::uint32_t tag{0};
     std::string name;
     std::string ffd_type;
+    std::vector<std::pair<std::string, std::string>> enum_values;
 };
 
 struct FieldRuleEntry {
@@ -156,6 +157,11 @@ auto ConvertXmlToFfd(const std::string& xml_content, std::uint64_t profile_id) -
         info.name = field.attribute("name").as_string();
         const std::string xml_type = field.attribute("type").as_string();
         info.ffd_type = MapXmlType(xml_type);
+        for (const auto& value_node : field.children("value")) {
+            info.enum_values.emplace_back(
+                value_node.attribute("enum").as_string(),
+                value_node.attribute("description").as_string());
+        }
         field_map[info.name] = info;
     }
 
@@ -236,6 +242,9 @@ auto ConvertXmlToFfd(const std::string& xml_content, std::uint64_t profile_id) -
 
     for (const auto& field : sorted_fields) {
         body << "field|" << field.tag << '|' << field.name << '|' << field.ffd_type << "|0\n";
+        for (const auto& [ev, desc] : field.enum_values) {
+            body << "enum|" << field.tag << '|' << ev << '|' << desc << '\n';
+        }
     }
     body << '\n';
 

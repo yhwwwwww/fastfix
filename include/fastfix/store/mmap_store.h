@@ -51,7 +51,7 @@ class MmapSessionStore : public SessionStore {
 
     std::filesystem::path path_;
     SyncPolicy sync_policy_;
-    std::unique_ptr<Impl> impl_;
+    mutable std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace fastfix::store

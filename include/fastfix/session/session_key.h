@@ -12,6 +12,8 @@ struct SessionKey {
     std::string target_comp_id;
     std::optional<std::string> sender_sub_id;
     std::optional<std::string> target_sub_id;
+    std::optional<std::string> sender_location_id;
+    std::optional<std::string> target_location_id;
     std::optional<std::string> session_qualifier;
 
     auto operator==(const SessionKey& other) const -> bool = default;
