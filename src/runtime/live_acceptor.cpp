@@ -15,6 +15,7 @@
 #include <sys/epoll.h>
 #include <unistd.h>
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/base/spsc_queue.h"
 #include "fastfix/runtime/thread_affinity.h"
 #include "fastfix/store/durable_batch_store.h"
@@ -1716,7 +1717,7 @@ auto LiveAcceptor::DispatchAppMessage(
         .message = inline_mode ? message::MessageRef(message) : owned_message,
         .text = {},
         .timestamp_ns = timestamp_ns,
-        .poss_resend = message.get_boolean(97U).value_or(false),
+        .poss_resend = message.get_boolean(codec::tags::kPossResend).value_or(false),
     };
     base::Status status;
     auto* worker_shard = FindWorkerShard(connection.session->worker_id);

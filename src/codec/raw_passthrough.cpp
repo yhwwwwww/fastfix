@@ -1,5 +1,6 @@
 #include "fastfix/codec/raw_passthrough.h"
 #include "fastfix/codec/fast_int_format.h"
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/codec/simd_scan.h"
 
 #include <array>
@@ -10,6 +11,8 @@
 namespace fastfix::codec {
 
 namespace {
+
+using namespace fastfix::codec::tags;
 
 inline constexpr std::size_t kBodyLengthPlaceholderWidth = 7U;
 
@@ -74,15 +77,7 @@ auto ScanField(std::span<const std::byte> data, std::size_t pos, std::byte delim
 // Session-layer header tags — used to determine where raw_body begins.
 // Matches CompiledMessageDecoder::is_header_tag() plus framing tags.
 auto IsSessionHeaderTag(std::uint32_t tag) -> bool {
-    switch (tag) {
-        case 8U: case 9U: case 10U:           // frame structure
-        case 34U: case 35U: case 43U:         // SeqNum, MsgType, PossDupFlag
-        case 49U: case 52U: case 56U:         // Sender, SendingTime, Target
-        case 97U: case 122U: case 1137U:      // PossResend, OrigSendingTime, DefaultApplVerID
-            return true;
-        default:
-            return false;
-    }
+    return IsSessionEnvelopeTag(tag);
 }
 
 }  // namespace
@@ -99,14 +94,14 @@ auto DecodeRawPassThrough(
 
     // Field 0: must be tag 8 (BeginString)
     auto f = ScanField(data, 0, delim);
-    if (f.tag != 8U) {
+    if (f.tag != kBeginString) {
         return base::Status::FormatError("FIX frame must begin with tag 8");
     }
     view.begin_string = ValueView(data, f.value_offset, f.value_length);
 
     // Field 1: must be tag 9 (BodyLength)
     f = ScanField(data, f.next_pos, delim);
-    if (f.tag != 9U) {
+    if (f.tag != kBodyLength) {
         return base::Status::FormatError("FIX frame must have tag 9 after tag 8");
     }
     const auto declared_body_length = ParseUint32(ValueView(data, f.value_offset, f.value_length));
@@ -161,11 +156,11 @@ auto DecodeRawPassThrough(
 
         const auto val = ValueView(data, f.value_offset, f.value_length);
         switch (f.tag) {
-            case 35U: view.msg_type = val; break;
-            case 34U: view.msg_seq_num = ParseUint32(val); break;
-            case 49U: view.sender_comp_id = val; break;
-            case 56U: view.target_comp_id = val; break;
-            case 52U: view.sending_time = val; break;
+            case kMsgType: view.msg_type = val; break;
+            case kMsgSeqNum: view.msg_seq_num = ParseUint32(val); break;
+            case kSenderCompID: view.sender_comp_id = val; break;
+            case kTargetCompID: view.target_comp_id = val; break;
+            case kSendingTime: view.sending_time = val; break;
             default: break;
         }
         last_header_end = f.next_pos;
@@ -201,29 +196,29 @@ auto EncodeForwarded(
     const auto begin_string = options.begin_string.empty()
         ? inbound.begin_string
         : options.begin_string;
-    out.append("8=");
+    out.append(kBeginStringPrefix);
     out.append(begin_string);
     out.push_back(soh);
 
     // 2. Write 9= + placeholder + SOH
-    out.append("9=");
+    out.append(kBodyLengthPrefix);
     const auto body_length_offset = out.size();
     out.append(kBodyLengthPlaceholderWidth, '0');
     out.push_back(soh);
     const auto body_start = out.size();
 
     // 3. Write 35=<msg_type>SOH
-    out.append("35=");
+    out.append(kMsgTypePrefix);
     out.append(inbound.msg_type);
     out.push_back(soh);
 
     // 4. Write 49=<sender>SOH
-    out.append("49=");
+    out.append(kSenderCompIDPrefix);
     out.append(options.sender_comp_id);
     out.push_back(soh);
 
     // 5. Write 56=<target>SOH
-    out.append("56=");
+    out.append(kTargetCompIDPrefix);
     out.append(options.target_comp_id);
     out.push_back(soh);
 
@@ -231,39 +226,39 @@ auto EncodeForwarded(
     {
         char buf[10];
         const auto len = FormatUint32(buf, options.msg_seq_num);
-        out.append("34=");
+        out.append(kMsgSeqNumPrefix);
         out.append(buf, len);
         out.push_back(soh);
     }
 
     // 7. Write 52=<sending_time>SOH
-    out.append("52=");
+    out.append(kSendingTimePrefix);
     out.append(options.sending_time);
     out.push_back(soh);
 
     // 8. Optional: 43=Y SOH (PossDupFlag)
     if (options.poss_dup) {
-        out.append("43=Y");
+        out.append(kPossDupFlagYesField);
         out.push_back(soh);
     }
 
     // 9. Optional: 122=<orig_sending_time>SOH
     if (!options.orig_sending_time.empty()) {
-        out.append("122=");
+        out.append(kOrigSendingTimePrefix);
         out.append(options.orig_sending_time);
         out.push_back(soh);
     }
 
     // 10. Optional: 115=<on_behalf_of_comp_id>SOH
     if (!options.on_behalf_of_comp_id.empty()) {
-        out.append("115=");
+        out.append(kOnBehalfOfCompIDPrefix);
         out.append(options.on_behalf_of_comp_id);
         out.push_back(soh);
     }
 
     // 9. Optional: 128=<deliver_to_comp_id>SOH
     if (!options.deliver_to_comp_id.empty()) {
-        out.append("128=");
+        out.append(kDeliverToCompIDPrefix);
         out.append(options.deliver_to_comp_id);
         out.push_back(soh);
     }
@@ -296,7 +291,7 @@ auto EncodeForwarded(
     cksum[0] = static_cast<char>('0' + ((checksum / 100U) % 10U));
     cksum[1] = static_cast<char>('0' + ((checksum / 10U) % 10U));
     cksum[2] = static_cast<char>('0' + (checksum % 10U));
-    out.append("10=");
+    out.append(kCheckSumPrefix);
     out.append(cksum.data(), 3);
     out.push_back(soh);
 
@@ -324,29 +319,29 @@ auto EncodeReplay(
     const auto begin_string = options.begin_string.empty()
         ? stored.begin_string
         : options.begin_string;
-    out.append("8=");
+    out.append(kBeginStringPrefix);
     out.append(begin_string);
     out.push_back(soh);
 
     // 2. 9=<placeholder>SOH
-    out.append("9=");
+    out.append(kBodyLengthPrefix);
     const auto body_length_offset = out.size();
     out.append(kBodyLengthPlaceholderWidth, '0');
     out.push_back(soh);
     const auto body_start = out.size();
 
     // 3. 35=<msg_type>SOH
-    out.append("35=");
+    out.append(kMsgTypePrefix);
     out.append(stored.msg_type);
     out.push_back(soh);
 
     // 4. 49=<sender>SOH
-    out.append("49=");
+    out.append(kSenderCompIDPrefix);
     out.append(options.sender_comp_id);
     out.push_back(soh);
 
     // 5. 56=<target>SOH
-    out.append("56=");
+    out.append(kTargetCompIDPrefix);
     out.append(options.target_comp_id);
     out.push_back(soh);
 
@@ -354,30 +349,30 @@ auto EncodeReplay(
     {
         char buf[10];
         const auto len = FormatUint32(buf, options.msg_seq_num);
-        out.append("34=");
+        out.append(kMsgSeqNumPrefix);
         out.append(buf, len);
         out.push_back(soh);
     }
 
     // 7. 52=<sending_time>SOH
-    out.append("52=");
+    out.append(kSendingTimePrefix);
     out.append(options.sending_time);
     out.push_back(soh);
 
     // 8. 43=Y SOH (always set for replay)
-    out.append("43=Y");
+    out.append(kPossDupFlagYesField);
     out.push_back(soh);
 
     // 9. 122=<orig_sending_time>SOH
     if (!options.orig_sending_time.empty()) {
-        out.append("122=");
+        out.append(kOrigSendingTimePrefix);
         out.append(options.orig_sending_time);
         out.push_back(soh);
     }
 
     // 10. Optional 1137=<default_appl_ver_id>SOH
     if (!options.default_appl_ver_id.empty()) {
-        out.append("1137=");
+        out.append(kDefaultApplVerIDPrefix);
         out.append(options.default_appl_ver_id);
         out.push_back(soh);
     }
@@ -410,7 +405,7 @@ auto EncodeReplay(
     cksum[0] = static_cast<char>('0' + ((checksum / 100U) % 10U));
     cksum[1] = static_cast<char>('0' + ((checksum / 10U) % 10U));
     cksum[2] = static_cast<char>('0' + (checksum % 10U));
-    out.append("10=");
+    out.append(kCheckSumPrefix);
     out.append(cksum.data(), 3);
     out.push_back(soh);
 
@@ -470,12 +465,12 @@ auto EncodeReplayInto(
     // 1. 8=<begin_string>SOH
     const auto begin_string = options.begin_string.empty()
         ? stored.begin_string : options.begin_string;
-    append_sv("8=");
+    append_sv(kBeginStringPrefix);
     append_sv(begin_string);
     append_char(soh);
 
     // 2. 9=<placeholder>SOH — write "9=" tracked, then placeholder untracked (will adjust later)
-    append_sv("9=");
+    append_sv(kBodyLengthPrefix);
     const auto body_length_offset = pos;
     // Write placeholder without tracking — we'll add the real digits' sum after backfill
     std::memcpy(buf + pos, "0000000", 7);
@@ -484,17 +479,17 @@ auto EncodeReplayInto(
     const auto body_start = pos;
 
     // 3. 35=<msg_type>SOH
-    append_sv("35=");
+    append_sv(kMsgTypePrefix);
     append_sv(stored.msg_type);
     append_char(soh);
 
     // 4. 49=<sender>SOH
-    append_sv("49=");
+    append_sv(kSenderCompIDPrefix);
     append_sv(options.sender_comp_id);
     append_char(soh);
 
     // 5. 56=<target>SOH
-    append_sv("56=");
+    append_sv(kTargetCompIDPrefix);
     append_sv(options.target_comp_id);
     append_char(soh);
 
@@ -502,30 +497,30 @@ auto EncodeReplayInto(
     {
         char num_buf[10];
         const auto num_len = FormatUint32(num_buf, options.msg_seq_num);
-        append_sv("34=");
+        append_sv(kMsgSeqNumPrefix);
         append_sv(std::string_view(num_buf, num_len));
         append_char(soh);
     }
 
     // 7. 52=<sending_time>SOH
-    append_sv("52=");
+    append_sv(kSendingTimePrefix);
     append_sv(options.sending_time);
     append_char(soh);
 
     // 8. 43=Y SOH
-    append_sv("43=Y");
+    append_sv(kPossDupFlagYesField);
     append_char(soh);
 
     // 9. 122=<orig_sending_time>SOH
     if (!options.orig_sending_time.empty()) {
-        append_sv("122=");
+        append_sv(kOrigSendingTimePrefix);
         append_sv(options.orig_sending_time);
         append_char(soh);
     }
 
     // 10. Optional 1137=<default_appl_ver_id>SOH
     if (!options.default_appl_ver_id.empty()) {
-        append_sv("1137=");
+        append_sv(kDefaultApplVerIDPrefix);
         append_sv(options.default_appl_ver_id);
         append_char(soh);
     }
@@ -575,9 +570,8 @@ auto EncodeReplayInto(
     // 13. Combine: header (incremental) + body (SIMD), no full-buffer rescan
     std::uint32_t checksum = (header_checksum + body_checksum) % 256U;
 
-    buf[pos++] = '1';
-    buf[pos++] = '0';
-    buf[pos++] = '=';
+    std::memcpy(buf + pos, kCheckSumPrefix.data(), kCheckSumPrefix.size());
+    pos += kCheckSumPrefix.size();
     buf[pos++] = static_cast<char>('0' + ((checksum / 100U) % 10U));
     buf[pos++] = static_cast<char>('0' + ((checksum / 10U) % 10U));
     buf[pos++] = static_cast<char>('0' + (checksum % 10U));

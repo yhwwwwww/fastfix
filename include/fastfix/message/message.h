@@ -15,6 +15,7 @@
 #include "fastfix/base/inline_split_vector.h"
 #include "fastfix/base/result.h"
 #include "fastfix/base/status.h"
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/profile/normalized_dictionary.h"
 
 namespace fastfix::codec {
@@ -99,14 +100,14 @@ struct FieldValue {
   /// is not one of the 8 cached session tags.
   [[nodiscard]] inline auto QuickCacheSlotForTag(std::uint32_t tag) -> std::optional<QuickCacheSlot> {
       switch (tag) {
-          case 8U:  return QuickCacheSlot::kBeginString;
-          case 9U:  return QuickCacheSlot::kBodyLength;
-          case 35U: return QuickCacheSlot::kMsgType;
-          case 34U: return QuickCacheSlot::kMsgSeqNum;
-          case 49U: return QuickCacheSlot::kSenderCompID;
-          case 56U: return QuickCacheSlot::kTargetCompID;
-          case 52U: return QuickCacheSlot::kSendingTime;
-          case 10U: return QuickCacheSlot::kCheckSum;
+        case codec::tags::kBeginString:  return QuickCacheSlot::kBeginString;
+        case codec::tags::kBodyLength:   return QuickCacheSlot::kBodyLength;
+        case codec::tags::kMsgType:      return QuickCacheSlot::kMsgType;
+        case codec::tags::kMsgSeqNum:    return QuickCacheSlot::kMsgSeqNum;
+        case codec::tags::kSenderCompID: return QuickCacheSlot::kSenderCompID;
+        case codec::tags::kTargetCompID: return QuickCacheSlot::kTargetCompID;
+        case codec::tags::kSendingTime:  return QuickCacheSlot::kSendingTime;
+        case codec::tags::kCheckSum:     return QuickCacheSlot::kCheckSum;
           default:  return std::nullopt;
       }
   }

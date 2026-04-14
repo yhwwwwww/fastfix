@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "fastfix/codec/fix_codec.h"
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/profile/normalized_dictionary.h"
 #include "fastfix/profile/profile_loader.h"
 #include "fastfix/session/admin_protocol.h"
@@ -78,9 +79,10 @@ auto WrapBodyFields(std::string_view body_fields) -> std::vector<std::byte> {
     }
 
     std::string full;
-    full.append("8=FIX.4.4");
+    full.append(fastfix::codec::tags::kBeginStringPrefix);
+    full.append("FIX.4.4");
     full.push_back('\x01');
-    full.append("9=");
+    full.append(fastfix::codec::tags::kBodyLengthPrefix);
     full.append(std::to_string(body.size()));
     full.push_back('\x01');
     full.append(body);
@@ -95,7 +97,7 @@ auto WrapBodyFields(std::string_view body_fields) -> std::vector<std::byte> {
     digits[0] = static_cast<char>('0' + ((checksum / 100U) % 10U));
     digits[1] = static_cast<char>('0' + ((checksum / 10U) % 10U));
     digits[2] = static_cast<char>('0' + (checksum % 10U));
-    full.append("10=");
+    full.append(fastfix::codec::tags::kCheckSumPrefix);
     full.append(digits.data(), 3U);
     full.push_back('\x01');
     return ToBytes(full);
@@ -105,7 +107,7 @@ auto NormalizeFrame(std::string text) -> std::vector<std::byte> {
     while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
         text.pop_back();
     }
-    if (text.rfind("8=", 0) == 0) {
+    if (text.rfind(fastfix::codec::tags::kBeginStringPrefix, 0) == 0) {
         for (auto& ch : text) {
             if (ch == '|') {
                 ch = '\x01';

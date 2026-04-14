@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/runtime/application.h"
 
 #include "test_support.h"
@@ -174,9 +175,9 @@ TEST_CASE("application-queue", "[application-queue]") {
         fastfix::session::SessionHandle handle(4001U, 0U, sink);
 
         fastfix::message::MessageBuilder builder("D");
-        builder.set_string(35U, "D");
-        builder.set_string(49U, "BUY");
-        builder.set_string(56U, "SELL");
+        builder.set_string(fastfix::codec::tags::kMsgType, "D");
+        builder.set_string(fastfix::codec::tags::kSenderCompID, "BUY");
+        builder.set_string(fastfix::codec::tags::kTargetCompID, "SELL");
         auto message = std::move(builder).build();
 
         const auto borrowed = handle.SendBorrowed(message.view());

@@ -1,44 +1,45 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/profile/overlay.h"
 
-#include "test_support.h"
+using namespace fastfix::codec::tags;
 
 TEST_CASE("overlay-merge", "[overlay-merge]") {
     fastfix::profile::NormalizedDictionary baseline;
     baseline.profile_id = 9001U;
     baseline.schema_hash = 0x9001000000000001ULL;
     baseline.fields = {
-        {35U, "MsgType", fastfix::profile::ValueType::kString, 0U},
-        {49U, "SenderCompID", fastfix::profile::ValueType::kString, 0U},
-        {56U, "TargetCompID", fastfix::profile::ValueType::kString, 0U},
-        {453U, "NoPartyIDs", fastfix::profile::ValueType::kInt, 0U},
-        {448U, "PartyID", fastfix::profile::ValueType::kString, 0U},
-        {447U, "PartyIDSource", fastfix::profile::ValueType::kChar, 0U},
-        {452U, "PartyRole", fastfix::profile::ValueType::kInt, 0U},
+        {kMsgType, "MsgType", fastfix::profile::ValueType::kString, 0U},
+        {kSenderCompID, "SenderCompID", fastfix::profile::ValueType::kString, 0U},
+        {kTargetCompID, "TargetCompID", fastfix::profile::ValueType::kString, 0U},
+        {kNoPartyIDs, "NoPartyIDs", fastfix::profile::ValueType::kInt, 0U},
+        {kPartyID, "PartyID", fastfix::profile::ValueType::kString, 0U},
+        {kPartyIDSource, "PartyIDSource", fastfix::profile::ValueType::kChar, 0U},
+        {kPartyRole, "PartyRole", fastfix::profile::ValueType::kInt, 0U},
     };
     baseline.messages = {
         fastfix::profile::MessageDef{
             .msg_type = "D",
             .name = "NewOrderSingle",
             .field_rules = {
-                {35U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
-                {49U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
-                {56U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
-                {453U, 0U},
+                {kMsgType, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+                {kSenderCompID, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+                {kTargetCompID, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+                {kNoPartyIDs, 0U},
             },
             .flags = 0U,
         },
     };
     baseline.groups = {
         fastfix::profile::GroupDef{
-            .count_tag = 453U,
-            .delimiter_tag = 448U,
+            .count_tag = kNoPartyIDs,
+            .delimiter_tag = kPartyID,
             .name = "Parties",
             .field_rules = {
-                {448U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
-                {447U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
-                {452U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+                {kPartyID, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+                {kPartyIDSource, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+                {kPartyRole, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
             },
             .flags = 0U,
         },
@@ -60,17 +61,17 @@ TEST_CASE("overlay-merge", "[overlay-merge]") {
         .field_rules = {
             {5001U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
             {5002U, 0U},
-            {453U, 0U},
+            {kNoPartyIDs, 0U},
         },
         .flags = 0U,
     });
     overlay.groups.push_back(fastfix::profile::GroupDef{
-        .count_tag = 453U,
-        .delimiter_tag = 448U,
+        .count_tag = kNoPartyIDs,
+        .delimiter_tag = kPartyID,
         .name = "Parties",
         .field_rules = {
             {6001U, 0U},
-            {452U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+            {kPartyRole, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
         },
         .flags = 0U,
     });
@@ -81,23 +82,23 @@ TEST_CASE("overlay-merge", "[overlay-merge]") {
     REQUIRE(merged.value().messages.size() == 1U);
     REQUIRE(merged.value().groups.size() == 1U);
     REQUIRE(merged.value().messages.front().field_rules.size() == 6U);
-    REQUIRE(merged.value().groups.front().count_tag == 453U);
+    REQUIRE(merged.value().groups.front().count_tag == kNoPartyIDs);
     REQUIRE(merged.value().fields.back().tag == 6001U);
-    REQUIRE(merged.value().messages.front().field_rules[0].tag == 35U);
-    REQUIRE(merged.value().messages.front().field_rules[1].tag == 49U);
-    REQUIRE(merged.value().messages.front().field_rules[2].tag == 56U);
+    REQUIRE(merged.value().messages.front().field_rules[0].tag == kMsgType);
+    REQUIRE(merged.value().messages.front().field_rules[1].tag == kSenderCompID);
+    REQUIRE(merged.value().messages.front().field_rules[2].tag == kTargetCompID);
     REQUIRE(merged.value().messages.front().field_rules[3].tag == 5001U);
     REQUIRE(merged.value().messages.front().field_rules[4].tag == 5002U);
-    REQUIRE(merged.value().messages.front().field_rules[5].tag == 453U);
+    REQUIRE(merged.value().messages.front().field_rules[5].tag == kNoPartyIDs);
     REQUIRE(merged.value().groups.front().field_rules.size() == 4U);
-    REQUIRE(merged.value().groups.front().field_rules[0].tag == 448U);
-    REQUIRE(merged.value().groups.front().field_rules[1].tag == 447U);
+    REQUIRE(merged.value().groups.front().field_rules[0].tag == kPartyID);
+    REQUIRE(merged.value().groups.front().field_rules[1].tag == kPartyIDSource);
     REQUIRE(merged.value().groups.front().field_rules[2].tag == 6001U);
-    REQUIRE(merged.value().groups.front().field_rules[3].tag == 452U);
+    REQUIRE(merged.value().groups.front().field_rules[3].tag == kPartyRole);
 
     fastfix::profile::NormalizedDictionary delimiter_reject_overlay;
     delimiter_reject_overlay.groups.push_back(fastfix::profile::GroupDef{
-        .count_tag = 453U,
+        .count_tag = kNoPartyIDs,
         .delimiter_tag = 999U,
         .name = "",
         .field_rules = {},
@@ -108,7 +109,7 @@ TEST_CASE("overlay-merge", "[overlay-merge]") {
 
     fastfix::profile::NormalizedDictionary delimiter_allow_overlay;
     delimiter_allow_overlay.groups.push_back(fastfix::profile::GroupDef{
-        .count_tag = 453U,
+        .count_tag = kNoPartyIDs,
         .delimiter_tag = 999U,
         .name = "",
         .field_rules = {},
@@ -125,17 +126,17 @@ TEST_CASE("overlay-merge-header-trailer", "[overlay-merge]") {
     baseline.profile_id = 9002U;
     baseline.schema_hash = 0x9002000000000001ULL;
     baseline.fields = {
-        {35U, "MsgType", fastfix::profile::ValueType::kString, 0U},
-        {49U, "SenderCompID", fastfix::profile::ValueType::kString, 0U},
-        {56U, "TargetCompID", fastfix::profile::ValueType::kString, 0U},
-        {115U, "OnBehalfOfCompID", fastfix::profile::ValueType::kString, 0U},
-        {89U, "Signature", fastfix::profile::ValueType::kString, 0U},
+        {kMsgType, "MsgType", fastfix::profile::ValueType::kString, 0U},
+        {kSenderCompID, "SenderCompID", fastfix::profile::ValueType::kString, 0U},
+        {kTargetCompID, "TargetCompID", fastfix::profile::ValueType::kString, 0U},
+        {kOnBehalfOfCompID, "OnBehalfOfCompID", fastfix::profile::ValueType::kString, 0U},
+        {kSignature, "Signature", fastfix::profile::ValueType::kString, 0U},
     };
     baseline.header_fields = {
-        {115U, 0U},
+        {kOnBehalfOfCompID, 0U},
     };
     baseline.trailer_fields = {
-        {89U, 0U},
+        {kSignature, 0U},
     };
 
     // Overlay adds custom venue header/trailer fields.
@@ -158,13 +159,13 @@ TEST_CASE("overlay-merge-header-trailer", "[overlay-merge]") {
 
     // Header should have baseline (115) + overlay (5500).
     REQUIRE(merged.value().header_fields.size() == 2U);
-    REQUIRE(merged.value().header_fields[0].tag == 115U);
+    REQUIRE(merged.value().header_fields[0].tag == kOnBehalfOfCompID);
     REQUIRE(merged.value().header_fields[1].tag == 5500U);
     REQUIRE(merged.value().header_fields[1].required());
 
     // Trailer should have baseline (89) + overlay (5501).
     REQUIRE(merged.value().trailer_fields.size() == 2U);
-    REQUIRE(merged.value().trailer_fields[0].tag == 89U);
+    REQUIRE(merged.value().trailer_fields[0].tag == kSignature);
     REQUIRE(merged.value().trailer_fields[1].tag == 5501U);
     REQUIRE(!merged.value().trailer_fields[1].required());
 }
@@ -174,31 +175,31 @@ TEST_CASE("overlay-merge-header-rejects-core-session-tags", "[overlay-merge]") {
     baseline.profile_id = 9003U;
     baseline.schema_hash = 0x9003000000000001ULL;
 
-    // Overlay tries to add tag 35 (MsgType) to header — should be rejected.
+    // Overlay tries to add MsgType to header — should be rejected.
     {
         fastfix::profile::NormalizedDictionary overlay;
         overlay.header_fields = {
-            {35U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+            {kMsgType, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
         };
         auto result = fastfix::profile::ApplyOverlay(baseline, overlay);
         REQUIRE(!result.ok());
     }
 
-    // Overlay tries to add tag 10 (CheckSum) to trailer — should be rejected.
+    // Overlay tries to add CheckSum to trailer — should be rejected.
     {
         fastfix::profile::NormalizedDictionary overlay;
         overlay.trailer_fields = {
-            {10U, 0U},
+            {kCheckSum, 0U},
         };
         auto result = fastfix::profile::ApplyOverlay(baseline, overlay);
         REQUIRE(!result.ok());
     }
 
-    // Overlay tries to add tag 49 (SenderCompID) to header — should be rejected.
+    // Overlay tries to add SenderCompID to header — should be rejected.
     {
         fastfix::profile::NormalizedDictionary overlay;
         overlay.header_fields = {
-            {49U, 0U},
+            {kSenderCompID, 0U},
         };
         auto result = fastfix::profile::ApplyOverlay(baseline, overlay);
         REQUIRE(!result.ok());

@@ -5,6 +5,7 @@
 #include <iostream>
 #include <thread>
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/session/admin_protocol.h"
 #include "fastfix/store/memory_store.h"
 #include "fastfix/transport/tcp_transport.h"
@@ -162,9 +163,11 @@ TEST_CASE("socket-loopback", "[socket-loopback]") {
 
         if (event.value().session_active && !sent_app) {
             fastfix::message::MessageBuilder builder("D");
-            builder.set_string(35U, "D");
-            auto party = builder.add_group_entry(453U);
-            party.set_string(448U, "PARTY-A").set_char(447U, 'D').set_int(452U, 3);
+            builder.set_string(fastfix::codec::tags::kMsgType, "D");
+            auto party = builder.add_group_entry(fastfix::codec::tags::kNoPartyIDs);
+            party.set_string(fastfix::codec::tags::kPartyID, "PARTY-A")
+                .set_char(fastfix::codec::tags::kPartyIDSource, 'D')
+                .set_int(fastfix::codec::tags::kPartyRole, 3);
             auto outbound = initiator.SendApplication(std::move(builder).build(), NowNs());
             REQUIRE(outbound.ok());
             REQUIRE(connection.value().Send(outbound.value().bytes, std::chrono::seconds(5)).ok());
@@ -173,10 +176,10 @@ TEST_CASE("socket-loopback", "[socket-loopback]") {
         }
 
         if (!event.value().application_messages.empty()) {
-            const auto group = event.value().application_messages.front().view().group(453U);
+            const auto group = event.value().application_messages.front().view().group(fastfix::codec::tags::kNoPartyIDs);
             REQUIRE(group.has_value());
             REQUIRE(group->size() == 1U);
-            REQUIRE((*group)[0].get_string(448U).value() == "PARTY-A");
+            REQUIRE((*group)[0].get_string(fastfix::codec::tags::kPartyID).value() == "PARTY-A");
             received_echo = true;
 
             auto logout = initiator.BeginLogout({}, NowNs());

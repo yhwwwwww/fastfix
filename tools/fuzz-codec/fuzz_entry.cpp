@@ -17,11 +17,14 @@
 #include <vector>
 
 #include "fastfix/codec/fix_codec.h"
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/profile/artifact_builder.h"
 #include "fastfix/profile/normalized_dictionary.h"
 #include "fastfix/profile/profile_loader.h"
 
 namespace {
+
+using namespace fastfix::codec::tags;
 
 // Lazily initialized dictionary shared across all fuzz iterations.
 struct FuzzState {
@@ -38,27 +41,27 @@ auto GetFuzzState() -> FuzzState& {
         dict.profile_id = 9001U;
         dict.schema_hash = 0x9001900190019001ULL;
         dict.fields = {
-            {35U, "MsgType", fastfix::profile::ValueType::kString, 0U},
-            {49U, "SenderCompID", fastfix::profile::ValueType::kString, 0U},
-            {56U, "TargetCompID", fastfix::profile::ValueType::kString, 0U},
-            {11U, "ClOrdID", fastfix::profile::ValueType::kString, 0U},
-            {55U, "Symbol", fastfix::profile::ValueType::kString, 0U},
-            {552U, "NoSides", fastfix::profile::ValueType::kInt, 0U},
-            {54U, "Side", fastfix::profile::ValueType::kChar, 0U},
-            {453U, "NoPartyIDs", fastfix::profile::ValueType::kInt, 0U},
-            {448U, "PartyID", fastfix::profile::ValueType::kString, 0U},
-            {98U, "EncryptMethod", fastfix::profile::ValueType::kInt, 0U},
-            {108U, "HeartBtInt", fastfix::profile::ValueType::kInt, 0U},
+            {kMsgType, "MsgType", fastfix::profile::ValueType::kString, 0U},
+            {kSenderCompID, "SenderCompID", fastfix::profile::ValueType::kString, 0U},
+            {kTargetCompID, "TargetCompID", fastfix::profile::ValueType::kString, 0U},
+            {kClOrdID, "ClOrdID", fastfix::profile::ValueType::kString, 0U},
+            {kSymbol, "Symbol", fastfix::profile::ValueType::kString, 0U},
+            {kNoSides, "NoSides", fastfix::profile::ValueType::kInt, 0U},
+            {kSide, "Side", fastfix::profile::ValueType::kChar, 0U},
+            {kNoPartyIDs, "NoPartyIDs", fastfix::profile::ValueType::kInt, 0U},
+            {kPartyID, "PartyID", fastfix::profile::ValueType::kString, 0U},
+            {kEncryptMethod, "EncryptMethod", fastfix::profile::ValueType::kInt, 0U},
+            {kHeartBtInt, "HeartBtInt", fastfix::profile::ValueType::kInt, 0U},
         };
         dict.messages = {
             fastfix::profile::MessageDef{
                 .msg_type = "D",
                 .name = "NewOrderSingle",
                 .field_rules = {
-                    {35U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
-                    {11U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
-                    {55U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
-                    {552U, 0U},
+                    {kMsgType, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+                    {kClOrdID, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+                    {kSymbol, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+                    {kNoSides, 0U},
                 },
                 .flags = 0U,
             },
@@ -77,21 +80,21 @@ auto GetFuzzState() -> FuzzState& {
         };
         dict.groups = {
             fastfix::profile::GroupDef{
-                .count_tag = 552U,
-                .delimiter_tag = 54U,
+                .count_tag = kNoSides,
+                .delimiter_tag = kSide,
                 .name = "Sides",
                 .field_rules = {
-                    {54U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
-                    {453U, 0U},
+                    {kSide, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+                    {kNoPartyIDs, 0U},
                 },
                 .flags = 0U,
             },
             fastfix::profile::GroupDef{
-                .count_tag = 453U,
-                .delimiter_tag = 448U,
+                .count_tag = kNoPartyIDs,
+                .delimiter_tag = kPartyID,
                 .name = "Parties",
                 .field_rules = {
-                    {448U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+                    {kPartyID, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
                 },
                 .flags = 0U,
             },

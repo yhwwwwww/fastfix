@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fastfix/codec/fix_codec.h"
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/session/admin_protocol.h"
 #include "fastfix/session/session_core.h"
 #include "fastfix/store/memory_store.h"
@@ -18,6 +19,7 @@
 using fastfix::session::AdminProtocol;
 using fastfix::session::AdminProtocolConfig;
 using fastfix::session::SessionConfig;
+using namespace fastfix::codec::tags;
 using fastfix::session::SessionCore;
 using fastfix::session::SessionKey;
 using fastfix::session::SessionState;
@@ -318,14 +320,14 @@ TEST_CASE("gap-transition: app message triggering gap is delivered after fill",
 
     // Counterparty sends a NewOrderSingle (D) at seq=5 (gap: expected 2, received 5)
     fastfix::message::MessageBuilder order_builder("D");
-    order_builder.set_string(35U, "D")
-        .set_string(11U, "ORDER-001")
-        .set_string(55U, "AAPL")
-        .set_string(54U, "1")
-        .set_int(38U, 100)
-        .set_string(40U, "2")
-        .set_string(44U, "150.50")
-        .set_string(60U, "20260414-12:00:00.000");
+    order_builder.set_string(kMsgType, "D")
+        .set_string(kClOrdID, "ORDER-001")
+        .set_string(kSymbol, "AAPL")
+        .set_string(kSide, "1")
+        .set_int(kOrderQty, 100)
+        .set_string(kOrdType, "2")
+        .set_string(kPrice, "150.50")
+        .set_string(kTransactTime, "20260414-12:00:00.000");
     auto order_frame = EncodeInboundFrame(
         std::move(order_builder).build(),
         dictionary.value(),
@@ -709,9 +711,9 @@ TEST_CASE("gap-transition: second gap-triggering message extends gap then both d
 
     // First app message at seq=4 (gap [2, 3])
     fastfix::message::MessageBuilder order1("D");
-    order1.set_string(35U, "D").set_string(11U, "ORD-1").set_string(55U, "AAPL")
-        .set_string(54U, "1").set_int(38U, 100).set_string(40U, "2")
-        .set_string(60U, "20260414-12:00:00.000");
+    order1.set_string(kMsgType, "D").set_string(kClOrdID, "ORD-1").set_string(kSymbol, "AAPL")
+        .set_string(kSide, "1").set_int(kOrderQty, 100).set_string(kOrdType, "2")
+        .set_string(kTransactTime, "20260414-12:00:00.000");
     auto frame1 = EncodeInboundFrame(
         std::move(order1).build(), dictionary.value(),
         "FIX.4.4", "BUY", "SELL", 4U, false);
@@ -723,9 +725,9 @@ TEST_CASE("gap-transition: second gap-triggering message extends gap then both d
 
     // Second app message at seq=6 (extends gap to [2, 5])
     fastfix::message::MessageBuilder order2("D");
-    order2.set_string(35U, "D").set_string(11U, "ORD-2").set_string(55U, "MSFT")
-        .set_string(54U, "1").set_int(38U, 200).set_string(40U, "2")
-        .set_string(60U, "20260414-12:00:01.000");
+    order2.set_string(kMsgType, "D").set_string(kClOrdID, "ORD-2").set_string(kSymbol, "MSFT")
+        .set_string(kSide, "1").set_int(kOrderQty, 200).set_string(kOrdType, "2")
+        .set_string(kTransactTime, "20260414-12:00:01.000");
     auto frame2 = EncodeInboundFrame(
         std::move(order2).build(), dictionary.value(),
         "FIX.4.4", "BUY", "SELL", 6U, false);
@@ -762,9 +764,9 @@ TEST_CASE("gap-transition: second gap-triggering message extends gap then both d
 
     // Counterparty replays seq=4 as PossDup
     fastfix::message::MessageBuilder replay4("D");
-    replay4.set_string(35U, "D").set_string(11U, "ORD-1-PD").set_string(55U, "AAPL")
-        .set_string(54U, "1").set_int(38U, 100).set_string(40U, "2")
-        .set_string(60U, "20260414-12:00:00.000");
+    replay4.set_string(kMsgType, "D").set_string(kClOrdID, "ORD-1-PD").set_string(kSymbol, "AAPL")
+        .set_string(kSide, "1").set_int(kOrderQty, 100).set_string(kOrdType, "2")
+        .set_string(kTransactTime, "20260414-12:00:00.000");
     auto replay4_frame = EncodeInboundFrame(
         std::move(replay4).build(), dictionary.value(),
         "FIX.4.4", "BUY", "SELL", 4U, true, {}, "20260414-11:59:01.000");

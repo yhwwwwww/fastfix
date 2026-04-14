@@ -1,6 +1,7 @@
 #include "fastfix/codec/fix_codec.h"
 #include "fastfix/codec/compiled_decoder.h"
 #include "fastfix/codec/fast_int_format.h"
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/codec/simd_scan.h"
 
 #include <algorithm>
@@ -19,6 +20,8 @@
 namespace fastfix::codec {
 
 namespace {
+
+using namespace fastfix::codec::tags;
 
 template <typename Integer>
 inline constexpr std::size_t kIntegerTextBufferBytes =
@@ -93,50 +96,11 @@ struct CompiledScopeTemplate {
 };
 
 auto IsStandardSessionField(std::uint32_t tag) -> bool {
-    switch (tag) {
-        case 34U:
-        case 35U:
-        case 43U:
-        case 49U:
-        case 52U:
-        case 56U:
-        case 97U:
-        case 122U:
-        case 1137U:
-            return true;
-        default:
-            return false;
-    }
+    return IsStandardSessionHeaderTag(tag);
 }
 
 auto IsImplicitStandardField(std::uint32_t tag) -> bool {
-    switch (tag) {
-        case 7U:
-        case 16U:
-        case 34U:
-        case 35U:
-        case 36U:
-        case 43U:
-        case 45U:
-        case 49U:
-        case 52U:
-        case 56U:
-        case 58U:
-        case 97U:
-        case 98U:
-        case 108U:
-        case 112U:
-        case 123U:
-        case 141U:
-        case 371U:
-        case 372U:
-        case 373U:
-        case 122U:
-        case 1137U:
-            return true;
-        default:
-            return false;
-    }
+    return IsStandardSessionHeaderTag(tag) || IsCommonAdminTag(tag);
 }
 
 auto SetValidationIssue(
@@ -840,21 +804,11 @@ auto ParseParsedGroupEntries(
 }
 
 auto ShouldSkipField(std::uint32_t tag) -> bool {
-    return tag == 8U || tag == 9U || tag == 10U;
+    return IsFrameStructureTag(tag);
 }
 
 auto IsTemplateManagedHeaderField(std::uint32_t tag) -> bool {
-    switch (tag) {
-        case 34U:
-        case 35U:
-        case 43U:
-        case 49U:
-        case 52U:
-        case 56U:
-            return true;
-        default:
-            return false;
-    }
+    return IsTemplateManagedHeaderTag(tag);
 }
 
 auto ContainsTag(const std::vector<std::uint32_t>& tags, std::uint32_t tag) -> bool {
@@ -1122,14 +1076,13 @@ auto EncodeMessageBody(
     char delimiter,
     bool skip_standard_header) -> void {
     for (const auto& field : data.fields) {
-        if (field.tag == 8U || field.tag == 9U || field.tag == 10U) {
+        if (ShouldSkipField(field.tag)) {
             continue;
         }
         if (HasGroupCountTag(data.groups, field.tag)) {
             continue;
         }
-        if (skip_standard_header && (field.tag == 35U || field.tag == 34U || field.tag == 49U || field.tag == 56U ||
-                                     field.tag == 52U || field.tag == 43U)) {
+        if (skip_standard_header && IsTemplateManagedHeaderField(field.tag)) {
             continue;
         }
         EncodeFieldValue(out, field, delimiter);
@@ -1153,11 +1106,10 @@ auto EncodeMessageBody(
     // Emit fields and groups in dictionary rule order.
     for (const auto& rule : rules) {
         const auto tag = rule.tag;
-        if (tag == 8U || tag == 9U || tag == 10U) {
+        if (ShouldSkipField(tag)) {
             continue;
         }
-        if (skip_standard_header && (tag == 35U || tag == 34U || tag == 49U || tag == 56U ||
-                                     tag == 52U || tag == 43U)) {
+        if (skip_standard_header && IsTemplateManagedHeaderField(tag)) {
             continue;
         }
 
@@ -1179,14 +1131,13 @@ auto EncodeMessageBody(
 
     // Sweep extra fields not covered by dictionary rules.
     for (const auto& field : data.fields) {
-        if (field.tag == 8U || field.tag == 9U || field.tag == 10U) {
+        if (ShouldSkipField(field.tag)) {
             continue;
         }
         if (HasGroupCountTag(data.groups, field.tag)) {
             continue;
         }
-        if (skip_standard_header && (field.tag == 35U || field.tag == 34U || field.tag == 49U || field.tag == 56U ||
-                                     field.tag == 52U || field.tag == 43U)) {
+        if (skip_standard_header && IsTemplateManagedHeaderField(field.tag)) {
             continue;
         }
         // Skip if already emitted by the rules pass.
@@ -1219,14 +1170,13 @@ auto EncodeMessageBody(
         if (!field.has_value()) {
             continue;
         }
-        if (field->tag == 8U || field->tag == 9U || field->tag == 10U) {
+        if (ShouldSkipField(field->tag)) {
             continue;
         }
         if (HasGroupCountTag(view, field->tag)) {
             continue;
         }
-        if (skip_standard_header && (field->tag == 35U || field->tag == 34U || field->tag == 49U || field->tag == 56U ||
-                                     field->tag == 52U || field->tag == 43U)) {
+        if (skip_standard_header && IsTemplateManagedHeaderField(field->tag)) {
             continue;
         }
         EncodeFieldValue(out, *field, delimiter);
@@ -1275,11 +1225,10 @@ auto EncodeMessageBody(
     // Emit fields and groups in dictionary rule order.
     for (const auto& rule : rules) {
         const auto tag = rule.tag;
-        if (tag == 8U || tag == 9U || tag == 10U) {
+        if (ShouldSkipField(tag)) {
             continue;
         }
-        if (skip_standard_header && (tag == 35U || tag == 34U || tag == 49U || tag == 56U ||
-                                     tag == 52U || tag == 43U)) {
+        if (skip_standard_header && IsTemplateManagedHeaderField(tag)) {
             continue;
         }
 
@@ -1306,14 +1255,13 @@ auto EncodeMessageBody(
         if (!field.has_value()) {
             continue;
         }
-        if (field->tag == 8U || field->tag == 9U || field->tag == 10U) {
+        if (ShouldSkipField(field->tag)) {
             continue;
         }
         if (HasGroupCountTag(view, field->tag)) {
             continue;
         }
-        if (skip_standard_header && (field->tag == 35U || field->tag == 34U || field->tag == 49U || field->tag == 56U ||
-                                     field->tag == 52U || field->tag == 43U)) {
+        if (skip_standard_header && IsTemplateManagedHeaderField(field->tag)) {
             continue;
         }
         bool in_rules = std::any_of(rules.begin(), rules.end(),
@@ -1500,10 +1448,10 @@ auto EncodeFixMessageGenericToBuffer(
 
     // BeginString + BodyLength placeholder
     const auto begin_string = options.begin_string.empty() ? std::string_view("FIX.4.4") : std::string_view(options.begin_string);
-    full.append("8=");
+    full.append(kBeginStringPrefix);
     full.append(begin_string);
     full.push_back(delimiter);
-    full.append("9=");
+    full.append(kBodyLengthPrefix);
 
     constexpr std::size_t kBodyLengthPlaceholderWidth = 7U;
     const auto body_length_offset = full.size();
@@ -1513,27 +1461,27 @@ auto EncodeFixMessageGenericToBuffer(
 
     // Body content directly into buffer (untracked — checksum computed at end)
     const auto msg_type = message.msg_type();
-    AppendField(full, 35U, msg_type.empty() ? std::string_view("UNKNOWN") : msg_type, delimiter);
+    AppendField(full, kMsgType, msg_type.empty() ? std::string_view("UNKNOWN") : msg_type, delimiter);
 
     const auto seq_num = options.msg_seq_num == 0U ? 1U : options.msg_seq_num;
-    AppendField(full, 34U, static_cast<std::int64_t>(seq_num), delimiter);
+    AppendField(full, kMsgSeqNum, static_cast<std::int64_t>(seq_num), delimiter);
     if (!options.sender_comp_id.empty()) {
-        AppendField(full, 49U, options.sender_comp_id, delimiter);
+        AppendField(full, kSenderCompID, options.sender_comp_id, delimiter);
     }
     if (!options.target_comp_id.empty()) {
-        AppendField(full, 56U, options.target_comp_id, delimiter);
+        AppendField(full, kTargetCompID, options.target_comp_id, delimiter);
     }
     UtcTimestampBuffer timestamp_buffer;
     const auto sending_time = options.sending_time.empty() ? CurrentUtcTimestamp(&timestamp_buffer) : options.sending_time;
-    AppendField(full, 52U, sending_time, delimiter);
+    AppendField(full, kSendingTime, sending_time, delimiter);
     if (msg_type == "A" && !options.default_appl_ver_id.empty()) {
-        AppendField(full, 1137U, options.default_appl_ver_id, delimiter);
+        AppendField(full, kDefaultApplVerID, options.default_appl_ver_id, delimiter);
     }
     if (options.poss_dup) {
-        AppendField(full, 43U, std::string_view("Y"), delimiter);
+        AppendField(full, kPossDupFlag, std::string_view("Y"), delimiter);
     }
     if (!options.orig_sending_time.empty()) {
-        AppendField(full, 122U, options.orig_sending_time, delimiter);
+        AppendField(full, kOrigSendingTime, options.orig_sending_time, delimiter);
     }
 
     // Look up dictionary rules for this message type.
@@ -1566,7 +1514,7 @@ auto EncodeFixMessageGenericToBuffer(
     cksum_digits[0] = static_cast<char>('0' + ((checksum / 100U) % 10U));
     cksum_digits[1] = static_cast<char>('0' + ((checksum / 10U) % 10U));
     cksum_digits[2] = static_cast<char>('0' + (checksum % 10U));
-    AppendField(full, 10U, std::string_view(cksum_digits.data(), 3U), delimiter);
+    AppendField(full, kCheckSum, std::string_view(cksum_digits.data(), 3U), delimiter);
     return base::Status::Ok();
 }
 
@@ -1649,21 +1597,21 @@ auto CompileFrameEncodeTemplate(
     state->target_comp_id = config.target_comp_id;
     state->default_appl_ver_id = config.default_appl_ver_id;
     state->delimiter = delimiter;
-    state->begin_prefix = MakeFixedFieldFragment(8U, state->begin_string, delimiter);
-    state->begin_prefix.append("9=");
-    state->msg_type_fragment = MakeFixedFieldFragment(35U, state->msg_type, delimiter);
-    state->msg_seq_prefix = MakeTagPrefix(34U);
-    state->sending_time_prefix = MakeTagPrefix(52U);
-    state->orig_sending_time_prefix = MakeTagPrefix(122U);
-    state->poss_dup_fragment = MakeFixedFieldFragment(43U, "Y", delimiter);
+    state->begin_prefix = MakeFixedFieldFragment(kBeginString, state->begin_string, delimiter);
+    state->begin_prefix.append(kBodyLengthPrefix);
+    state->msg_type_fragment = MakeFixedFieldFragment(kMsgType, state->msg_type, delimiter);
+    state->msg_seq_prefix = MakeTagPrefix(kMsgSeqNum);
+    state->sending_time_prefix = MakeTagPrefix(kSendingTime);
+    state->orig_sending_time_prefix = MakeTagPrefix(kOrigSendingTime);
+    state->poss_dup_fragment = MakeFixedFieldFragment(kPossDupFlag, "Y", delimiter);
     if (!state->sender_comp_id.empty()) {
-        state->sender_fragment = MakeFixedFieldFragment(49U, state->sender_comp_id, delimiter);
+        state->sender_fragment = MakeFixedFieldFragment(kSenderCompID, state->sender_comp_id, delimiter);
     }
     if (!state->target_comp_id.empty()) {
-        state->target_fragment = MakeFixedFieldFragment(56U, state->target_comp_id, delimiter);
+        state->target_fragment = MakeFixedFieldFragment(kTargetCompID, state->target_comp_id, delimiter);
     }
     if (state->msg_type == "A" && !state->default_appl_ver_id.empty()) {
-        state->default_appl_ver_fragment = MakeFixedFieldFragment(1137U, state->default_appl_ver_id, delimiter);
+        state->default_appl_ver_fragment = MakeFixedFieldFragment(kDefaultApplVerID, state->default_appl_ver_id, delimiter);
     }
     state->body_scope = CompileScopeTemplate(dictionary, dictionary.message_field_rules(*message_def), true);
     return FrameEncodeTemplate(std::move(state));
@@ -1783,7 +1731,7 @@ auto FrameEncodeTemplate::EncodeToBuffer(
     }
 
     checksum %= 256U;
-    AppendTracked(full, nullptr, std::string_view("10="));
+    AppendTracked(full, nullptr, kCheckSumPrefix);
     std::array<char, 4> checksum_digits{};
     checksum_digits[0] = static_cast<char>('0' + ((checksum / 100U) % 10U));
     checksum_digits[1] = static_cast<char>('0' + ((checksum / 10U) % 10U));
@@ -1910,7 +1858,7 @@ auto DecodeFixMessageView(
     if (!field0.ok()) {
         return field0.status();
     }
-    if (field0.value().tag != 8U) {
+    if (field0.value().tag != kBeginString) {
         return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
     }
 
@@ -1919,7 +1867,7 @@ auto DecodeFixMessageView(
     if (!field1.ok()) {
         return field1.status();
     }
-    if (field1.value().tag != 9U) {
+    if (field1.value().tag != kBodyLength) {
         return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
     }
 
@@ -1963,7 +1911,7 @@ auto DecodeFixMessageView(
             reinterpret_cast<const char*>(bytes.data() + scanned.value().value_offset),
             scanned.value().value_length);
 
-        if (tag == 10U) {
+        if (tag == kCheckSum) {
             auto expected_checksum = ParseUnsigned(value_sv, "CheckSum");
             if (!expected_checksum.ok()) {
                 return expected_checksum.status();
@@ -1980,7 +1928,7 @@ auto DecodeFixMessageView(
             continue;
         }
 
-        if (tag == 35U) {
+        if (tag == kMsgType) {
             parsed_message->msg_type = value_sv;
             header.msg_type = value_sv;
             cached_message_def = dictionary.find_message(header.msg_type);
@@ -2007,7 +1955,7 @@ auto DecodeFixMessageView(
             continue;
         }
         switch (tag) {
-            case 34U: {
+            case kMsgSeqNum: {
                 auto parsed = ParseUnsigned(value_sv, "MsgSeqNum");
                 if (!parsed.ok()) {
                     return parsed.status();
@@ -2015,12 +1963,12 @@ auto DecodeFixMessageView(
                 header.msg_seq_num = parsed.value();
                 break;
             }
-            case 49U: header.sender_comp_id = value_sv; break;
-            case 56U: header.target_comp_id = value_sv; break;
-            case 52U: header.sending_time = value_sv; break;
-            case 122U: header.orig_sending_time = value_sv; break;
-            case 1137U: header.default_appl_ver_id = value_sv; break;
-            case 43U: {
+            case kSenderCompID: header.sender_comp_id = value_sv; break;
+            case kTargetCompID: header.target_comp_id = value_sv; break;
+            case kSendingTime: header.sending_time = value_sv; break;
+            case kOrigSendingTime: header.orig_sending_time = value_sv; break;
+            case kDefaultApplVerID: header.default_appl_ver_id = value_sv; break;
+            case kPossDupFlag: {
                 auto parsed = ParseBoolean(value_sv, "PossDupFlag");
                 if (!parsed.ok()) {
                     return parsed.status();
@@ -2164,7 +2112,7 @@ auto DecodeFixMessageView(
     if (!field0.ok()) {
         return field0.status();
     }
-    if (field0.value().tag != 8U) {
+    if (field0.value().tag != kBeginString) {
         return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
     }
 
@@ -2173,7 +2121,7 @@ auto DecodeFixMessageView(
     if (!field1.ok()) {
         return field1.status();
     }
-    if (field1.value().tag != 9U) {
+    if (field1.value().tag != kBodyLength) {
         return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
     }
 
@@ -2214,7 +2162,7 @@ auto DecodeFixMessageView(
             reinterpret_cast<const char*>(bytes.data() + scanned.value().value_offset),
             scanned.value().value_length);
 
-        if (tag == 10U) {
+        if (tag == kCheckSum) {
             auto expected_checksum = ParseUnsigned(value_sv, "CheckSum");
             if (!expected_checksum.ok()) {
                 return expected_checksum.status();
@@ -2231,7 +2179,7 @@ auto DecodeFixMessageView(
             continue;
         }
 
-        if (tag == 35U) {
+        if (tag == kMsgType) {
             parsed_message->msg_type = value_sv;
             header.msg_type = value_sv;
             compiled = compiled_decoders.find(header.msg_type);
@@ -2252,7 +2200,7 @@ auto DecodeFixMessageView(
 
         // Header field extraction — same for both paths.
         switch (tag) {
-            case 34U: {
+            case kMsgSeqNum: {
                 auto parsed = ParseUnsigned(value_sv, "MsgSeqNum");
                 if (!parsed.ok()) {
                     return parsed.status();
@@ -2260,12 +2208,12 @@ auto DecodeFixMessageView(
                 header.msg_seq_num = parsed.value();
                 break;
             }
-            case 49U: header.sender_comp_id = value_sv; break;
-            case 56U: header.target_comp_id = value_sv; break;
-            case 52U: header.sending_time = value_sv; break;
-            case 122U: header.orig_sending_time = value_sv; break;
-            case 1137U: header.default_appl_ver_id = value_sv; break;
-            case 43U: {
+            case kSenderCompID: header.sender_comp_id = value_sv; break;
+            case kTargetCompID: header.target_comp_id = value_sv; break;
+            case kSendingTime: header.sending_time = value_sv; break;
+            case kOrigSendingTime: header.orig_sending_time = value_sv; break;
+            case kDefaultApplVerID: header.default_appl_ver_id = value_sv; break;
+            case kPossDupFlag: {
                 auto parsed = ParseBoolean(value_sv, "PossDupFlag");
                 if (!parsed.ok()) {
                     return parsed.status();
@@ -2495,7 +2443,7 @@ auto PeekSessionHeaderView(
         ++field_count;
 
         if (field_count == 1U) {
-            if (tag.value() != 8U) {
+            if (tag.value() != kBeginString) {
                 return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
             }
             header.begin_string = value;
@@ -2504,7 +2452,7 @@ auto PeekSessionHeaderView(
         }
 
         if (field_count == 2U) {
-            if (tag.value() != 9U) {
+            if (tag.value() != kBodyLength) {
                 return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
             }
             auto declared_body_length = ParseUnsigned(value, "BodyLength");
@@ -2517,7 +2465,7 @@ auto PeekSessionHeaderView(
             continue;
         }
 
-        if (tag.value() == 10U) {
+        if (tag.value() == kCheckSum) {
             if (index + 1U != bytes.size()) {
                 return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
             }
@@ -2534,10 +2482,10 @@ auto PeekSessionHeaderView(
         }
 
         switch (tag.value()) {
-            case 35U:
+            case kMsgType:
                 header.msg_type = value;
                 break;
-            case 34U: {
+            case kMsgSeqNum: {
                 auto parsed = ParseUnsigned(value, "MsgSeqNum");
                 if (!parsed.ok()) {
                     return parsed.status();
@@ -2545,7 +2493,7 @@ auto PeekSessionHeaderView(
                 header.msg_seq_num = parsed.value();
                 break;
             }
-            case 43U: {
+            case kPossDupFlag: {
                 auto parsed = ParseBoolean(value, "PossDupFlag");
                 if (!parsed.ok()) {
                     return parsed.status();
@@ -2553,19 +2501,19 @@ auto PeekSessionHeaderView(
                 header.poss_dup = parsed.value();
                 break;
             }
-            case 49U:
+            case kSenderCompID:
                 header.sender_comp_id = value;
                 break;
-            case 52U:
+            case kSendingTime:
                 header.sending_time = value;
                 break;
-            case 122U:
+            case kOrigSendingTime:
                 header.orig_sending_time = value;
                 break;
-            case 56U:
+            case kTargetCompID:
                 header.target_comp_id = value;
                 break;
-            case 1137U:
+            case kDefaultApplVerID:
                 header.default_appl_ver_id = value;
                 break;
             default:

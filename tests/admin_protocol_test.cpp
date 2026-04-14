@@ -1,12 +1,15 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "fastfix/codec/fix_codec.h"
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/session/admin_protocol.h"
 #include "fastfix/store/memory_store.h"
 
 #include "test_support.h"
 
 namespace {
+
+using namespace fastfix::codec::tags;
 
 auto EncodeInboundFrame(
     const fastfix::message::Message& message,
@@ -36,7 +39,7 @@ auto ActivateAcceptorSession(
     std::string begin_string,
     std::string default_appl_ver_id = {}) -> fastfix::base::Status {
     fastfix::message::MessageBuilder logon_builder("A");
-    logon_builder.set_string(35U, "A").set_int(98U, 0).set_int(108U, 30);
+    logon_builder.set_string(kMsgType, "A").set_int(kEncryptMethod, 0).set_int(kHeartBtInt, 30);
     auto inbound = EncodeInboundFrame(
         std::move(logon_builder).build(),
         dictionary,
@@ -99,7 +102,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(protocol.OnTransportConnected(1U).ok());
 
         fastfix::message::MessageBuilder logon_builder("A");
-        logon_builder.set_string(35U, "A").set_int(98U, 0).set_int(108U, 30);
+        logon_builder.set_string(kMsgType, "A").set_int(kEncryptMethod, 0).set_int(kHeartBtInt, 30);
         auto inbound = EncodeInboundFrame(
             std::move(logon_builder).build(),
             dictionary.value(),
@@ -156,7 +159,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(protocol.OnTransportConnected(1U).ok());
 
         fastfix::message::MessageBuilder logon_builder("A");
-        logon_builder.set_string(35U, "A").set_int(98U, 0).set_int(108U, 30).set_boolean(141U, true);
+        logon_builder.set_string(kMsgType, "A").set_int(kEncryptMethod, 0).set_int(kHeartBtInt, 30).set_boolean(kResetSeqNumFlag, true);
         auto inbound = EncodeInboundFrame(
             std::move(logon_builder).build(),
             dictionary.value(),
@@ -176,7 +179,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "A");
         REQUIRE(decoded.value().header.msg_seq_num == 1U);
-        REQUIRE(decoded.value().message.view().get_boolean(141U).value());
+        REQUIRE(decoded.value().message.view().get_boolean(kResetSeqNumFlag).value());
 
         const auto snapshot = protocol.session().Snapshot();
         REQUIRE(snapshot.next_in_seq == 2U);
@@ -206,7 +209,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
     REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder heartbeat_builder("0");
-        heartbeat_builder.set_string(35U, "0");
+        heartbeat_builder.set_string(kMsgType, "0");
         auto inbound = EncodeInboundFrame(
             std::move(heartbeat_builder).build(),
             dictionary.value(),
@@ -225,10 +228,10 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(45U).value() == 1);
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 122);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "0");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 1);
+        REQUIRE(decoded.value().message.view().get_int(kRefSeqNum).value() == 1);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kOrigSendingTime);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "0");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 1);
     }
 
     {
@@ -254,7 +257,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder heartbeat_builder("0");
-        heartbeat_builder.set_string(35U, "0");
+        heartbeat_builder.set_string(kMsgType, "0");
         auto inbound = EncodeInboundFrame(
             std::move(heartbeat_builder).build(),
             dictionary.value(),
@@ -312,9 +315,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 49);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "0");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 13);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kSenderCompID);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "0");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 13);
     }
 
     {
@@ -341,7 +344,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder heartbeat_builder("0");
-        heartbeat_builder.set_string(35U, "0");
+        heartbeat_builder.set_string(kMsgType, "0");
         auto inbound = EncodeInboundFrame(
             std::move(heartbeat_builder).build(),
             dictionary.value(),
@@ -413,7 +416,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(protocol.OnTransportConnected(1U).ok());
 
         fastfix::message::MessageBuilder logon_builder("A");
-        logon_builder.set_string(35U, "A").set_int(98U, 0).set_int(108U, 30);
+        logon_builder.set_string(kMsgType, "A").set_int(kEncryptMethod, 0).set_int(kHeartBtInt, 30);
         auto inbound = EncodeInboundFrame(
             std::move(logon_builder).build(),
             dictionary.value(),
@@ -433,7 +436,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "5");
-        REQUIRE(decoded.value().message.view().get_string(58U).value() == "unexpected SenderCompID on inbound frame");
+        REQUIRE(decoded.value().message.view().get_string(kText).value() == "unexpected SenderCompID on inbound frame");
     }
 
     {
@@ -459,7 +462,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(protocol.OnTransportConnected(1U).ok());
 
         fastfix::message::MessageBuilder logon_builder("A");
-        logon_builder.set_string(35U, "A").set_int(98U, 0).set_int(108U, 30);
+        logon_builder.set_string(kMsgType, "A").set_int(kEncryptMethod, 0).set_int(kHeartBtInt, 30);
         auto inbound = EncodeInboundFrame(
             std::move(logon_builder).build(),
             dictionary.value(),
@@ -503,7 +506,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(protocol.OnTransportConnected(1U).ok());
 
         fastfix::message::MessageBuilder logon_builder("A");
-        logon_builder.set_string(35U, "A").set_int(98U, 0);
+        logon_builder.set_string(kMsgType, "A").set_int(kEncryptMethod, 0);
         auto inbound = EncodeInboundFrame(
             std::move(logon_builder).build(),
             dictionary.value(),
@@ -522,7 +525,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "5");
-        REQUIRE(decoded.value().message.view().get_string(58U).value() == "Logon requires HeartBtInt");
+        REQUIRE(decoded.value().message.view().get_string(kText).value() == "Logon requires HeartBtInt");
     }
 
     {
@@ -547,7 +550,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(protocol.OnTransportConnected(1U).ok());
 
         fastfix::message::MessageBuilder logon_builder("A");
-        logon_builder.set_string(35U, "A").set_int(98U, 1).set_int(108U, 30);
+        logon_builder.set_string(kMsgType, "A").set_int(kEncryptMethod, 1).set_int(kHeartBtInt, 30);
         auto inbound = EncodeInboundFrame(
             std::move(logon_builder).build(),
             dictionary.value(),
@@ -566,7 +569,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "5");
-        REQUIRE(decoded.value().message.view().get_string(58U).value() == "Logon EncryptMethod must be 0");
+        REQUIRE(decoded.value().message.view().get_string(kText).value() == "Logon EncryptMethod must be 0");
     }
 
     {
@@ -593,7 +596,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(protocol.OnTransportConnected(1U).ok());
 
         fastfix::message::MessageBuilder logon_builder("A");
-        logon_builder.set_string(35U, "A").set_int(98U, 0).set_int(108U, 30);
+        logon_builder.set_string(kMsgType, "A").set_int(kEncryptMethod, 0).set_int(kHeartBtInt, 30);
         auto inbound = EncodeInboundFrame(
             std::move(logon_builder).build(),
             dictionary.value(),
@@ -612,7 +615,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "5");
-        REQUIRE(decoded.value().message.view().get_string(58U).value() == "FIXT.1.1 logon requires DefaultApplVerID");
+        REQUIRE(decoded.value().message.view().get_string(kText).value() == "FIXT.1.1 logon requires DefaultApplVerID");
     }
 
     {
@@ -640,7 +643,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(protocol.OnTransportConnected(1U).ok());
 
         fastfix::message::MessageBuilder logon_builder("A");
-        logon_builder.set_string(35U, "A").set_int(98U, 0).set_int(108U, 30);
+        logon_builder.set_string(kMsgType, "A").set_int(kEncryptMethod, 0).set_int(kHeartBtInt, 30);
         auto inbound = EncodeInboundFrame(
             std::move(logon_builder).build(),
             dictionary.value(),
@@ -686,7 +689,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(protocol.OnTransportConnected(1U).ok());
 
         fastfix::message::MessageBuilder logon_builder("A");
-        logon_builder.set_string(35U, "A").set_int(98U, 0).set_int(108U, 30);
+        logon_builder.set_string(kMsgType, "A").set_int(kEncryptMethod, 0).set_int(kHeartBtInt, 30);
         auto inbound = EncodeInboundFrame(
             std::move(logon_builder).build(),
             dictionary.value(),
@@ -706,7 +709,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "5");
-        REQUIRE(decoded.value().message.view().get_string(58U).value() == "unexpected DefaultApplVerID on inbound frame");
+        REQUIRE(decoded.value().message.view().get_string(kText).value() == "unexpected DefaultApplVerID on inbound frame");
     }
 
     {
@@ -731,7 +734,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(protocol.OnTransportConnected(1U).ok());
 
         fastfix::message::MessageBuilder logon_builder("A");
-        logon_builder.set_string(35U, "A").set_int(98U, 0).set_int(108U, 30);
+        logon_builder.set_string(kMsgType, "A").set_int(kEncryptMethod, 0).set_int(kHeartBtInt, 30);
         auto inbound = EncodeInboundFrame(
             std::move(logon_builder).build(),
             dictionary.value(),
@@ -750,7 +753,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "5");
-        REQUIRE(decoded.value().message.view().get_string(58U).value() == "PossDupFlag requires OrigSendingTime");
+        REQUIRE(decoded.value().message.view().get_string(kText).value() == "PossDupFlag requires OrigSendingTime");
     }
 
     {
@@ -808,7 +811,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(protocol.OnTransportConnected(1U).ok());
 
         fastfix::message::MessageBuilder heartbeat_builder("0");
-        heartbeat_builder.set_string(35U, "0");
+        heartbeat_builder.set_string(kMsgType, "0");
         auto inbound = EncodeInboundFrame(
             std::move(heartbeat_builder).build(),
             dictionary.value(),
@@ -827,7 +830,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "5");
-        REQUIRE(decoded.value().message.view().get_string(58U).value() == "received 0 before Logon completed");
+        REQUIRE(decoded.value().message.view().get_string(kText).value() == "received 0 before Logon completed");
 
         const auto snapshot = protocol.session().Snapshot();
         REQUIRE(snapshot.next_in_seq == 2U);
@@ -856,7 +859,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(protocol.OnTransportConnected(1U).ok());
 
         fastfix::message::MessageBuilder resend_builder("2");
-        resend_builder.set_string(35U, "2").set_int(7U, 1).set_int(16U, 0);
+        resend_builder.set_string(kMsgType, "2").set_int(kBeginSeqNo, 1).set_int(kEndSeqNo, 0);
         auto inbound = EncodeInboundFrame(
             std::move(resend_builder).build(),
             dictionary.value(),
@@ -875,7 +878,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "5");
-        REQUIRE(decoded.value().message.view().get_string(58U).value() == "received 2 before Logon completed");
+        REQUIRE(decoded.value().message.view().get_string(kText).value() == "received 2 before Logon completed");
 
         const auto snapshot = protocol.session().Snapshot();
         REQUIRE(snapshot.state == fastfix::session::SessionState::kAwaitingLogout);
@@ -906,7 +909,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder heartbeat_builder("0");
-        heartbeat_builder.set_string(35U, "0");
+        heartbeat_builder.set_string(kMsgType, "0");
         auto inbound = EncodeInboundFrame(
             std::move(heartbeat_builder).build(),
             dictionary.value(),
@@ -925,7 +928,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "5");
-        REQUIRE(decoded.value().message.view().get_string(58U).value() == "received stale inbound FIX sequence number");
+        REQUIRE(decoded.value().message.view().get_string(kText).value() == "received stale inbound FIX sequence number");
     }
 
     {
@@ -951,7 +954,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder logon_builder("A");
-        logon_builder.set_string(35U, "A").set_int(98U, 0).set_int(108U, 30);
+        logon_builder.set_string(kMsgType, "A").set_int(kEncryptMethod, 0).set_int(kHeartBtInt, 30);
         auto inbound = EncodeInboundFrame(
             std::move(logon_builder).build(),
             dictionary.value(),
@@ -970,7 +973,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "5");
-        REQUIRE(decoded.value().message.view().get_string(58U).value() == "received unexpected Logon after session activation");
+        REQUIRE(decoded.value().message.view().get_string(kText).value() == "received unexpected Logon after session activation");
 
         const auto snapshot = protocol.session().Snapshot();
         REQUIRE(snapshot.state == fastfix::session::SessionState::kAwaitingLogout);
@@ -1001,7 +1004,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder test_request_builder("1");
-        test_request_builder.set_string(35U, "1");
+        test_request_builder.set_string(kMsgType, "1");
         auto inbound = EncodeInboundFrame(
             std::move(test_request_builder).build(),
             dictionary.value(),
@@ -1020,9 +1023,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 112);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "1");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 1);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kTestReqID);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "1");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 1);
     }
 
     {
@@ -1048,7 +1051,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder resend_builder("2");
-        resend_builder.set_string(35U, "2").set_int(7U, 9).set_int(16U, 4);
+        resend_builder.set_string(kMsgType, "2").set_int(kBeginSeqNo, 9).set_int(kEndSeqNo, 4);
         auto inbound = EncodeInboundFrame(
             std::move(resend_builder).build(),
             dictionary.value(),
@@ -1067,9 +1070,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 16);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "2");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 5);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kEndSeqNo);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "2");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 5);
     }
 
     {
@@ -1095,7 +1098,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder reset_builder("4");
-        reset_builder.set_string(35U, "4");
+        reset_builder.set_string(kMsgType, "4");
         auto inbound = EncodeInboundFrame(
             std::move(reset_builder).build(),
             dictionary.value(),
@@ -1114,9 +1117,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 36);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "4");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 1);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kNewSeqNo);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "4");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 1);
     }
 
     {
@@ -1142,7 +1145,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder reset_builder("4");
-        reset_builder.set_string(35U, "4").set_int(36U, 1);
+        reset_builder.set_string(kMsgType, "4").set_int(kNewSeqNo, 1);
         auto inbound = EncodeInboundFrame(
             std::move(reset_builder).build(),
             dictionary.value(),
@@ -1161,9 +1164,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 36);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "4");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 5);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kNewSeqNo);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "4");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 5);
     }
 
     {
@@ -1189,7 +1192,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder heartbeat_builder("0");
-        heartbeat_builder.set_string(35U, "0");
+        heartbeat_builder.set_string(kMsgType, "0");
         auto gap_inbound = EncodeInboundFrame(
             std::move(heartbeat_builder).build(),
             dictionary.value(),
@@ -1207,11 +1210,11 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto resend = fastfix::codec::DecodeFixMessage(gap_event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(resend.ok());
         REQUIRE(resend.value().header.msg_type == "2");
-        REQUIRE(resend.value().message.view().get_int(7U).value() == 2);
-        REQUIRE(resend.value().message.view().get_int(16U).value() == 4);
+        REQUIRE(resend.value().message.view().get_int(kBeginSeqNo).value() == 2);
+        REQUIRE(resend.value().message.view().get_int(kEndSeqNo).value() == 4);
 
         fastfix::message::MessageBuilder first_gap_fill_builder("4");
-        first_gap_fill_builder.set_string(35U, "4").set_boolean(123U, true).set_int(36U, 4);
+        first_gap_fill_builder.set_string(kMsgType, "4").set_boolean(kGapFillFlag, true).set_int(kNewSeqNo, 4);
         auto first_gap_fill = EncodeInboundFrame(
             std::move(first_gap_fill_builder).build(),
             dictionary.value(),
@@ -1235,7 +1238,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(after_first_gap_fill.next_in_seq == 4U);
 
         fastfix::message::MessageBuilder overlapping_gap_fill_builder("4");
-        overlapping_gap_fill_builder.set_string(35U, "4").set_boolean(123U, true).set_int(36U, 6);
+        overlapping_gap_fill_builder.set_string(kMsgType, "4").set_boolean(kGapFillFlag, true).set_int(kNewSeqNo, 6);
         auto overlapping_gap_fill = EncodeInboundFrame(
             std::move(overlapping_gap_fill_builder).build(),
             dictionary.value(),
@@ -1286,7 +1289,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder first_gap_fill_builder("4");
-        first_gap_fill_builder.set_string(35U, "4").set_boolean(123U, true).set_int(36U, 5);
+        first_gap_fill_builder.set_string(kMsgType, "4").set_boolean(kGapFillFlag, true).set_int(kNewSeqNo, 5);
         auto first_gap_fill = EncodeInboundFrame(
             std::move(first_gap_fill_builder).build(),
             dictionary.value(),
@@ -1303,7 +1306,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(!first_gap_fill_event.value().disconnect);
 
         fastfix::message::MessageBuilder duplicate_gap_fill_builder("4");
-        duplicate_gap_fill_builder.set_string(35U, "4").set_boolean(123U, true).set_int(36U, 5);
+        duplicate_gap_fill_builder.set_string(kMsgType, "4").set_boolean(kGapFillFlag, true).set_int(kNewSeqNo, 5);
         auto duplicate_gap_fill = EncodeInboundFrame(
             std::move(duplicate_gap_fill_builder).build(),
             dictionary.value(),
@@ -1353,7 +1356,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
     REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder app_builder("D");
-        app_builder.set_string(35U, "D").set_string(11U, "ORD-1");
+        app_builder.set_string(kMsgType, "D").set_string(kClOrdID, "ORD-1");
         auto outbound = protocol.SendApplication(std::move(app_builder).build(), 100U);
         REQUIRE(outbound.ok());
 
@@ -1362,7 +1365,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(!original.value().header.sending_time.empty());
 
         fastfix::message::MessageBuilder resend_builder("2");
-        resend_builder.set_string(35U, "2").set_int(7U, 2).set_int(16U, 2);
+        resend_builder.set_string(kMsgType, "2").set_int(kBeginSeqNo, 2).set_int(kEndSeqNo, 2);
         auto inbound = EncodeInboundFrame(
             std::move(resend_builder).build(),
             dictionary.value(),
@@ -1382,8 +1385,8 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(replay.value().header.msg_type == "D");
         REQUIRE(replay.value().header.poss_dup);
         REQUIRE(replay.value().header.orig_sending_time == original.value().header.sending_time);
-        REQUIRE(replay.value().message.view().get_string(122U).has_value());
-        REQUIRE(replay.value().message.view().get_string(122U).value() == original.value().header.sending_time);
+        REQUIRE(replay.value().message.view().get_string(kOrigSendingTime).has_value());
+        REQUIRE(replay.value().message.view().get_string(kOrigSendingTime).value() == original.value().header.sending_time);
     }
 
     {
@@ -1417,7 +1420,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(before_replay.next_out_seq == 3U);
 
         fastfix::message::MessageBuilder resend_builder("2");
-        resend_builder.set_string(35U, "2").set_int(7U, 2).set_int(16U, 2);
+        resend_builder.set_string(kMsgType, "2").set_int(kBeginSeqNo, 2).set_int(kEndSeqNo, 2);
         auto inbound = EncodeInboundFrame(
             std::move(resend_builder).build(),
             dictionary.value(),
@@ -1437,8 +1440,8 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(replay.ok());
         REQUIRE(replay.value().header.msg_type == "4");
         REQUIRE(replay.value().header.msg_seq_num == 2U);
-        REQUIRE(replay.value().message.view().get_boolean(123U).value());
-        REQUIRE(replay.value().message.view().get_int(36U).value() == 3);
+        REQUIRE(replay.value().message.view().get_boolean(kGapFillFlag).value());
+        REQUIRE(replay.value().message.view().get_int(kNewSeqNo).value() == 3);
 
         const auto after_replay = protocol.session().Snapshot();
         REQUIRE(after_replay.next_in_seq == 3U);
@@ -1474,7 +1477,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder logout_builder("5");
-        logout_builder.set_string(35U, "5");
+        logout_builder.set_string(kMsgType, "5");
         auto inbound = EncodeInboundFrame(
             std::move(logout_builder).build(),
             dictionary.value(),
@@ -1523,7 +1526,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder heartbeat_builder("0");
-        heartbeat_builder.set_string(35U, "0");
+        heartbeat_builder.set_string(kMsgType, "0");
         auto inbound = EncodeInboundFrame(
             std::move(heartbeat_builder).build(),
             dictionary.value(),
@@ -1542,8 +1545,8 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto resend = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(resend.ok());
         REQUIRE(resend.value().header.msg_type == "2");
-        REQUIRE(resend.value().message.view().get_int(7U).value() == 2);
-        REQUIRE(resend.value().message.view().get_int(16U).value() == 3);
+        REQUIRE(resend.value().message.view().get_int(kBeginSeqNo).value() == 2);
+        REQUIRE(resend.value().message.view().get_int(kEndSeqNo).value() == 3);
 
         const auto snapshot = protocol.session().Snapshot();
         REQUIRE(snapshot.state == fastfix::session::SessionState::kResendProcessing);
@@ -1575,7 +1578,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
             dictionary.value());
         REQUIRE(test_request.ok());
         REQUIRE(test_request.value().header.msg_type == "1");
-        REQUIRE(test_request.value().message.view().get_string(112U).has_value());
+        REQUIRE(test_request.value().message.view().get_string(kTestReqID).has_value());
     }
 
     {
@@ -1601,7 +1604,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder app_builder("ZZ");
-        app_builder.set_string(35U, "ZZ");
+        app_builder.set_string(kMsgType, "ZZ");
         auto inbound = EncodeInboundFrame(
             std::move(app_builder).build(),
             dictionary.value(),
@@ -1621,9 +1624,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 35);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "ZZ");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 11);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kMsgType);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "ZZ");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 11);
     }
 
     {
@@ -1650,7 +1653,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder app_builder("ZZ");
-        app_builder.set_string(35U, "ZZ");
+        app_builder.set_string(kMsgType, "ZZ");
         auto inbound = EncodeInboundFrame(
             std::move(app_builder).build(),
             dictionary.value(),
@@ -1699,9 +1702,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 9999);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "D");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 3);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == 9999);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "D");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 3);
     }
 
     {
@@ -1736,9 +1739,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 448);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "D");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 2);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kPartyID);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "D");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 2);
     }
 
     {
@@ -1773,9 +1776,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 55);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "D");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 13);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kSymbol);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "D");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 13);
     }
 
     {
@@ -1810,9 +1813,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 11);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "D");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 1);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kClOrdID);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "D");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 1);
     }
 
     {
@@ -1847,9 +1850,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 453);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "D");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 16);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kNoPartyIDs);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "D");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 16);
     }
 
     {
@@ -1999,7 +2002,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder app_builder("D");
-        app_builder.set_string(35U, "D");
+        app_builder.set_string(kMsgType, "D");
         auto inbound = EncodeInboundFrame(
             std::move(app_builder).build(),
             dictionary.value(),
@@ -2018,9 +2021,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 11);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "D");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 1);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kClOrdID);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "D");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 1);
     }
 
     {
@@ -2046,9 +2049,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder app_builder("D");
-        app_builder.set_string(35U, "D").set_string(55U, "AAPL");
-        auto party = app_builder.add_group_entry(453U);
-        party.set_string(448U, "PTY1").set_int(452U, 7);
+        app_builder.set_string(kMsgType, "D").set_string(kSymbol, "AAPL");
+        auto party = app_builder.add_group_entry(kNoPartyIDs);
+        party.set_string(kPartyID, "PTY1").set_int(kPartyRole, 7);
         auto inbound = EncodeInboundFrame(
             std::move(app_builder).build(),
             dictionary.value(),
@@ -2067,9 +2070,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
         REQUIRE(decoded.ok());
         REQUIRE(decoded.value().header.msg_type == "3");
-        REQUIRE(decoded.value().message.view().get_int(371U).value() == 11);
-        REQUIRE(decoded.value().message.view().get_string(372U).value() == "D");
-        REQUIRE(decoded.value().message.view().get_int(373U).value() == 1);
+        REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kClOrdID);
+        REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "D");
+        REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 1);
     }
 
     {
@@ -2096,7 +2099,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder app_builder("D");
-        app_builder.set_string(35U, "D");
+        app_builder.set_string(kMsgType, "D");
         auto inbound = EncodeInboundFrame(
             std::move(app_builder).build(),
             dictionary.value(),
@@ -2137,9 +2140,9 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
         REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
         fastfix::message::MessageBuilder app_builder("D");
-        app_builder.set_string(35U, "D").set_string(55U, "AAPL");
-        auto party = app_builder.add_group_entry(453U);
-        party.set_string(448U, "PTY1").set_char(447U, 'D').set_int(452U, 1);
+        app_builder.set_string(kMsgType, "D").set_string(kSymbol, "AAPL");
+        auto party = app_builder.add_group_entry(kNoPartyIDs);
+        party.set_string(kPartyID, "PTY1").set_char(kPartyIDSource, 'D').set_int(kPartyRole, 1);
         auto inbound = EncodeInboundFrame(
             std::move(app_builder).build(),
             dictionary.value(),
@@ -2160,12 +2163,12 @@ TEST_CASE("admin-protocol", "[admin-protocol]") {
 
         auto moved_event = std::move(event);
         REQUIRE(moved_event.application_messages.size() == 1U);
-        REQUIRE(moved_event.application_messages.front().view().get_string(55U).value() == "AAPL");
-        const auto parties = moved_event.application_messages.front().view().group(453U);
+        REQUIRE(moved_event.application_messages.front().view().get_string(kSymbol).value() == "AAPL");
+        const auto parties = moved_event.application_messages.front().view().group(kNoPartyIDs);
         REQUIRE(parties.has_value());
         REQUIRE(parties->size() == 1U);
-        REQUIRE((*parties)[0].get_char(447U).value() == 'D');
-        REQUIRE((*parties)[0].get_string(448U).value() == "PTY1");
+        REQUIRE((*parties)[0].get_char(kPartyIDSource).value() == 'D');
+        REQUIRE((*parties)[0].get_string(kPartyID).value() == "PTY1");
     }
 
 }
@@ -2199,7 +2202,7 @@ TEST_CASE("PossResend flag detected on app message", "[admin-protocol]") {
     REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
     fastfix::message::MessageBuilder app_builder("D");
-    app_builder.set_string(35U, "D").set_string(55U, "MSFT").set_boolean(97U, true);
+    app_builder.set_string(kMsgType, "D").set_string(kSymbol, "MSFT").set_boolean(kPossResend, true);
     auto inbound = EncodeInboundFrame(
         std::move(app_builder).build(),
         dictionary.value(),
@@ -2245,7 +2248,7 @@ TEST_CASE("PossResend flag not set on normal message", "[admin-protocol]") {
     REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
     fastfix::message::MessageBuilder app_builder("D");
-    app_builder.set_string(35U, "D").set_string(55U, "AAPL");
+    app_builder.set_string(kMsgType, "D").set_string(kSymbol, "AAPL");
     auto inbound = EncodeInboundFrame(
         std::move(app_builder).build(),
         dictionary.value(),
@@ -2291,7 +2294,7 @@ TEST_CASE("PossResend message still processed by application", "[admin-protocol]
     REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
     fastfix::message::MessageBuilder app_builder("D");
-    app_builder.set_string(35U, "D").set_string(55U, "GOOG").set_boolean(97U, true);
+    app_builder.set_string(kMsgType, "D").set_string(kSymbol, "GOOG").set_boolean(kPossResend, true);
     auto inbound = EncodeInboundFrame(
         std::move(app_builder).build(),
         dictionary.value(),
@@ -2308,8 +2311,8 @@ TEST_CASE("PossResend message still processed by application", "[admin-protocol]
     REQUIRE(event.value().application_messages.size() == 1U);
     REQUIRE(event.value().poss_resend);
     // The application message content is intact.
-    REQUIRE(event.value().application_messages.front().view().get_string(55U).value() == "GOOG");
-    REQUIRE(event.value().application_messages.front().view().get_boolean(97U).value());
+    REQUIRE(event.value().application_messages.front().view().get_string(kSymbol).value() == "GOOG");
+    REQUIRE(event.value().application_messages.front().view().get_boolean(kPossResend).value());
     // No reject or disconnect — the message is delivered normally.
     REQUIRE(event.value().outbound_frames.empty());
     REQUIRE_FALSE(event.value().disconnect);
@@ -2347,7 +2350,7 @@ TEST_CASE("ResendRequest happy path", "[admin-protocol]") {
     // Send 3 outbound application messages (seqs 2, 3, 4)
     for (int i = 0; i < 3; ++i) {
         fastfix::message::MessageBuilder app_builder("D");
-        app_builder.set_string(35U, "D").set_string(55U, "AAPL");
+        app_builder.set_string(kMsgType, "D").set_string(kSymbol, "AAPL");
         auto sent = protocol.SendApplication(
             std::move(app_builder).build(), 100U + static_cast<std::uint64_t>(i));
         REQUIRE(sent.ok());
@@ -2356,7 +2359,7 @@ TEST_CASE("ResendRequest happy path", "[admin-protocol]") {
 
     // Counterparty requests resend of seqs 2-4
     fastfix::message::MessageBuilder resend_builder("2");
-    resend_builder.set_string(35U, "2").set_int(7U, 2).set_int(16U, 4);
+    resend_builder.set_string(kMsgType, "2").set_int(kBeginSeqNo, 2).set_int(kEndSeqNo, 4);
     auto inbound = EncodeInboundFrame(
         std::move(resend_builder).build(),
         dictionary.value(),
@@ -2411,7 +2414,7 @@ TEST_CASE("ResendRequest BeginSeqNo=0 rejected", "[admin-protocol]") {
 
     // BeginSeqNo=0 is invalid per FIX spec — must be positive
     fastfix::message::MessageBuilder resend_builder("2");
-    resend_builder.set_string(35U, "2").set_int(7U, 0).set_int(16U, 5);
+    resend_builder.set_string(kMsgType, "2").set_int(kBeginSeqNo, 0).set_int(kEndSeqNo, 5);
     auto inbound = EncodeInboundFrame(
         std::move(resend_builder).build(),
         dictionary.value(),
@@ -2431,9 +2434,9 @@ TEST_CASE("ResendRequest BeginSeqNo=0 rejected", "[admin-protocol]") {
         event.value().outbound_frames.front().bytes, dictionary.value());
     REQUIRE(decoded.ok());
     REQUIRE(decoded.value().header.msg_type == "3");
-    REQUIRE(decoded.value().message.view().get_int(371U).value() == 7);
-    REQUIRE(decoded.value().message.view().get_string(372U).value() == "2");
-    REQUIRE(decoded.value().message.view().get_int(373U).value() == 5);
+    REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kBeginSeqNo);
+    REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "2");
+    REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 5);
 }
 
 TEST_CASE("ResendRequest EndSeqNo=0 replays to infinity", "[admin-protocol]") {
@@ -2466,7 +2469,7 @@ TEST_CASE("ResendRequest EndSeqNo=0 replays to infinity", "[admin-protocol]") {
     // Send 2 outbound app messages (seqs 2, 3)
     for (int i = 0; i < 2; ++i) {
         fastfix::message::MessageBuilder app_builder("D");
-        app_builder.set_string(35U, "D").set_string(55U, "AAPL");
+        app_builder.set_string(kMsgType, "D").set_string(kSymbol, "AAPL");
         auto sent = protocol.SendApplication(
             std::move(app_builder).build(), 100U + static_cast<std::uint64_t>(i));
         REQUIRE(sent.ok());
@@ -2475,7 +2478,7 @@ TEST_CASE("ResendRequest EndSeqNo=0 replays to infinity", "[admin-protocol]") {
 
     // EndSeqNo=0 means "all messages from BeginSeqNo to end"
     fastfix::message::MessageBuilder resend_builder("2");
-    resend_builder.set_string(35U, "2").set_int(7U, 1).set_int(16U, 0);
+    resend_builder.set_string(kMsgType, "2").set_int(kBeginSeqNo, 1).set_int(kEndSeqNo, 0);
     auto inbound = EncodeInboundFrame(
         std::move(resend_builder).build(),
         dictionary.value(),
@@ -2497,8 +2500,8 @@ TEST_CASE("ResendRequest EndSeqNo=0 replays to infinity", "[admin-protocol]") {
         event.value().outbound_frames[0U].bytes, dictionary.value());
     REQUIRE(gap_fill.ok());
     REQUIRE(gap_fill.value().header.msg_type == "4");
-    REQUIRE(gap_fill.value().message.view().get_boolean(123U).value());
-    REQUIRE(gap_fill.value().message.view().get_int(36U).value() == 2);
+    REQUIRE(gap_fill.value().message.view().get_boolean(kGapFillFlag).value());
+    REQUIRE(gap_fill.value().message.view().get_int(kNewSeqNo).value() == 2);
 
     for (std::size_t i = 1U; i < event.value().outbound_frames.size(); ++i) {
         auto replayed = fastfix::codec::DecodeFixMessage(
@@ -2540,7 +2543,7 @@ TEST_CASE("TestRequest happy path", "[admin-protocol]") {
 
     // Receive TestRequest with TestReqID
     fastfix::message::MessageBuilder test_builder("1");
-    test_builder.set_string(35U, "1").set_string(112U, "HELLO-123");
+    test_builder.set_string(kMsgType, "1").set_string(kTestReqID, "HELLO-123");
     auto inbound = EncodeInboundFrame(
         std::move(test_builder).build(),
         dictionary.value(),
@@ -2561,7 +2564,7 @@ TEST_CASE("TestRequest happy path", "[admin-protocol]") {
         event.value().outbound_frames.front().bytes, dictionary.value());
     REQUIRE(decoded.ok());
     REQUIRE(decoded.value().header.msg_type == "0");
-    REQUIRE(decoded.value().message.view().get_string(112U).value() == "HELLO-123");
+    REQUIRE(decoded.value().message.view().get_string(kTestReqID).value() == "HELLO-123");
 }
 
 TEST_CASE("TestRequest timeout triggers disconnect", "[admin-protocol]") {
@@ -2605,7 +2608,7 @@ TEST_CASE("TestRequest timeout triggers disconnect", "[admin-protocol]") {
         timer1.value().outbound_frames.front().bytes, dictionary.value());
     REQUIRE(test_request.ok());
     REQUIRE(test_request.value().header.msg_type == "1");
-    REQUIRE(test_request.value().message.view().has_field(112U));
+    REQUIRE(test_request.value().message.view().has_field(kTestReqID));
 
     // No Heartbeat response within another heartbeat_interval → disconnect
     auto timer2 = protocol.OnTimer(ts_test_request + kIntervalNs + 1U);
@@ -2643,7 +2646,7 @@ TEST_CASE("TestRequest duplicate handling", "[admin-protocol]") {
 
     // First TestRequest
     fastfix::message::MessageBuilder test1("1");
-    test1.set_string(35U, "1").set_string(112U, "DUP-REQ");
+    test1.set_string(kMsgType, "1").set_string(kTestReqID, "DUP-REQ");
     auto inbound1 = EncodeInboundFrame(
         std::move(test1).build(), dictionary.value(),
         "FIX.4.4", "BUY", "SELL", 2U, false);
@@ -2657,11 +2660,11 @@ TEST_CASE("TestRequest duplicate handling", "[admin-protocol]") {
         event1.value().outbound_frames.front().bytes, dictionary.value());
     REQUIRE(hb1.ok());
     REQUIRE(hb1.value().header.msg_type == "0");
-    REQUIRE(hb1.value().message.view().get_string(112U).value() == "DUP-REQ");
+    REQUIRE(hb1.value().message.view().get_string(kTestReqID).value() == "DUP-REQ");
 
     // Second TestRequest with same TestReqID at next seq
     fastfix::message::MessageBuilder test2("1");
-    test2.set_string(35U, "1").set_string(112U, "DUP-REQ");
+    test2.set_string(kMsgType, "1").set_string(kTestReqID, "DUP-REQ");
     auto inbound2 = EncodeInboundFrame(
         std::move(test2).build(), dictionary.value(),
         "FIX.4.4", "BUY", "SELL", 3U, false);
@@ -2675,7 +2678,7 @@ TEST_CASE("TestRequest duplicate handling", "[admin-protocol]") {
         event2.value().outbound_frames.front().bytes, dictionary.value());
     REQUIRE(hb2.ok());
     REQUIRE(hb2.value().header.msg_type == "0");
-    REQUIRE(hb2.value().message.view().get_string(112U).value() == "DUP-REQ");
+    REQUIRE(hb2.value().message.view().get_string(kTestReqID).value() == "DUP-REQ");
 }
 
 // ==================== SequenceReset Tests ====================
@@ -2710,7 +2713,7 @@ TEST_CASE("SequenceReset-Reset happy path", "[admin-protocol]") {
 
     // SequenceReset-Reset (no GapFillFlag) advances expected inbound seq
     fastfix::message::MessageBuilder reset_builder("4");
-    reset_builder.set_string(35U, "4").set_int(36U, 10);
+    reset_builder.set_string(kMsgType, "4").set_int(kNewSeqNo, 10);
     auto inbound = EncodeInboundFrame(
         std::move(reset_builder).build(),
         dictionary.value(),
@@ -2760,7 +2763,7 @@ TEST_CASE("SequenceReset backward rejected", "[admin-protocol]") {
 
     // NewSeqNo=1 is backward (next_in_seq will be 3 after ObserveInboundSeq(2))
     fastfix::message::MessageBuilder reset_builder("4");
-    reset_builder.set_string(35U, "4").set_int(36U, 1);
+    reset_builder.set_string(kMsgType, "4").set_int(kNewSeqNo, 1);
     auto inbound = EncodeInboundFrame(
         std::move(reset_builder).build(),
         dictionary.value(),
@@ -2780,9 +2783,9 @@ TEST_CASE("SequenceReset backward rejected", "[admin-protocol]") {
         event.value().outbound_frames.front().bytes, dictionary.value());
     REQUIRE(decoded.ok());
     REQUIRE(decoded.value().header.msg_type == "3");
-    REQUIRE(decoded.value().message.view().get_int(371U).value() == 36);
-    REQUIRE(decoded.value().message.view().get_string(372U).value() == "4");
-    REQUIRE(decoded.value().message.view().get_int(373U).value() == 5);
+    REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == kNewSeqNo);
+    REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "4");
+    REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 5);
 }
 
 TEST_CASE("SequenceReset-GapFill happy path", "[admin-protocol]") {
@@ -2815,7 +2818,7 @@ TEST_CASE("SequenceReset-GapFill happy path", "[admin-protocol]") {
 
     // GapFill at expected seq advances inbound expected seq past the filled range
     fastfix::message::MessageBuilder gap_fill_builder("4");
-    gap_fill_builder.set_string(35U, "4").set_boolean(123U, true).set_int(36U, 5);
+    gap_fill_builder.set_string(kMsgType, "4").set_boolean(kGapFillFlag, true).set_int(kNewSeqNo, 5);
     auto inbound = EncodeInboundFrame(
         std::move(gap_fill_builder).build(),
         dictionary.value(),
@@ -2865,7 +2868,7 @@ TEST_CASE("SequenceReset-GapFill partial fill", "[admin-protocol]") {
 
     // Create a gap: receive heartbeat at seq 5 when expected is 2
     fastfix::message::MessageBuilder heartbeat_builder("0");
-    heartbeat_builder.set_string(35U, "0");
+    heartbeat_builder.set_string(kMsgType, "0");
     auto gap_inbound = EncodeInboundFrame(
         std::move(heartbeat_builder).build(),
         dictionary.value(),
@@ -2884,12 +2887,12 @@ TEST_CASE("SequenceReset-GapFill partial fill", "[admin-protocol]") {
         gap_event.value().outbound_frames.front().bytes, dictionary.value());
     REQUIRE(resend_req.ok());
     REQUIRE(resend_req.value().header.msg_type == "2");
-    REQUIRE(resend_req.value().message.view().get_int(7U).value() == 2);
-    REQUIRE(resend_req.value().message.view().get_int(16U).value() == 4);
+    REQUIRE(resend_req.value().message.view().get_int(kBeginSeqNo).value() == 2);
+    REQUIRE(resend_req.value().message.view().get_int(kEndSeqNo).value() == 4);
 
     // Partial GapFill: covers seqs 2-3 only (NewSeqNo=4), seq 4 still missing
     fastfix::message::MessageBuilder gap_fill_builder("4");
-    gap_fill_builder.set_string(35U, "4").set_boolean(123U, true).set_int(36U, 4);
+    gap_fill_builder.set_string(kMsgType, "4").set_boolean(kGapFillFlag, true).set_int(kNewSeqNo, 4);
     auto gap_fill_inbound = EncodeInboundFrame(
         std::move(gap_fill_builder).build(),
         dictionary.value(),
@@ -2944,9 +2947,9 @@ TEST_CASE("Reject received processed silently", "[admin-protocol]") {
 
     // Receive inbound Reject — protocol processes it silently
     fastfix::message::MessageBuilder reject_builder("3");
-    reject_builder.set_string(35U, "3")
-        .set_int(45U, 1)
-        .set_string(58U, "invalid message");
+    reject_builder.set_string(kMsgType, "3")
+        .set_int(kRefSeqNum, 1)
+        .set_string(kText, "invalid message");
     auto inbound = EncodeInboundFrame(
         std::move(reject_builder).build(),
         dictionary.value(),

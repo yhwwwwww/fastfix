@@ -37,12 +37,12 @@ struct ForwardingOptions {
     std::string_view begin_string;        // downstream BeginString (empty = use original)
 
     // Optional routing fields
-    std::string_view on_behalf_of_comp_id;   // tag 115, empty = omit
-    std::string_view deliver_to_comp_id;     // tag 128, empty = omit
+    std::string_view on_behalf_of_comp_id;   // OnBehalfOfCompID, empty = omit
+    std::string_view deliver_to_comp_id;     // DeliverToCompID, empty = omit
 
     // PossDupFlag / OrigSendingTime for forwarded retransmissions
-    bool poss_dup{false};                    // tag 43
-    std::string_view orig_sending_time;      // tag 122, empty = omit
+    bool poss_dup{false};                    // PossDupFlag
+    std::string_view orig_sending_time;      // OrigSendingTime, empty = omit
 
     // Delimiter (default SOH)
     char delimiter{kFixSoh};
@@ -52,7 +52,7 @@ struct ReplayOptions {
     std::string_view sender_comp_id;
     std::string_view target_comp_id;
     std::string_view begin_string;
-    std::string_view default_appl_ver_id;   // tag 1137, empty = omit
+    std::string_view default_appl_ver_id;   // DefaultApplVerID, empty = omit
     std::uint32_t msg_seq_num{0};
     std::string_view sending_time;          // new sending time
     std::string_view orig_sending_time;     // original sending time from stored frame

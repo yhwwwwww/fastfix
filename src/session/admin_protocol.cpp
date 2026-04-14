@@ -5,12 +5,15 @@
 #include <cstring>
 #include <string_view>
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/message/typed_message.h"
 #include "fastfix/codec/raw_passthrough.h"
 
 namespace fastfix::session {
 
 namespace {
+
+using namespace fastfix::codec::tags;
 
 constexpr std::uint64_t kNanosPerSecond = 1'000'000'000ULL;
 constexpr std::uint32_t kSessionRejectRequiredTagMissing = 1U;
@@ -52,7 +55,7 @@ auto ParseSequenceResetNewSeq(
     std::uint32_t* new_seq_num,
     std::uint32_t* reject_reason,
     std::string* text) -> bool {
-    const auto value = view.get_int(36U);
+    const auto value = view.get_int(kNewSeqNo);
     if (!value.has_value() || value.value() <= 0) {
         *reject_reason = kSessionRejectRequiredTagMissing;
         *text = "SequenceReset requires NewSeqNo";
@@ -65,7 +68,7 @@ auto ParseSequenceResetNewSeq(
 
 auto BuildAdminMessage(std::string_view msg_type) -> message::MessageBuilder {
     message::MessageBuilder builder{std::string(msg_type)};
-    builder.set_string(35U, std::string(msg_type));
+    builder.set_string(kMsgType, std::string(msg_type));
     return builder;
 }
 
@@ -149,17 +152,11 @@ auto ComputeBodyStartOffset(std::span<const std::byte> frame) -> std::uint32_t {
 
         const auto field_end = soh + 1;
 
-        // Check if this is a session header tag
-        switch (tag) {
-            case 8U: case 9U: case 10U:
-            case 34U: case 35U: case 43U:
-            case 49U: case 52U: case 56U:
-            case 97U: case 122U: case 1137U:
-                last_header_end = field_end;
-                break;
-            default:
-                // First non-header tag — body starts at the current position
-                return static_cast<std::uint32_t>(last_header_end);
+        if (fastfix::codec::tags::IsSessionEnvelopeTag(tag)) {
+            last_header_end = field_end;
+        } else {
+            // First non-header tag — body starts at the current position
+            return static_cast<std::uint32_t>(last_header_end);
         }
 
         pos = field_end;
@@ -283,7 +280,7 @@ auto AdminProtocol::ValidateCompIds(
     const bool is_logon = decoded.header.msg_type == "A";
     if (config_.validation_policy.enforce_comp_ids &&
         !config_.target_comp_id.empty() && decoded.header.sender_comp_id != config_.target_comp_id) {
-        *ref_tag_id = 49U;
+        *ref_tag_id = kSenderCompID;
         *reject_reason = kSessionRejectCompIdProblem;
         *text = "unexpected SenderCompID on inbound frame";
         *disconnect = true;
@@ -291,7 +288,7 @@ auto AdminProtocol::ValidateCompIds(
     }
     if (config_.validation_policy.enforce_comp_ids &&
         !config_.sender_comp_id.empty() && decoded.header.target_comp_id != config_.sender_comp_id) {
-        *ref_tag_id = 56U;
+        *ref_tag_id = kTargetCompID;
         *reject_reason = kSessionRejectCompIdProblem;
         *text = "unexpected TargetCompID on inbound frame";
         *disconnect = true;
@@ -299,7 +296,7 @@ auto AdminProtocol::ValidateCompIds(
     }
     if (is_logon && config_.validation_policy.require_default_appl_ver_id_on_logon &&
         config_.transport_profile.requires_default_appl_ver_id && decoded.header.default_appl_ver_id.empty()) {
-        *ref_tag_id = 1137U;
+        *ref_tag_id = kDefaultApplVerID;
         *reject_reason = kSessionRejectRequiredTagMissing;
         *text = "FIXT.1.1 logon requires DefaultApplVerID";
         *disconnect = true;
@@ -308,7 +305,7 @@ auto AdminProtocol::ValidateCompIds(
     if (is_logon && config_.validation_policy.require_default_appl_ver_id_on_logon &&
         !config_.default_appl_ver_id.empty() &&
         decoded.header.default_appl_ver_id != config_.default_appl_ver_id) {
-        *ref_tag_id = 1137U;
+        *ref_tag_id = kDefaultApplVerID;
         *reject_reason = kSessionRejectValueIncorrect;
         *text = "unexpected DefaultApplVerID on inbound frame";
         *disconnect = true;
@@ -353,34 +350,34 @@ auto AdminProtocol::ValidateAdministrativeMessage(
 
     const auto view = decoded.message.view();
     if (decoded.header.msg_type == "A") {
-        if (!view.has_field(98U)) {
-            *ref_tag_id = 98U;
+        if (!view.has_field(kEncryptMethod)) {
+            *ref_tag_id = kEncryptMethod;
             *reject_reason = kSessionRejectRequiredTagMissing;
             *text = "Logon requires EncryptMethod";
             *disconnect = true;
             return false;
         }
 
-        const auto encrypt_method = view.get_int(98U);
+        const auto encrypt_method = view.get_int(kEncryptMethod);
         if (!encrypt_method.has_value() || encrypt_method.value() != 0) {
-            *ref_tag_id = 98U;
+            *ref_tag_id = kEncryptMethod;
             *reject_reason = kSessionRejectValueIncorrect;
             *text = "Logon EncryptMethod must be 0";
             *disconnect = true;
             return false;
         }
 
-        if (!view.has_field(108U)) {
-            *ref_tag_id = 108U;
+        if (!view.has_field(kHeartBtInt)) {
+            *ref_tag_id = kHeartBtInt;
             *reject_reason = kSessionRejectRequiredTagMissing;
             *text = "Logon requires HeartBtInt";
             *disconnect = true;
             return false;
         }
 
-        const auto heartbeat_interval = view.get_int(108U);
+        const auto heartbeat_interval = view.get_int(kHeartBtInt);
         if (!heartbeat_interval.has_value() || heartbeat_interval.value() <= 0) {
-            *ref_tag_id = 108U;
+            *ref_tag_id = kHeartBtInt;
             *reject_reason = kSessionRejectValueIncorrect;
             *text = "Logon HeartBtInt must be positive";
             *disconnect = true;
@@ -388,43 +385,43 @@ auto AdminProtocol::ValidateAdministrativeMessage(
         }
     }
 
-    if (decoded.header.msg_type == "1" && !view.has_field(112U)) {
-        *ref_tag_id = 112U;
+    if (decoded.header.msg_type == "1" && !view.has_field(kTestReqID)) {
+        *ref_tag_id = kTestReqID;
         *reject_reason = kSessionRejectRequiredTagMissing;
         *text = "TestRequest requires TestReqID";
         return false;
     }
 
     if (decoded.header.msg_type == "2") {
-        if (!view.has_field(7U)) {
-            *ref_tag_id = 7U;
+        if (!view.has_field(kBeginSeqNo)) {
+            *ref_tag_id = kBeginSeqNo;
             *reject_reason = kSessionRejectRequiredTagMissing;
             *text = "ResendRequest requires BeginSeqNo";
             return false;
         }
-        if (!view.has_field(16U)) {
-            *ref_tag_id = 16U;
+        if (!view.has_field(kEndSeqNo)) {
+            *ref_tag_id = kEndSeqNo;
             *reject_reason = kSessionRejectRequiredTagMissing;
             *text = "ResendRequest requires EndSeqNo";
             return false;
         }
 
-        const auto begin_seq = view.get_int(7U);
-        const auto end_seq = view.get_int(16U);
+        const auto begin_seq = view.get_int(kBeginSeqNo);
+        const auto end_seq = view.get_int(kEndSeqNo);
         if (!begin_seq.has_value() || begin_seq.value() <= 0) {
-            *ref_tag_id = 7U;
+            *ref_tag_id = kBeginSeqNo;
             *reject_reason = kSessionRejectValueIncorrect;
             *text = "ResendRequest BeginSeqNo must be positive";
             return false;
         }
         if (!end_seq.has_value() || end_seq.value() < 0) {
-            *ref_tag_id = 16U;
+            *ref_tag_id = kEndSeqNo;
             *reject_reason = kSessionRejectValueIncorrect;
             *text = "ResendRequest EndSeqNo must be zero or positive";
             return false;
         }
         if (end_seq.value() != 0 && begin_seq.value() > end_seq.value()) {
-            *ref_tag_id = 16U;
+            *ref_tag_id = kEndSeqNo;
             *reject_reason = kSessionRejectValueIncorrect;
             *text = "ResendRequest BeginSeqNo must be less than or equal to EndSeqNo";
             return false;
@@ -448,7 +445,7 @@ auto AdminProtocol::ValidateApplicationMessage(
         if (!config_.validation_policy.require_known_app_message_type) {
             return true;
         }
-        *ref_tag_id = 35U;
+        *ref_tag_id = kMsgType;
         *reject_reason = kSessionRejectInvalidMsgType;
         *text = "application message type is not present in the bound dictionary";
         return false;
@@ -610,9 +607,9 @@ auto AdminProtocol::EncodeFrame(
 
 auto AdminProtocol::BuildLogonFrame(std::uint64_t timestamp_ns, bool reset_seq_num) -> base::Result<EncodedFrame> {
     auto builder = BuildAdminMessage("A");
-    builder.set_int(98U, 0).set_int(108U, static_cast<std::int64_t>(config_.heartbeat_interval_seconds));
+    builder.set_int(kEncryptMethod, 0).set_int(kHeartBtInt, static_cast<std::int64_t>(config_.heartbeat_interval_seconds));
     if (reset_seq_num) {
-        builder.set_boolean(141U, true);
+        builder.set_boolean(kResetSeqNumFlag, true);
     }
     return EncodeFrame(std::move(builder).build(), true, timestamp_ns, true, false, true, 0U);
 }
@@ -621,7 +618,7 @@ auto AdminProtocol::BuildHeartbeatFrame(std::uint64_t timestamp_ns, std::string_
     -> base::Result<EncodedFrame> {
     auto builder = BuildAdminMessage("0");
     if (!test_request_id.empty()) {
-        builder.set_string(112U, std::string(test_request_id));
+        builder.set_string(kTestReqID, std::string(test_request_id));
     }
     return EncodeFrame(std::move(builder).build(), true, timestamp_ns, true, false, true, 0U);
 }
@@ -629,7 +626,7 @@ auto AdminProtocol::BuildHeartbeatFrame(std::uint64_t timestamp_ns, std::string_
 auto AdminProtocol::BuildTestRequestFrame(std::uint64_t timestamp_ns, std::string_view test_request_id)
     -> base::Result<EncodedFrame> {
     auto builder = BuildAdminMessage("1");
-    builder.set_string(112U, std::string(test_request_id));
+    builder.set_string(kTestReqID, std::string(test_request_id));
     return EncodeFrame(std::move(builder).build(), true, timestamp_ns, true, false, true, 0U);
 }
 
@@ -638,8 +635,8 @@ auto AdminProtocol::BuildResendRequestFrame(
     std::uint32_t end_seq,
     std::uint64_t timestamp_ns) -> base::Result<EncodedFrame> {
     auto builder = BuildAdminMessage("2");
-    builder.set_int(7U, static_cast<std::int64_t>(begin_seq))
-        .set_int(16U, static_cast<std::int64_t>(end_seq));
+    builder.set_int(kBeginSeqNo, static_cast<std::int64_t>(begin_seq))
+        .set_int(kEndSeqNo, static_cast<std::int64_t>(end_seq));
     return EncodeFrame(std::move(builder).build(), true, timestamp_ns, true, false, true, 0U);
 }
 
@@ -648,8 +645,8 @@ auto AdminProtocol::BuildGapFillFrame(
     std::uint32_t new_seq_num,
     std::uint64_t timestamp_ns) -> base::Result<EncodedFrame> {
     auto builder = BuildAdminMessage("4");
-    builder.set_boolean(123U, true).set_int(36U, static_cast<std::int64_t>(new_seq_num));
-    builder.set_boolean(43U, true);
+    builder.set_boolean(kGapFillFlag, true).set_int(kNewSeqNo, static_cast<std::int64_t>(new_seq_num));
+    builder.set_boolean(kPossDupFlag, true);
     return EncodeFrame(
         std::move(builder).build(),
         true,
@@ -669,16 +666,16 @@ auto AdminProtocol::BuildRejectFrame(
     std::string text,
     std::uint64_t timestamp_ns) -> base::Result<EncodedFrame> {
     auto builder = BuildAdminMessage("3");
-    builder.set_int(45U, static_cast<std::int64_t>(ref_seq_num));
-    builder.set_string(372U, std::string(ref_msg_type));
+    builder.set_int(kRefSeqNum, static_cast<std::int64_t>(ref_seq_num));
+    builder.set_string(kRefMsgType, std::string(ref_msg_type));
     if (ref_tag_id != 0U) {
-        builder.set_int(371U, static_cast<std::int64_t>(ref_tag_id));
+        builder.set_int(kRefTagID, static_cast<std::int64_t>(ref_tag_id));
     }
     if (reject_reason != 0U) {
-        builder.set_int(373U, static_cast<std::int64_t>(reject_reason));
+        builder.set_int(kRejectReason, static_cast<std::int64_t>(reject_reason));
     }
     if (!text.empty()) {
-        builder.set_string(58U, std::move(text));
+        builder.set_string(kText, std::move(text));
     }
     return EncodeFrame(std::move(builder).build(), true, timestamp_ns, true, false, true, 0U);
 }
@@ -949,8 +946,8 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
 
     const auto view = decoded.message.view();
     const auto msg_type = view.msg_type();
-    const bool inbound_gap_fill = msg_type == "4" && HasBoolean(view, 123U);
-    const bool inbound_logon_reset = msg_type == "A" && HasBoolean(view, 141U);
+    const bool inbound_gap_fill = msg_type == "4" && HasBoolean(view, kGapFillFlag);
+    const bool inbound_logon_reset = msg_type == "A" && HasBoolean(view, kResetSeqNumFlag);
 
     std::uint32_t ref_tag_id = 0U;
     std::uint32_t reject_reason = 0U;
@@ -970,7 +967,7 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
     if (!status.ok()) {
         return RejectInbound(
             decoded,
-            122U,
+            kOrigSendingTime,
             kSessionRejectRequiredTagMissing,
             status.message(),
             timestamp_ns,
@@ -1013,7 +1010,7 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
             if (!ParseSequenceResetNewSeq(view, &new_seq_num, &reject_reason, &reject_text)) {
                 return RejectInbound(
                     decoded,
-                    36U,
+                    kNewSeqNo,
                     reject_reason,
                     std::move(reject_text),
                     timestamp_ns,
@@ -1148,7 +1145,7 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
     }
 
     if (msg_type == "A") {
-        const bool inbound_reset = HasBoolean(view, 141U);
+        const bool inbound_reset = HasBoolean(view, kResetSeqNumFlag);
         if (inbound_reset) {
             const auto snapshot = session_.Snapshot();
             const auto next_out = config_.session.is_initiator ? snapshot.next_out_seq : 1U;
@@ -1179,7 +1176,7 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
     }
 
     if (msg_type == "0") {
-        const auto test_request_id = GetStringView(view, 112U);
+        const auto test_request_id = GetStringView(view, kTestReqID);
         if (!test_request_id.empty() && test_request_id == outstanding_test_request_id_) {
             outstanding_test_request_id_.clear();
             test_request_sent_ns_ = 0U;
@@ -1188,7 +1185,7 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
     }
 
     if (msg_type == "1") {
-        auto response = BuildHeartbeatFrame(timestamp_ns, GetStringView(view, 112U));
+        auto response = BuildHeartbeatFrame(timestamp_ns, GetStringView(view, kTestReqID));
         if (!response.ok()) {
             return response.status();
         }
@@ -1197,8 +1194,8 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
     }
 
     if (msg_type == "2") {
-        const auto begin_seq = static_cast<std::uint32_t>(std::max<std::int64_t>(1, GetInt(view, 7U, 1)));
-        const auto end_seq = static_cast<std::uint32_t>(std::max<std::int64_t>(0, GetInt(view, 16U, 0)));
+        const auto begin_seq = static_cast<std::uint32_t>(std::max<std::int64_t>(1, GetInt(view, kBeginSeqNo, 1)));
+        const auto end_seq = static_cast<std::uint32_t>(std::max<std::int64_t>(0, GetInt(view, kEndSeqNo, 0)));
         if (auto replay_frames = AcquireReplayFrameBuffer()) {
             status = ReplayOutbound(begin_seq, end_seq, timestamp_ns, replay_frames.get());
             if (!status.ok()) {
@@ -1222,7 +1219,7 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
         if (!ParseSequenceResetNewSeq(view, &new_seq_num, &reject_reason, &reject_text)) {
             return RejectInbound(
                 decoded,
-                36U,
+                kNewSeqNo,
                 reject_reason,
                 std::move(reject_text),
                 timestamp_ns,
@@ -1233,7 +1230,7 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
         if (new_seq_num < snapshot.next_in_seq) {
             return RejectInbound(
                 decoded,
-                36U,
+                kNewSeqNo,
                 kSessionRejectValueIncorrect,
                 "SequenceReset NewSeqNo must not move inbound sequence backwards",
                 timestamp_ns,
@@ -1288,7 +1285,7 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
     }
 
     event.application_messages.push_back(message::MessageRef(decoded.message.view()));
-    if (HasBoolean(view, 97U)) {
+    if (HasBoolean(view, kPossResend)) {
         event.poss_resend = true;
     }
     return event;
@@ -1460,7 +1457,7 @@ auto AdminProtocol::BeginLogout(std::string text, std::uint64_t timestamp_ns) ->
 
     auto builder = BuildAdminMessage("5");
     if (!text.empty()) {
-        builder.set_string(58U, std::move(text));
+        builder.set_string(kText, std::move(text));
     }
     logout_sent_ = true;
     logout_sent_ns_ = timestamp_ns;

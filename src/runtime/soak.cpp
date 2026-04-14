@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "fastfix/codec/fix_codec.h"
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/message/message.h"
 #include "fastfix/profile/normalized_dictionary.h"
 #include "fastfix/profile/profile_loader.h"
@@ -20,6 +21,8 @@
 namespace fastfix::runtime {
 
 namespace {
+
+using namespace fastfix::codec::tags;
 
 constexpr std::uint64_t kNanosPerSecond = 1'000'000'000ULL;
 
@@ -37,34 +40,34 @@ auto AdvanceTime(SoakSessionHarness* harness, std::uint64_t delta_ns) -> std::ui
 
 auto BuildAdminMessage(std::string_view msg_type) -> message::MessageBuilder {
     message::MessageBuilder builder{std::string(msg_type)};
-    builder.set_string(35U, std::string(msg_type));
+    builder.set_string(kMsgType, std::string(msg_type));
     return builder;
 }
 
 auto BuildLogonMessage(std::uint32_t heartbeat_interval_seconds) -> message::Message {
     auto builder = BuildAdminMessage("A");
-    builder.set_int(98U, 0).set_int(108U, static_cast<std::int64_t>(heartbeat_interval_seconds));
+    builder.set_int(kEncryptMethod, 0).set_int(kHeartBtInt, static_cast<std::int64_t>(heartbeat_interval_seconds));
     return std::move(builder).build();
 }
 
 auto BuildHeartbeatMessage(std::string test_request_id) -> message::Message {
     auto builder = BuildAdminMessage("0");
     if (!test_request_id.empty()) {
-        builder.set_string(112U, std::move(test_request_id));
+        builder.set_string(kTestReqID, std::move(test_request_id));
     }
     return std::move(builder).build();
 }
 
 auto BuildResendRequestMessage(std::uint32_t begin_seq, std::uint32_t end_seq) -> message::Message {
     auto builder = BuildAdminMessage("2");
-    builder.set_int(7U, static_cast<std::int64_t>(begin_seq))
-        .set_int(16U, static_cast<std::int64_t>(end_seq));
+    builder.set_int(kBeginSeqNo, static_cast<std::int64_t>(begin_seq))
+        .set_int(kEndSeqNo, static_cast<std::int64_t>(end_seq));
     return std::move(builder).build();
 }
 
 auto BuildGapFillMessage(std::uint32_t new_seq_num) -> message::Message {
     auto builder = BuildAdminMessage("4");
-    builder.set_boolean(123U, true).set_int(36U, static_cast<std::int64_t>(new_seq_num));
+    builder.set_boolean(kGapFillFlag, true).set_int(kNewSeqNo, static_cast<std::int64_t>(new_seq_num));
     return std::move(builder).build();
 }
 
@@ -73,21 +76,21 @@ auto BuildApplicationMessage(
     std::uint32_t round,
     bool with_group) -> message::Message {
     message::MessageBuilder builder("D");
-    builder.set_string(35U, "D");
-    builder.set_string(11U, "ORD-" + std::to_string(round + 1U));
-    builder.set_string(55U, "AAPL");
-    builder.set_char(54U, '1');
-    builder.set_string(60U, "20260406-12:00:00.000");
-    builder.set_int(38U, static_cast<std::int64_t>(100U + round));
-    builder.set_char(40U, '2');
-    if (dictionary.find_field(1U) != nullptr && (round % 2U) == 0U) {
-        builder.set_string(1U, "ACCT-" + std::to_string(round + 1U));
+    builder.set_string(kMsgType, "D");
+    builder.set_string(kClOrdID, "ORD-" + std::to_string(round + 1U));
+    builder.set_string(kSymbol, "AAPL");
+    builder.set_char(kSide, '1');
+    builder.set_string(kTransactTime, "20260406-12:00:00.000");
+    builder.set_int(kOrderQty, static_cast<std::int64_t>(100U + round));
+    builder.set_char(kOrdType, '2');
+    if (dictionary.find_field(kAccount) != nullptr && (round % 2U) == 0U) {
+        builder.set_string(kAccount, "ACCT-" + std::to_string(round + 1U));
     }
     if (with_group) {
-        auto party = builder.add_group_entry(453U);
-        party.set_string(448U, "PTY-" + std::to_string(round + 1U))
-            .set_char(447U, 'D')
-            .set_int(452U, static_cast<std::int64_t>(7U + (round % 3U)));
+        auto party = builder.add_group_entry(kNoPartyIDs);
+        party.set_string(kPartyID, "PTY-" + std::to_string(round + 1U))
+            .set_char(kPartyIDSource, 'D')
+            .set_int(kPartyRole, static_cast<std::int64_t>(7U + (round % 3U)));
     }
     return std::move(builder).build();
 }
@@ -154,7 +157,7 @@ auto ProcessEvent(
             if (!decoded.ok()) {
                 return decoded.status();
             }
-            const auto test_request_id = decoded.value().message.view().get_string(112U);
+            const auto test_request_id = decoded.value().message.view().get_string(kTestReqID);
             if (test_request_id.has_value()) {
                 test_request_ids->push_back(std::string(test_request_id.value()));
             }

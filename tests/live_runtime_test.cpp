@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/runtime/application.h"
 #include "fastfix/runtime/engine.h"
 #include "fastfix/runtime/io_poller.h"
@@ -21,6 +22,8 @@
 #include "test_support.h"
 
 namespace {
+
+using namespace fastfix::codec::tags;
 
 class MixedApplication final : public fastfix::runtime::ApplicationCallbacks,
                                public fastfix::runtime::QueueApplicationProvider {
@@ -373,9 +376,9 @@ auto RunInitiatorEchoSession(
 
         if (event.value().session_active && !sent_application) {
             fastfix::message::MessageBuilder builder("D");
-            builder.set_string(35U, "D");
-            auto party = builder.add_group_entry(453U);
-            party.set_string(448U, expected_party_id).set_char(447U, 'D').set_int(452U, 3);
+            builder.set_string(kMsgType, "D");
+            auto party = builder.add_group_entry(kNoPartyIDs);
+            party.set_string(kPartyID, expected_party_id).set_char(kPartyIDSource, 'D').set_int(kPartyRole, 3);
             auto outbound = initiator.SendApplication(std::move(builder).build(), NowNs());
             if (!outbound.ok()) {
                 return outbound.status();
@@ -389,9 +392,9 @@ auto RunInitiatorEchoSession(
         }
 
         if (!event.value().application_messages.empty()) {
-            const auto group = event.value().application_messages.front().view().group(453U);
+            const auto group = event.value().application_messages.front().view().group(kNoPartyIDs);
             const auto echoed_party =
-                group.has_value() && group->size() == 1U ? (*group)[0].get_string(448U) : std::optional<std::string_view>{};
+                group.has_value() && group->size() == 1U ? (*group)[0].get_string(kPartyID) : std::optional<std::string_view>{};
             if (!echoed_party.has_value() || echoed_party.value() != expected_party_id) {
                 return fastfix::base::Status::InvalidArgument("echoed application message did not preserve repeating group data");
             }
@@ -694,19 +697,19 @@ TEST_CASE("live-runtime", "[live-runtime]") {
         find_notification(notifications_42.value(), fastfix::session::SessionNotificationKind::kApplicationMessage);
     REQUIRE(app_notification_42 != nullptr);
     REQUIRE(app_notification_42->message.valid());
-    const auto parties_42 = app_notification_42->message_view().group(453U);
+    const auto parties_42 = app_notification_42->message_view().group(kNoPartyIDs);
     REQUIRE(parties_42.has_value());
     REQUIRE(parties_42->size() == 1U);
-    REQUIRE((*parties_42)[0].get_string(448U).value() == "PARTY-42");
+    REQUIRE((*parties_42)[0].get_string(kPartyID).value() == "PARTY-42");
 
     const auto* app_notification_fixt =
         find_notification(notifications_fixt.value(), fastfix::session::SessionNotificationKind::kApplicationMessage);
     REQUIRE(app_notification_fixt != nullptr);
     REQUIRE(app_notification_fixt->message.valid());
-    const auto parties_fixt = app_notification_fixt->message_view().group(453U);
+    const auto parties_fixt = app_notification_fixt->message_view().group(kNoPartyIDs);
     REQUIRE(parties_fixt.has_value());
     REQUIRE(parties_fixt->size() == 1U);
-    REQUIRE((*parties_fixt)[0].get_string(448U).value() == "PARTY-FIXT");
+    REQUIRE((*parties_fixt)[0].get_string(kPartyID).value() == "PARTY-FIXT");
 
     const auto* metrics_42 = engine.metrics().FindSession(3101U);
     const auto* metrics_fixt = engine.metrics().FindSession(3102U);

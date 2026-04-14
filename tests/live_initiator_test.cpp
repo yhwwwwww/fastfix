@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/runtime/application.h"
 #include "fastfix/runtime/engine.h"
 #include "fastfix/runtime/live_initiator.h"
@@ -23,6 +24,8 @@
 
 namespace {
 
+using namespace fastfix::codec::tags;
+
 auto NowNs() -> std::uint64_t {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch())
@@ -31,16 +34,16 @@ auto NowNs() -> std::uint64_t {
 
 auto BuildInitiatorMessage() -> fastfix::message::Message {
     fastfix::message::MessageBuilder builder("D");
-    builder.set_string(35U, "D");
-    auto party = builder.add_group_entry(453U);
-    party.set_string(448U, "INITIATOR-PARTY").set_char(447U, 'D').set_int(452U, 3);
+    builder.set_string(kMsgType, "D");
+    auto party = builder.add_group_entry(kNoPartyIDs);
+    party.set_string(kPartyID, "INITIATOR-PARTY").set_char(kPartyIDSource, 'D').set_int(kPartyRole, 3);
     return std::move(builder).build();
 }
 
 auto ValidateInitiatorEcho(fastfix::message::MessageView message) -> fastfix::base::Status {
-    const auto group = message.group(453U);
+    const auto group = message.group(kNoPartyIDs);
     if (!group.has_value() || group->size() != 1U ||
-        (*group)[0].get_string(448U) != std::optional<std::string_view>{"INITIATOR-PARTY"}) {
+        (*group)[0].get_string(kPartyID) != std::optional<std::string_view>{"INITIATOR-PARTY"}) {
         return fastfix::base::Status::InvalidArgument("runtime initiator application received an invalid echo");
     }
     return fastfix::base::Status::Ok();
@@ -852,10 +855,10 @@ TEST_CASE("live-initiator", "[live-initiator]") {
     const auto* app_notification = find_notification(fastfix::session::SessionNotificationKind::kApplicationMessage);
     REQUIRE(app_notification != nullptr);
     REQUIRE(app_notification->message.valid());
-    const auto parties = app_notification->message_view().group(453U);
+    const auto parties = app_notification->message_view().group(kNoPartyIDs);
     REQUIRE(parties.has_value());
     REQUIRE(parties->size() == 1U);
-    REQUIRE((*parties)[0].get_string(448U).value() == "INITIATOR-PARTY");
+    REQUIRE((*parties)[0].get_string(kPartyID).value() == "INITIATOR-PARTY");
 
     const auto* metrics = engine.metrics().FindSession(1201U);
     REQUIRE(metrics != nullptr);
@@ -1285,10 +1288,10 @@ TEST_CASE("live-initiator-queue", "[live-initiator-queue]") {
     const auto* app_notification = find_notification(fastfix::session::SessionNotificationKind::kApplicationMessage);
     REQUIRE(app_notification != nullptr);
     REQUIRE(app_notification->message.valid());
-    const auto parties = app_notification->message_view().group(453U);
+    const auto parties = app_notification->message_view().group(kNoPartyIDs);
     REQUIRE(parties.has_value());
     REQUIRE(parties->size() == 1U);
-    REQUIRE((*parties)[0].get_string(448U).value() == "INITIATOR-PARTY");
+    REQUIRE((*parties)[0].get_string(kPartyID).value() == "INITIATOR-PARTY");
 
     const auto* metrics = engine.metrics().FindSession(1202U);
     REQUIRE(metrics != nullptr);

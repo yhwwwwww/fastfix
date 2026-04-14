@@ -6,12 +6,15 @@
 #include <sstream>
 #include <string>
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/profile/dictgen_input.h"
 #include "fastfix/profile/normalized_dictionary.h"
 
 #include "../tools/xml2ffd/xml2ffd.h"
 
 namespace {
+
+using namespace fastfix::codec::tags;
 
 auto ReadFileContent(const std::filesystem::path& path) -> std::string {
     std::ifstream stream(path);
@@ -48,38 +51,38 @@ TEST_CASE("xml2ffd converts QuickFIX XML to valid ffd", "[xml2ffd]") {
         // The test XML has 37 fields.
         CHECK(dict.fields.size() == 37U);
 
-        // Check specific field: MsgType (tag 35, type string).
+        // Check specific field: MsgType (type string).
         auto msgtype_it = std::find_if(dict.fields.begin(), dict.fields.end(),
-            [](const auto& f) { return f.tag == 35U; });
+            [](const auto& f) { return f.tag == kMsgType; });
         REQUIRE(msgtype_it != dict.fields.end());
         CHECK(msgtype_it->name == "MsgType");
         CHECK(msgtype_it->value_type == fastfix::profile::ValueType::kString);
         CHECK(msgtype_it->flags == 0U);
 
-        // Check Price (tag 44, type float).
+        // Check Price (type float).
         auto price_it = std::find_if(dict.fields.begin(), dict.fields.end(),
-            [](const auto& f) { return f.tag == 44U; });
+            [](const auto& f) { return f.tag == kPrice; });
         REQUIRE(price_it != dict.fields.end());
         CHECK(price_it->name == "Price");
         CHECK(price_it->value_type == fastfix::profile::ValueType::kFloat);
 
-        // Check TransactTime (tag 60, type timestamp).
+        // Check TransactTime (type timestamp).
         auto tt_it = std::find_if(dict.fields.begin(), dict.fields.end(),
-            [](const auto& f) { return f.tag == 60U; });
+            [](const auto& f) { return f.tag == kTransactTime; });
         REQUIRE(tt_it != dict.fields.end());
         CHECK(tt_it->name == "TransactTime");
         CHECK(tt_it->value_type == fastfix::profile::ValueType::kTimestamp);
 
-        // Check GapFillFlag (tag 123, type boolean).
+        // Check GapFillFlag (type boolean).
         auto gff_it = std::find_if(dict.fields.begin(), dict.fields.end(),
-            [](const auto& f) { return f.tag == 123U; });
+            [](const auto& f) { return f.tag == kGapFillFlag; });
         REQUIRE(gff_it != dict.fields.end());
         CHECK(gff_it->name == "GapFillFlag");
         CHECK(gff_it->value_type == fastfix::profile::ValueType::kBoolean);
 
-        // Check Side (tag 54, type char).
+        // Check Side (type char).
         auto side_it = std::find_if(dict.fields.begin(), dict.fields.end(),
-            [](const auto& f) { return f.tag == 54U; });
+            [](const auto& f) { return f.tag == kSide; });
         REQUIRE(side_it != dict.fields.end());
         CHECK(side_it->name == "Side");
         CHECK(side_it->value_type == fastfix::profile::ValueType::kChar);
@@ -118,13 +121,13 @@ TEST_CASE("xml2ffd converts QuickFIX XML to valid ffd", "[xml2ffd]") {
 
         // Check ClOrdID is required.
         auto clord_rule = std::find_if(nos_it->field_rules.begin(), nos_it->field_rules.end(),
-            [](const auto& r) { return r.tag == 11U; });
+            [](const auto& r) { return r.tag == kClOrdID; });
         REQUIRE(clord_rule != nos_it->field_rules.end());
         CHECK(clord_rule->required());
 
         // Check Price is optional.
         auto price_rule = std::find_if(nos_it->field_rules.begin(), nos_it->field_rules.end(),
-            [](const auto& r) { return r.tag == 44U; });
+            [](const auto& r) { return r.tag == kPrice; });
         REQUIRE(price_rule != nos_it->field_rules.end());
         CHECK(!price_rule->required());
 
@@ -142,9 +145,9 @@ TEST_CASE("xml2ffd converts QuickFIX XML to valid ffd", "[xml2ffd]") {
 
         // Check Parties group.
         auto parties_it = std::find_if(dict.groups.begin(), dict.groups.end(),
-            [](const auto& g) { return g.count_tag == 453U; });
+            [](const auto& g) { return g.count_tag == kNoPartyIDs; });
         REQUIRE(parties_it != dict.groups.end());
-        CHECK(parties_it->delimiter_tag == 448U);
+        CHECK(parties_it->delimiter_tag == kPartyID);
         CHECK(parties_it->name == "NoPartyIDs");
         CHECK(parties_it->field_rules.size() == 3U);
 

@@ -4,10 +4,13 @@
 #include <cstddef>
 #include <vector>
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/codec/fix_codec.h"
 #include "fastfix/codec/simd_scan.h"
 
 #include "test_support.h"
+
+using namespace fastfix::codec::tags;
 
 TEST_CASE("fix-codec", "[fix-codec]") {
     const auto ToReadableFrame = [](const std::vector<std::byte>& bytes) {
@@ -26,13 +29,13 @@ TEST_CASE("fix-codec", "[fix-codec]") {
     }
 
     fastfix::message::MessageBuilder builder("D");
-    builder.set_string(35U, "D")
-        .set_string(49U, "BUY")
-        .set_string(56U, "SELL")
-        .set_string(11U, "ORD-1")
-        .set_string(55U, "AAPL");
-    auto party = builder.add_group_entry(453U);
-    party.set_string(448U, "PARTY-1").set_char(447U, 'D').set_int(452U, 3);
+    builder.set_string(kMsgType, "D")
+        .set_string(kSenderCompID, "BUY")
+        .set_string(kTargetCompID, "SELL")
+        .set_string(kClOrdID, "ORD-1")
+        .set_string(kSymbol, "AAPL");
+    auto party = builder.add_group_entry(kNoPartyIDs);
+    party.set_string(kPartyID, "PARTY-1").set_char(kPartyIDSource, 'D').set_int(kPartyRole, 3);
 
     const auto message = std::move(builder).build();
     fastfix::codec::EncodeOptions options;
@@ -89,9 +92,9 @@ TEST_CASE("fix-codec", "[fix-codec]") {
     REQUIRE(decoded.value().header.msg_type == "D");
     REQUIRE(decoded.value().header.msg_seq_num == 1U);
     REQUIRE(!decoded.value().validation_issue.present());
-    REQUIRE(decoded.value().message.view().group(453U).has_value());
-    REQUIRE(decoded.value().message.view().group(453U)->size() == 1U);
-    REQUIRE((*decoded.value().message.view().group(453U))[0].get_string(448U).value() == "PARTY-1");
+    REQUIRE(decoded.value().message.view().group(kNoPartyIDs).has_value());
+    REQUIRE(decoded.value().message.view().group(kNoPartyIDs)->size() == 1U);
+    REQUIRE((*decoded.value().message.view().group(kNoPartyIDs))[0].get_string(kPartyID).value() == "PARTY-1");
 
     auto decoded_view = fastfix::codec::DecodeFixMessageView(encoded.value(), dictionary.value());
     REQUIRE(decoded_view.ok());
@@ -104,13 +107,13 @@ TEST_CASE("fix-codec", "[fix-codec]") {
         decoded_view.value().raw.end(),
         encoded.value().begin(),
         encoded.value().end()));
-    const auto raw_parties = decoded_view.value().message.view().raw_group(453U);
+    const auto raw_parties = decoded_view.value().message.view().raw_group(kNoPartyIDs);
     REQUIRE(raw_parties.has_value());
     REQUIRE(raw_parties->size() == 1U);
-    REQUIRE((*raw_parties)[0].field(448U).value() == "PARTY-1");
-    REQUIRE((*raw_parties)[0].field_at(0U).value().tag == 448U);
+    REQUIRE((*raw_parties)[0].field(kPartyID).value() == "PARTY-1");
+    REQUIRE((*raw_parties)[0].field_at(0U).value().tag == kPartyID);
     REQUIRE((*raw_parties)[0].field_at(0U).value().value == "PARTY-1");
-    REQUIRE(!message.view().raw_group(453U).has_value());
+    REQUIRE(!message.view().raw_group(kNoPartyIDs).has_value());
 
     fastfix::codec::DecodedMessageView reusable_decoded;
     auto reusable_status = fastfix::codec::DecodeFixMessageView(
@@ -119,15 +122,15 @@ TEST_CASE("fix-codec", "[fix-codec]") {
         &reusable_decoded);
     REQUIRE(reusable_status.ok());
     REQUIRE(reusable_decoded.header.msg_type == "D");
-    REQUIRE(reusable_decoded.message.view().group(453U).has_value());
+    REQUIRE(reusable_decoded.message.view().group(kNoPartyIDs).has_value());
 
     fastfix::message::MessageBuilder cancel_builder("F");
-    cancel_builder.set_string(35U, "F")
-        .set_string(49U, "BUY")
-        .set_string(56U, "SELL")
-        .set_string(11U, "ORD-2")
+    cancel_builder.set_string(kMsgType, "F")
+        .set_string(kSenderCompID, "BUY")
+        .set_string(kTargetCompID, "SELL")
+        .set_string(kClOrdID, "ORD-2")
         .set_string(41U, "ORD-1")
-        .set_string(55U, "MSFT");
+        .set_string(kSymbol, "MSFT");
     options.msg_seq_num = 2U;
     options.sending_time = "20260402-12:00:00.001";
     auto cancel_encoded = fastfix::codec::EncodeFixMessage(
@@ -145,7 +148,7 @@ TEST_CASE("fix-codec", "[fix-codec]") {
     REQUIRE(reusable_decoded.header.msg_seq_num == 2U);
     REQUIRE(reusable_decoded.message.view().msg_type() == "F");
     REQUIRE(reusable_decoded.message.view().get_string(41U).value() == "ORD-1");
-    REQUIRE(!reusable_decoded.message.view().group(453U).has_value());
+    REQUIRE(!reusable_decoded.message.view().group(kNoPartyIDs).has_value());
     REQUIRE(reusable_decoded.raw.size() == cancel_encoded.value().size());
 
     fastfix::message::MessageRef parsed_owned_ref;
@@ -158,10 +161,10 @@ TEST_CASE("fix-codec", "[fix-codec]") {
     }
     REQUIRE(parsed_owned_ref.valid());
     REQUIRE(parsed_owned_ref.owns_message());
-    const auto parsed_owned_group = parsed_owned_ref.view().group(453U);
+    const auto parsed_owned_group = parsed_owned_ref.view().group(kNoPartyIDs);
     REQUIRE(parsed_owned_group.has_value());
     REQUIRE(parsed_owned_group->size() == 1U);
-    REQUIRE((*parsed_owned_group)[0].get_string(448U).value() == "PARTY-1");
+    REQUIRE((*parsed_owned_group)[0].get_string(kPartyID).value() == "PARTY-1");
 
     auto peeked_view = fastfix::codec::PeekSessionHeaderView(encoded.value());
     REQUIRE(peeked_view.ok());
@@ -184,7 +187,7 @@ TEST_CASE("fix-codec", "[fix-codec]") {
         dictionary.value());
     REQUIRE(disallowed.ok());
     REQUIRE(disallowed.value().validation_issue.kind == fastfix::codec::ValidationIssueKind::kFieldNotAllowed);
-    REQUIRE(disallowed.value().validation_issue.tag == 448U);
+    REQUIRE(disallowed.value().validation_issue.tag == kPartyID);
 
     auto duplicate = fastfix::codec::DecodeFixMessage(
         ::fastfix::tests::EncodeFixFrame(
@@ -192,7 +195,7 @@ TEST_CASE("fix-codec", "[fix-codec]") {
         dictionary.value());
     REQUIRE(duplicate.ok());
     REQUIRE(duplicate.value().validation_issue.kind == fastfix::codec::ValidationIssueKind::kDuplicateField);
-    REQUIRE(duplicate.value().validation_issue.tag == 55U);
+    REQUIRE(duplicate.value().validation_issue.tag == kSymbol);
 
     auto out_of_order = fastfix::codec::DecodeFixMessage(
         ::fastfix::tests::EncodeFixFrame(
@@ -208,17 +211,17 @@ TEST_CASE("fix-codec", "[fix-codec]") {
         dictionary.value());
     REQUIRE(invalid_group.ok());
     REQUIRE(invalid_group.value().validation_issue.present());
-    REQUIRE(invalid_group.value().validation_issue.tag == 453U);
+    REQUIRE(invalid_group.value().validation_issue.tag == kNoPartyIDs);
 
     fastfix::message::MessageBuilder reordered_builder("D");
-    reordered_builder.set_string(35U, "D")
-        .set_string(49U, "BUY")
-        .set_string(56U, "SELL")
-        .set_string(55U, "MSFT")
-        .set_string(11U, "ORD-2")
+    reordered_builder.set_string(kMsgType, "D")
+        .set_string(kSenderCompID, "BUY")
+        .set_string(kTargetCompID, "SELL")
+        .set_string(kSymbol, "MSFT")
+        .set_string(kClOrdID, "ORD-2")
         .set_string(9999U, "EXTRA");
-    auto reordered_party = reordered_builder.add_group_entry(453U);
-    reordered_party.set_string(448U, "PARTY-2").set_char(447U, 'D').set_int(452U, 3);
+    auto reordered_party = reordered_builder.add_group_entry(kNoPartyIDs);
+    reordered_party.set_string(kPartyID, "PARTY-2").set_char(kPartyIDSource, 'D').set_int(kPartyRole, 3);
 
     options.msg_seq_num = 7U;
     options.sending_time = "20260402-12:00:01.000";
@@ -283,10 +286,12 @@ TEST_CASE("fix-codec", "[fix-codec]") {
     REQUIRE(reordered_decoded.value().validation_issue.tag == 9999U);
 
     fastfix::message::MessageBuilder spill_builder("D");
-    spill_builder.set_string(35U, "D").set_string(49U, "BUY").set_string(56U, "SELL");
+    spill_builder.set_string(kMsgType, "D").set_string(kSenderCompID, "BUY").set_string(kTargetCompID, "SELL");
     for (int index = 0; index < 10; ++index) {
-        auto spill_party = spill_builder.add_group_entry(453U);
-        spill_party.set_string(448U, "PARTY-" + std::to_string(index)).set_char(447U, 'D').set_int(452U, index % 10);
+        auto spill_party = spill_builder.add_group_entry(kNoPartyIDs);
+        spill_party.set_string(kPartyID, "PARTY-" + std::to_string(index))
+            .set_char(kPartyIDSource, 'D')
+            .set_int(kPartyRole, index % 10);
     }
 
     options.msg_seq_num = 11U;
@@ -299,11 +304,11 @@ TEST_CASE("fix-codec", "[fix-codec]") {
 
     auto spill_decoded = fastfix::codec::DecodeFixMessageView(spill_encoded.value(), dictionary.value());
     REQUIRE(spill_decoded.ok());
-    const auto spill_parties = spill_decoded.value().message.view().group(453U);
+    const auto spill_parties = spill_decoded.value().message.view().group(kNoPartyIDs);
     REQUIRE(spill_parties.has_value());
     REQUIRE(spill_parties->size() == 10U);
-    REQUIRE((*spill_parties)[0].get_string(448U).value() == "PARTY-0");
-    REQUIRE((*spill_parties)[9].get_string(448U).value() == "PARTY-9");
+    REQUIRE((*spill_parties)[0].get_string(kPartyID).value() == "PARTY-0");
+    REQUIRE((*spill_parties)[9].get_string(kPartyID).value() == "PARTY-9");
 }
 
 TEST_CASE("SIMD SOH scan correctness", "[simd-scan]") {
@@ -657,7 +662,7 @@ TEST_CASE("codec negative: duplicate tag in message", "[fix-codec][negative]") {
     REQUIRE(result.ok());
     REQUIRE(result.value().validation_issue.present());
     REQUIRE(result.value().validation_issue.kind == fastfix::codec::ValidationIssueKind::kDuplicateField);
-    REQUIRE(result.value().validation_issue.tag == 11U);
+    REQUIRE(result.value().validation_issue.tag == kClOrdID);
 }
 
 TEST_CASE("PrecompiledTemplateTable build, find, and encode", "[fix-codec][precompiled-table]") {
@@ -688,15 +693,15 @@ TEST_CASE("PrecompiledTemplateTable build, find, and encode", "[fix-codec][preco
 
     // Build a message and encode via the precompiled table overload
     fastfix::message::MessageBuilder builder("D");
-    builder.set_string(35U, "D")
-        .set_string(49U, "BUY")
-        .set_string(56U, "SELL")
-        .set_string(11U, "ORD-1")
-        .set_string(55U, "AAPL");
-    auto side = builder.add_group_entry(552U);
-    side.set_char(54U, '1');
-    auto party = side.add_group_entry(453U);
-    party.set_string(448U, "PARTY-1");
+    builder.set_string(kMsgType, "D")
+        .set_string(kSenderCompID, "BUY")
+        .set_string(kTargetCompID, "SELL")
+        .set_string(kClOrdID, "ORD-1")
+        .set_string(kSymbol, "AAPL");
+    auto side = builder.add_group_entry(kNoSides);
+    side.set_char(kSide, '1');
+    auto party = side.add_group_entry(kNoPartyIDs);
+    party.set_string(kPartyID, "PARTY-1");
     const auto message = std::move(builder).build();
 
     fastfix::codec::EncodeOptions options;
@@ -833,9 +838,9 @@ TEST_CASE("fix-codec: deeply nested groups beyond kMaxGroupNestingDepth", "[fix-
     // Level 16: count=5033, delimiter=5034
 
     std::vector<fastfix::profile::FieldDef> fields = {
-        {35U, "MsgType", fastfix::profile::ValueType::kString, 0U},
-        {49U, "SenderCompID", fastfix::profile::ValueType::kString, 0U},
-        {56U, "TargetCompID", fastfix::profile::ValueType::kString, 0U},
+        {kMsgType, "MsgType", fastfix::profile::ValueType::kString, 0U},
+        {kSenderCompID, "SenderCompID", fastfix::profile::ValueType::kString, 0U},
+        {kTargetCompID, "TargetCompID", fastfix::profile::ValueType::kString, 0U},
     };
     for (std::uint32_t level = 0; level <= 16; ++level) {
         std::uint32_t count_tag = 5001U + level * 2U;
@@ -851,7 +856,7 @@ TEST_CASE("fix-codec: deeply nested groups beyond kMaxGroupNestingDepth", "[fix-
             .msg_type = "U1",
             .name = "DeepTest",
             .field_rules = {
-                {35U, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
+                {kMsgType, static_cast<std::uint32_t>(fastfix::profile::FieldRuleFlags::kRequired)},
                 {5001U, 0U},
             },
             .flags = 0U,

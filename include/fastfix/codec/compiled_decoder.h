@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/message/message.h"
 #include "fastfix/profile/normalized_dictionary.h"
 
@@ -68,14 +69,7 @@ class CompiledMessageDecoder {
 
     /// Check if a tag is a known session-header field handled by the header extraction path.
     [[nodiscard]] static auto is_header_tag(std::uint32_t tag) -> bool {
-        switch (tag) {
-            case 8U: case 9U: case 10U:  // frame structure
-            case 34U: case 35U: case 43U: case 49U: case 52U: case 56U:
-            case 97U: case 122U: case 1137U:
-                return true;
-            default:
-                return false;
-        }
+        return tags::IsSessionEnvelopeTag(tag);
     }
 
   private:

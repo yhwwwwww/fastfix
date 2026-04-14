@@ -13,6 +13,7 @@
 
 #include "fastfix/codec/fast_int_format.h"
 #include "fastfix/codec/fix_codec.h"
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/codec/simd_scan.h"
 
 namespace fastfix::message {
@@ -25,14 +26,7 @@ inline constexpr std::size_t kUintBufSize =
     static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::digits10) + 3U;
 
 auto IsEncodeManagedTag(std::uint32_t tag) -> bool {
-    switch (tag) {
-        case 8U: case 9U: case 10U:
-        case 34U: case 35U: case 43U:
-        case 49U: case 52U: case 56U:
-            return true;
-        default:
-            return false;
-    }
+    return fastfix::codec::tags::IsEncodeManagedTag(tag);
 }
 
 void SetEncodeStepPrefix(FixedLayout::EncodeStep& step, std::uint32_t tag) {
@@ -72,7 +66,7 @@ auto FixedLayout::Build(
 
     // First pass: assign slot indices.
     for (const auto& rule : rules) {
-        if (rule.tag == 35U) {
+        if (rule.tag == codec::tags::kMsgType) {
             continue;  // MsgType is implicit
         }
         if (dictionary.find_group(rule.tag) != nullptr) {
@@ -115,7 +109,7 @@ auto FixedLayout::Build(
 
     // Pre-compute msg_type_fragment_: "35={msg_type}\x01"
     layout.msg_type_fragment_.reserve(3U + msg_type.size() + 1U);
-    layout.msg_type_fragment_.append("35=");
+    layout.msg_type_fragment_.append(codec::tags::kMsgTypePrefix);
     layout.msg_type_fragment_.append(msg_type);
     layout.msg_type_fragment_.push_back(codec::kFixSoh);
 
@@ -247,10 +241,10 @@ auto FixedLayoutWriter::bind_session(
         2U + kBLPlaceholderWidth + 1U +   // "9=0000000000\x01"
         layout_->msg_type_fragment_.size());
 
-    frag.header_prefix.append("8=");
+    frag.header_prefix.append(codec::tags::kBeginStringPrefix);
     frag.header_prefix.append(begin_string);
     frag.header_prefix.push_back(codec::kFixSoh);
-    frag.header_prefix.append("9=");
+    frag.header_prefix.append(codec::tags::kBodyLengthPrefix);
     frag.body_length_offset = frag.header_prefix.size();
     frag.header_prefix.append("0000000000", kBLPlaceholderWidth);
     frag.header_prefix.push_back(codec::kFixSoh);
@@ -262,10 +256,10 @@ auto FixedLayoutWriter::bind_session(
     frag.sender_target.reserve(
         3U + sender_comp_id.size() + 1U +
         3U + target_comp_id.size() + 1U);
-    frag.sender_target.append("49=");
+    frag.sender_target.append(codec::tags::kSenderCompIDPrefix);
     frag.sender_target.append(sender_comp_id);
     frag.sender_target.push_back(codec::kFixSoh);
-    frag.sender_target.append("56=");
+    frag.sender_target.append(codec::tags::kTargetCompIDPrefix);
     frag.sender_target.append(target_comp_id);
     frag.sender_target.push_back(codec::kFixSoh);
 
@@ -405,7 +399,7 @@ auto FixedLayoutWriter::encode_to_buffer(
             const auto seq = options.msg_seq_num == 0U ? 1U : options.msg_seq_num;
             char buf[10];
             const auto len = codec::FormatUint32(buf, seq);
-            out.append("34=");
+            out.append(codec::tags::kMsgSeqNumPrefix);
             out.append(buf, len);
             out.push_back(delimiter);
         }
@@ -416,10 +410,10 @@ auto FixedLayoutWriter::encode_to_buffer(
         // --- Slow path: format each header field individually ---
 
         // 1. BeginString: 8={begin_string}\x01  9=
-        out.append("8=");
+        out.append(codec::tags::kBeginStringPrefix);
         out.append(options.begin_string);
         out.push_back(delimiter);
-        out.append("9=");
+        out.append(codec::tags::kBodyLengthPrefix);
 
         // 2. BodyLength placeholder (7 chars reserved)
         bl_offset = out.size();
@@ -435,18 +429,18 @@ auto FixedLayoutWriter::encode_to_buffer(
             const auto seq = options.msg_seq_num == 0U ? 1U : options.msg_seq_num;
             char buf[10];
             const auto len = codec::FormatUint32(buf, seq);
-            out.append("34=");
+            out.append(codec::tags::kMsgSeqNumPrefix);
             out.append(buf, len);
             out.push_back(delimiter);
         }
 
         // 5. SenderCompID
-        out.append("49=");
+        out.append(codec::tags::kSenderCompIDPrefix);
         out.append(options.sender_comp_id);
         out.push_back(delimiter);
 
         // 6. TargetCompID
-        out.append("56=");
+        out.append(codec::tags::kTargetCompIDPrefix);
         out.append(options.target_comp_id);
         out.push_back(delimiter);
     }
@@ -456,26 +450,26 @@ auto FixedLayoutWriter::encode_to_buffer(
     const auto sending_time = options.sending_time.empty()
         ? codec::CurrentUtcTimestamp(&ts_buf)
         : options.sending_time;
-    out.append("52=");
+    out.append(codec::tags::kSendingTimePrefix);
     out.append(sending_time);
     out.push_back(delimiter);
 
-    // 8. DefaultApplVerID (optional)
+    // 8. ApplVerID (optional)
     if (!options.default_appl_ver_id.empty()) {
-        out.append("1128=");
+        out.append(codec::tags::kApplVerIDPrefix);
         out.append(options.default_appl_ver_id);
         out.push_back(delimiter);
     }
 
     // 9. PossDup (optional)
     if (options.poss_dup) {
-        out.append("43=Y");
+        out.append(codec::tags::kPossDupFlagYesField);
         out.push_back(delimiter);
     }
 
     // 10. OrigSendingTime (optional)
     if (!options.orig_sending_time.empty()) {
-        out.append("122=");
+        out.append(codec::tags::kOrigSendingTimePrefix);
         out.append(options.orig_sending_time);
         out.push_back(delimiter);
     }
@@ -537,7 +531,7 @@ auto FixedLayoutWriter::encode_to_buffer(
     const auto checksum = codec::ComputeChecksumSIMD(out.data(), out.size()) % 256U;
 
     // 14. Trailer: 10=NNN\x01  (NOT included in checksum)
-    out.append("10=");
+    out.append(codec::tags::kCheckSumPrefix);
     std::array<char, 3> ck{};
     ck[0] = static_cast<char>('0' + ((checksum / 100U) % 10U));
     ck[1] = static_cast<char>('0' + ((checksum / 10U) % 10U));

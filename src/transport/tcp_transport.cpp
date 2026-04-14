@@ -1,5 +1,6 @@
 #include "fastfix/transport/tcp_transport.h"
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/codec/simd_scan.h"
 
 #include <arpa/inet.h>
@@ -27,9 +28,6 @@ constexpr std::size_t kDefaultFrameBufferCapacity = 1024U;
 constexpr std::size_t kMinimumFrameProbeBytes = 12U;
 constexpr std::size_t kBodyLengthFieldPrefixSize = 3U;
 constexpr std::size_t kChecksumFieldWireSize = 7U;
-constexpr char kFixBeginStringTag = '8';
-constexpr char kFixBodyLengthTag = '9';
-constexpr char kFixTagValueSeparator = '=';
 constexpr int kSocketOptionEnabled = 1;
 
 auto IsRetryableAcceptError(int error) -> bool {
@@ -126,8 +124,8 @@ auto TryExtractFrame(std::span<const std::byte> buffer, Sink&& sink) -> base::Re
     if (buffer.size() < kMinimumFrameProbeBytes) {
         return std::size_t{0};
     }
-    if (static_cast<char>(buffer[0]) != kFixBeginStringTag ||
-        static_cast<char>(buffer[1]) != kFixTagValueSeparator) {
+    if (static_cast<char>(buffer[0]) != codec::tags::kBeginStringPrefix.front() ||
+        static_cast<char>(buffer[1]) != codec::tags::kBeginStringPrefix[1]) {
         return base::Status::FormatError("FIX frame must begin with tag 8");
     }
 
@@ -140,8 +138,8 @@ auto TryExtractFrame(std::span<const std::byte> buffer, Sink&& sink) -> base::Re
     if (first_delimiter + kBodyLengthFieldPrefixSize >= buffer.size()) {
         return std::size_t{0};
     }
-    if (static_cast<char>(buffer[first_delimiter + 1U]) != kFixBodyLengthTag ||
-        static_cast<char>(buffer[first_delimiter + 2U]) != kFixTagValueSeparator) {
+    if (static_cast<char>(buffer[first_delimiter + 1U]) != codec::tags::kBodyLengthPrefix.front() ||
+        static_cast<char>(buffer[first_delimiter + 2U]) != codec::tags::kBodyLengthPrefix[1]) {
         return base::Status::FormatError("FIX frame must place BodyLength immediately after BeginString");
     }
 

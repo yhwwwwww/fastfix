@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/codec/fix_codec.h"
 #include "fastfix/message/fixed_layout_writer.h"
 #include "fastfix/message/message.h"
@@ -10,14 +11,19 @@
 
 #include "test_support.h"
 
+using namespace fastfix::codec::tags;
+
 TEST_CASE("message-api", "[message-api]") {
     auto dictionary_view = fastfix::tests::LoadFix44DictionaryViewOrSkip();
     auto dictionary = fastfix::base::Result<fastfix::profile::NormalizedDictionaryView>(std::move(dictionary_view));
 
     fastfix::message::MessageBuilder builder("D");
-    builder.set_string(35U, "D").set_string(49U, "BUY").set_string(56U, "SELL").set_int(38U, 1000);
-    auto parties = builder.add_group_entry(453U);
-    parties.set_string(448U, "PTY1").set_char(447U, 'D').set_int(452U, 1);
+    builder.set_string(kMsgType, "D")
+        .set_string(kSenderCompID, "BUY")
+        .set_string(kTargetCompID, "SELL")
+        .set_int(kOrderQty, 1000);
+    auto parties = builder.add_group_entry(kNoPartyIDs);
+    parties.set_string(kPartyID, "PTY1").set_char(kPartyIDSource, 'D').set_int(kPartyRole, 1);
 
     fastfix::codec::EncodeOptions options;
     options.begin_string = "FIX.4.4";
@@ -45,17 +51,17 @@ TEST_CASE("message-api", "[message-api]") {
     REQUIRE(encoded_owned.value() == encoded.value());
 
     REQUIRE(view.msg_type() == "D");
-    REQUIRE(view.get_string(49U).has_value());
-    REQUIRE(view.get_string(49U).value() == "BUY");
-    REQUIRE(view.get_int(38U).has_value());
-    REQUIRE(view.get_int(38U).value() == 1000);
+    REQUIRE(view.get_string(kSenderCompID).has_value());
+    REQUIRE(view.get_string(kSenderCompID).value() == "BUY");
+    REQUIRE(view.get_int(kOrderQty).has_value());
+    REQUIRE(view.get_int(kOrderQty).value() == 1000);
 
-    const auto group = view.group(453U);
+    const auto group = view.group(kNoPartyIDs);
     REQUIRE(group.has_value());
     REQUIRE(group->size() == 1U);
-    REQUIRE((*group)[0].get_string(448U).value() == "PTY1");
-    REQUIRE((*group)[0].get_char(447U).value() == 'D');
-    REQUIRE((*group)[0].get_int(452U).value() == 1);
+    REQUIRE((*group)[0].get_string(kPartyID).value() == "PTY1");
+    REQUIRE((*group)[0].get_char(kPartyIDSource).value() == 'D');
+    REQUIRE((*group)[0].get_int(kPartyRole).value() == 1);
 }
 
 TEST_CASE("fixed-layout-build", "[message-api][fixed-layout]") {
@@ -68,12 +74,12 @@ TEST_CASE("fixed-layout-build", "[message-api][fixed-layout]") {
     CHECK(layout.value().msg_type() == "D");
     CHECK(layout.value().field_count() > 0U);
 
-    // Scalar tag 11 (ClOrdID) should have a valid slot.
-    CHECK(layout.value().slot_index(11U) >= 0);
+    // ClOrdID should have a valid slot.
+    CHECK(layout.value().slot_index(kClOrdID) >= 0);
     // Tag 0 should not be in layout.
     CHECK(layout.value().slot_index(0U) == -1);
-    // Group count_tag 453 should be in the group index.
-    CHECK(layout.value().group_slot_index(453U) >= 0);
+    // NoPartyIDs should be in the group index.
+    CHECK(layout.value().group_slot_index(kNoPartyIDs) >= 0);
     // Non-existent group.
     CHECK(layout.value().group_slot_index(99999U) == -1);
 }
@@ -94,9 +100,9 @@ TEST_CASE("fixed-layout-writer-scalar-fields", "[message-api][fixed-layout]") {
     REQUIRE(layout.ok());
 
     fastfix::message::FixedLayoutWriter writer(layout.value());
-    writer.set_string(49U, "BUY");
-    writer.set_string(56U, "SELL");
-    writer.set_string(1U, "ACC-1");
+    writer.set_string(kSenderCompID, "BUY");
+    writer.set_string(kTargetCompID, "SELL");
+    writer.set_string(kAccount, "ACC-1");
 
     // Unknown tag silently ignored (no error reporting on hot path).
     writer.set_string(99999U, "NOPE");
@@ -117,12 +123,12 @@ TEST_CASE("fixed-layout-writer-scalar-fields", "[message-api][fixed-layout]") {
     auto view = decoded.value().message.view();
 
     CHECK(view.msg_type() == "D");
-    REQUIRE(view.get_string(49U).has_value());
-    CHECK(view.get_string(49U).value() == "BUY");
-    REQUIRE(view.get_string(56U).has_value());
-    CHECK(view.get_string(56U).value() == "SELL");
-    REQUIRE(view.get_string(1U).has_value());
-    CHECK(view.get_string(1U).value() == "ACC-1");
+    REQUIRE(view.get_string(kSenderCompID).has_value());
+    CHECK(view.get_string(kSenderCompID).value() == "BUY");
+    REQUIRE(view.get_string(kTargetCompID).has_value());
+    CHECK(view.get_string(kTargetCompID).value() == "SELL");
+    REQUIRE(view.get_string(kAccount).has_value());
+    CHECK(view.get_string(kAccount).value() == "ACC-1");
 }
 
 TEST_CASE("fixed-layout-writer-with-groups", "[message-api][fixed-layout]") {
@@ -133,11 +139,11 @@ TEST_CASE("fixed-layout-writer-with-groups", "[message-api][fixed-layout]") {
     REQUIRE(layout.ok());
 
     fastfix::message::FixedLayoutWriter writer(layout.value());
-    writer.set_string(49U, "BUY");
-    writer.set_string(56U, "SELL");
-    writer.set_string(1U, "ACC-1");
-    auto party = writer.add_group_entry(453U);
-    party.set_string(448U, "PTY1").set_char(447U, 'D').set_int(452U, 1);
+    writer.set_string(kSenderCompID, "BUY");
+    writer.set_string(kTargetCompID, "SELL");
+    writer.set_string(kAccount, "ACC-1");
+    auto party = writer.add_group_entry(kNoPartyIDs);
+    party.set_string(kPartyID, "PTY1").set_char(kPartyIDSource, 'D').set_int(kPartyRole, 1);
 
     // Encode + decode roundtrip to verify group fields.
     fastfix::codec::EncodeOptions options;
@@ -154,12 +160,12 @@ TEST_CASE("fixed-layout-writer-with-groups", "[message-api][fixed-layout]") {
     REQUIRE(decoded.ok());
     auto view = decoded.value().message.view();
 
-    const auto group = view.group(453U);
+    const auto group = view.group(kNoPartyIDs);
     REQUIRE(group.has_value());
     REQUIRE(group->size() == 1U);
-    CHECK((*group)[0].get_string(448U).value() == "PTY1");
-    CHECK((*group)[0].get_char(447U).value() == 'D');
-    CHECK((*group)[0].get_int(452U).value() == 1);
+    CHECK((*group)[0].get_string(kPartyID).value() == "PTY1");
+    CHECK((*group)[0].get_char(kPartyIDSource).value() == 'D');
+    CHECK((*group)[0].get_int(kPartyRole).value() == 1);
 }
 
 TEST_CASE("fixed-layout-writer-matches-message-builder", "[message-api][fixed-layout]") {
@@ -168,9 +174,9 @@ TEST_CASE("fixed-layout-writer-matches-message-builder", "[message-api][fixed-la
 
     // Build via MessageBuilder (same tags as FixedLayoutWriter below).
     fastfix::message::MessageBuilder mb("D");
-    mb.set_string(49U, "BUY").set_string(56U, "SELL").set_string(1U, "ACC-1");
-    auto mb_party = mb.add_group_entry(453U);
-    mb_party.set_string(448U, "PTY1").set_char(447U, 'D').set_int(452U, 1);
+    mb.set_string(kSenderCompID, "BUY").set_string(kTargetCompID, "SELL").set_string(kAccount, "ACC-1");
+    auto mb_party = mb.add_group_entry(kNoPartyIDs);
+    mb_party.set_string(kPartyID, "PTY1").set_char(kPartyIDSource, 'D').set_int(kPartyRole, 1);
 
     fastfix::codec::EncodeOptions options;
     options.begin_string = "FIX.4.4";
@@ -187,11 +193,11 @@ TEST_CASE("fixed-layout-writer-matches-message-builder", "[message-api][fixed-la
     REQUIRE(layout.ok());
 
     fastfix::message::FixedLayoutWriter writer(layout.value());
-    writer.set_string(49U, "BUY");
-    writer.set_string(56U, "SELL");
-    writer.set_string(1U, "ACC-1");
-    auto fw_party = writer.add_group_entry(453U);
-    fw_party.set_string(448U, "PTY1").set_char(447U, 'D').set_int(452U, 1);
+    writer.set_string(kSenderCompID, "BUY");
+    writer.set_string(kTargetCompID, "SELL");
+    writer.set_string(kAccount, "ACC-1");
+    auto fw_party = writer.add_group_entry(kNoPartyIDs);
+    fw_party.set_string(kPartyID, "PTY1").set_char(kPartyIDSource, 'D').set_int(kPartyRole, 1);
 
     fastfix::codec::EncodeBuffer fw_buffer;
     REQUIRE(writer.encode_to_buffer(dictionary.value(), options, &fw_buffer).ok());
@@ -207,18 +213,18 @@ TEST_CASE("fixed-layout-writer-matches-message-builder", "[message-api][fixed-la
     auto fw_view = fw_decoded.value().message.view();
 
     CHECK(mb_view.msg_type() == fw_view.msg_type());
-    CHECK(mb_view.get_string(49U).value() == fw_view.get_string(49U).value());
-    CHECK(mb_view.get_string(56U).value() == fw_view.get_string(56U).value());
-    CHECK(mb_view.get_string(1U).value() == fw_view.get_string(1U).value());
+    CHECK(mb_view.get_string(kSenderCompID).value() == fw_view.get_string(kSenderCompID).value());
+    CHECK(mb_view.get_string(kTargetCompID).value() == fw_view.get_string(kTargetCompID).value());
+    CHECK(mb_view.get_string(kAccount).value() == fw_view.get_string(kAccount).value());
 
-    auto mb_group = mb_view.group(453U);
-    auto fw_group = fw_view.group(453U);
+    auto mb_group = mb_view.group(kNoPartyIDs);
+    auto fw_group = fw_view.group(kNoPartyIDs);
     REQUIRE(mb_group.has_value());
     REQUIRE(fw_group.has_value());
     REQUIRE(mb_group->size() == fw_group->size());
-    CHECK((*mb_group)[0].get_string(448U).value() == (*fw_group)[0].get_string(448U).value());
-    CHECK((*mb_group)[0].get_char(447U).value() == (*fw_group)[0].get_char(447U).value());
-    CHECK((*mb_group)[0].get_int(452U).value() == (*fw_group)[0].get_int(452U).value());
+    CHECK((*mb_group)[0].get_string(kPartyID).value() == (*fw_group)[0].get_string(kPartyID).value());
+    CHECK((*mb_group)[0].get_char(kPartyIDSource).value() == (*fw_group)[0].get_char(kPartyIDSource).value());
+    CHECK((*mb_group)[0].get_int(kPartyRole).value() == (*fw_group)[0].get_int(kPartyRole).value());
 }
 
 TEST_CASE("fixed-layout-writer-all-value-types", "[message-api][fixed-layout]") {
@@ -230,11 +236,10 @@ TEST_CASE("fixed-layout-writer-all-value-types", "[message-api][fixed-layout]") 
 
     fastfix::message::FixedLayoutWriter writer(layout.value());
 
-    // Use standard FIX44 fields: 49=SenderCompID, 56=TargetCompID, 1=Account, 11=ClOrdID.
-    writer.set_string(49U, "BUY");
-    writer.set_string(56U, "SELL");
-    writer.set_string(1U, "ACC-1");
-    writer.set_string(11U, "ORD-001");
+    writer.set_string(kSenderCompID, "BUY");
+    writer.set_string(kTargetCompID, "SELL");
+    writer.set_string(kAccount, "ACC-1");
+    writer.set_string(kClOrdID, "ORD-001");
 
     // Encode + decode roundtrip to verify all value types.
     fastfix::codec::EncodeOptions options;
@@ -250,14 +255,14 @@ TEST_CASE("fixed-layout-writer-all-value-types", "[message-api][fixed-layout]") 
     auto decoded = fastfix::codec::DecodeFixMessageView(buf.bytes(), dictionary.value());
     REQUIRE(decoded.ok());
     auto view = decoded.value().message.view();
-    REQUIRE(view.get_string(49U).has_value());
-    CHECK(view.get_string(49U).value() == "BUY");
-    REQUIRE(view.get_string(56U).has_value());
-    CHECK(view.get_string(56U).value() == "SELL");
-    REQUIRE(view.get_string(1U).has_value());
-    CHECK(view.get_string(1U).value() == "ACC-1");
-    REQUIRE(view.get_string(11U).has_value());
-    CHECK(view.get_string(11U).value() == "ORD-001");
+    REQUIRE(view.get_string(kSenderCompID).has_value());
+    CHECK(view.get_string(kSenderCompID).value() == "BUY");
+    REQUIRE(view.get_string(kTargetCompID).has_value());
+    CHECK(view.get_string(kTargetCompID).value() == "SELL");
+    REQUIRE(view.get_string(kAccount).has_value());
+    CHECK(view.get_string(kAccount).value() == "ACC-1");
+    REQUIRE(view.get_string(kClOrdID).has_value());
+    CHECK(view.get_string(kClOrdID).value() == "ORD-001");
 }
 
 TEST_CASE("fixed-layout-writer-encode-roundtrip", "[message-api][fixed-layout]") {
@@ -268,12 +273,12 @@ TEST_CASE("fixed-layout-writer-encode-roundtrip", "[message-api][fixed-layout]")
     REQUIRE(layout.ok());
 
     fastfix::message::FixedLayoutWriter writer(layout.value());
-    writer.set_string(49U, "SENDER");
-    writer.set_string(56U, "TARGET");
-    writer.set_string(1U, "ACC-1");
-    writer.set_string(11U, "ORD-001");
-    auto party = writer.add_group_entry(453U);
-    party.set_string(448U, "PTY1").set_char(447U, 'D').set_int(452U, 3);
+    writer.set_string(kSenderCompID, "SENDER");
+    writer.set_string(kTargetCompID, "TARGET");
+    writer.set_string(kAccount, "ACC-1");
+    writer.set_string(kClOrdID, "ORD-001");
+    auto party = writer.add_group_entry(kNoPartyIDs);
+    party.set_string(kPartyID, "PTY1").set_char(kPartyIDSource, 'D').set_int(kPartyRole, 3);
 
     fastfix::codec::EncodeOptions options;
     options.begin_string = "FIX.4.4";
@@ -291,14 +296,14 @@ TEST_CASE("fixed-layout-writer-encode-roundtrip", "[message-api][fixed-layout]")
     REQUIRE(decoded.ok());
     auto view = decoded.value().message.view();
     CHECK(view.msg_type() == "D");
-    REQUIRE(view.get_string(49U).has_value());
-    CHECK(view.get_string(49U).value() == "SENDER");
-    REQUIRE(view.get_string(1U).has_value());
-    CHECK(view.get_string(1U).value() == "ACC-1");
-    auto group = view.group(453U);
+    REQUIRE(view.get_string(kSenderCompID).has_value());
+    CHECK(view.get_string(kSenderCompID).value() == "SENDER");
+    REQUIRE(view.get_string(kAccount).has_value());
+    CHECK(view.get_string(kAccount).value() == "ACC-1");
+    auto group = view.group(kNoPartyIDs);
     REQUIRE(group.has_value());
     REQUIRE(group->size() == 1U);
-    CHECK((*group)[0].get_string(448U).value() == "PTY1");
+    CHECK((*group)[0].get_string(kPartyID).value() == "PTY1");
 }
 
 // ---------------------------------------------------------------------------
@@ -397,10 +402,10 @@ TEST_CASE("generated-writer-matches-raw-fixed-layout-writer", "[message-api][gen
 
     // Build via raw FixedLayoutWriter.
     fastfix::message::FixedLayoutWriter raw(layout.value());
-    raw.set_string(1U, "ACC-1");
-    raw.set_string(11U, "ORD-001");
-    auto raw_party = raw.add_group_entry(453U);
-    raw_party.set_string(448U, "PTY1").set_char(447U, 'D').set_int(452U, 1);
+    raw.set_string(kAccount, "ACC-1");
+    raw.set_string(kClOrdID, "ORD-001");
+    auto raw_party = raw.add_group_entry(kNoPartyIDs);
+    raw_party.set_string(kPartyID, "PTY1").set_char(kPartyIDSource, 'D').set_int(kPartyRole, 1);
 
     fastfix::codec::EncodeBuffer raw_buf;
     REQUIRE(raw.encode_to_buffer(dictionary.value(), options, &raw_buf).ok());

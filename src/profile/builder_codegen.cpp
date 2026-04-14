@@ -1,5 +1,7 @@
 #include "fastfix/profile/builder_codegen.h"
 
+#include "fastfix/codec/fix_tags.h"
+
 #include <cctype>
 #include <fstream>
 #include <sstream>
@@ -36,14 +38,7 @@ auto CamelToSnake(std::string_view name) -> std::string {
 }
 
 auto IsEncodeManagedTag(std::uint32_t tag) -> bool {
-    switch (tag) {
-        case 8U: case 9U: case 10U:
-        case 34U: case 35U: case 43U:
-        case 49U: case 52U: case 56U:
-            return true;
-        default:
-            return false;
-    }
+    return fastfix::codec::tags::IsEncodeManagedTag(tag);
 }
 
 auto SetterMethodSuffix(ValueType type) -> std::string_view {

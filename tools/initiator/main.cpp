@@ -7,6 +7,7 @@
 #include <optional>
 #include <vector>
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/message/message.h"
 #include "fastfix/profile/profile_loader.h"
 #include "fastfix/runtime/application.h"
@@ -14,6 +15,8 @@
 #include "fastfix/runtime/live_initiator.h"
 
 namespace {
+
+using namespace fastfix::codec::tags;
 
 auto PrintUsage() -> void {
     std::cout << "usage: fastfix-initiator --artifact <profile.art> --host <host> --port <port> --sender <sender> --target <target> [--begin-string <value>] [--default-appl-ver-id <value>] [--dispatch-mode inline|queue] [--validation-mode strict|compatible|permissive|raw-pass-through] [--worker-cpus <csv>] [--queue-runner-mode co-scheduled|threaded] [--app-cpus <csv>] [--reconnect] [--reconnect-initial-ms N] [--reconnect-max-ms N] [--reconnect-max-retries N]\n";
@@ -66,20 +69,20 @@ auto ParseValidationMode(std::string_view token) -> std::optional<fastfix::sessi
 
 auto BuildInitiatorMessage() -> fastfix::message::Message {
     fastfix::message::MessageBuilder builder("D");
-    builder.set(35U, "D");
-    auto party = builder.add_group_entry(453U);
-    party.set(448U, "INITIATOR-PARTY").set(447U, 'D').set(452U, static_cast<std::int64_t>(3));
+    builder.set(kMsgType, "D");
+    auto party = builder.add_group_entry(kNoPartyIDs);
+    party.set(kPartyID, "INITIATOR-PARTY").set(kPartyIDSource, 'D').set(kPartyRole, static_cast<std::int64_t>(3));
     return std::move(builder).build();
 }
 
 auto ValidateInitiatorEcho(fastfix::message::MessageView message) -> fastfix::base::Status {
-    const auto group = message.group(453U);
+    const auto group = message.group(kNoPartyIDs);
     if (!group.has_value() || group->size() != 1U ||
-        (*group)[0].get_string(448U) != std::optional<std::string_view>{"INITIATOR-PARTY"}) {
+        (*group)[0].get_string(kPartyID) != std::optional<std::string_view>{"INITIATOR-PARTY"}) {
         return fastfix::base::Status::InvalidArgument("echoed application message missing repeating group");
     }
 
-    std::cout << "received echo with PartyID=" << (*group)[0].get_string(448U).value() << '\n';
+    std::cout << "received echo with PartyID=" << (*group)[0].get_string(kPartyID).value() << '\n';
     return fastfix::base::Status::Ok();
 }
 

@@ -7,6 +7,7 @@
 #include <span>
 #include <string>
 
+#include "fastfix/codec/fix_tags.h"
 #include "fastfix/codec/fix_codec.h"
 #include "fastfix/message/typed_message.h"
 #include "fastfix/profile/artifact_builder.h"
@@ -50,11 +51,11 @@ TEST_CASE("dictgen", "[dictgen]") {    const auto ToReadableFrame = [](std::span
     REQUIRE(message != nullptr);
     REQUIRE(view.value().message_field_rules(*message).size() >= 5U);
 
-    // Verify group tag 453 (NoPartyIDs) is present in the NewOrderSingle message.
+    // Verify NoPartyIDs is present in the NewOrderSingle message.
     const auto& field_rules = view.value().message_field_rules(*message);
     bool has_parties = false;
     for (const auto& rule : field_rules) {
-        if (rule.tag == 453U) {
+        if (rule.tag == fastfix::codec::tags::kNoPartyIDs) {
             has_parties = true;
             break;
         }
@@ -70,13 +71,13 @@ TEST_CASE("dictgen", "[dictgen]") {    const auto ToReadableFrame = [](std::span
     options.sending_time = "20260404-12:00:00.000";
 
     fastfix::message::MessageBuilder builder{"D"};
-    builder.reserve_fields(4U).reserve_groups(1U).reserve_group_entries(453U, 1U);
-    builder.set_string(49U, "BUY")
-        .set_string(56U, "SELL");
-    auto party = builder.add_group_entry(453U);
-    party.set_string(448U, "PTY1")
-        .set_char(447U, 'D')
-        .set_int(452U, 7);
+    builder.reserve_fields(4U).reserve_groups(1U).reserve_group_entries(fastfix::codec::tags::kNoPartyIDs, 1U);
+    builder.set_string(fastfix::codec::tags::kSenderCompID, "BUY")
+        .set_string(fastfix::codec::tags::kTargetCompID, "SELL");
+    auto party = builder.add_group_entry(fastfix::codec::tags::kNoPartyIDs);
+    party.set_string(fastfix::codec::tags::kPartyID, "PTY1")
+        .set_char(fastfix::codec::tags::kPartyIDSource, 'D')
+        .set_int(fastfix::codec::tags::kPartyRole, 7);
 
     fastfix::codec::EncodeBuffer buffer;
     REQUIRE(builder.encode_to_buffer(view.value(), options, &buffer).ok());

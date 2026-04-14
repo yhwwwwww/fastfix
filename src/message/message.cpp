@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "fastfix/codec/fix_codec.h"
+#include "fastfix/codec/fix_tags.h"
 
 namespace fastfix::message {
 
@@ -680,8 +681,8 @@ auto MessageView::find_field_view(std::uint32_t tag) const -> std::optional<Fiel
             return v;
         }
 
-        if (tag == 35U && !data_->msg_type.empty()) {
-            return FieldView{.tag = 35U, .type = kFieldString, .string_value = data_->msg_type};
+        if (tag == codec::tags::kMsgType && !data_->msg_type.empty()) {
+            return FieldView{.tag = codec::tags::kMsgType, .type = kFieldString, .string_value = data_->msg_type};
         }
 
         return std::nullopt;
@@ -694,9 +695,9 @@ auto MessageView::find_field_view(std::uint32_t tag) const -> std::optional<Fiel
         return ParsedFieldView(*parsed_, *slot);
     }
 
-    if (tag == 35U && !parsed_msg_type_.empty()) {
+    if (tag == codec::tags::kMsgType && !parsed_msg_type_.empty()) {
         return FieldView{
-            .tag = 35U,
+            .tag = codec::tags::kMsgType,
             .type = kFieldString,
             .string_value = parsed_msg_type_,
         };
