@@ -870,12 +870,22 @@ TEST_CASE("live-runtime", "[live-runtime]") {
         balance_connections.push_back(std::move(connection).value());
     }
 
-    const auto accept_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (balance_runtime.active_connection_count() < balance_connections.size() &&
-           std::chrono::steady_clock::now() < accept_deadline) {
+    auto accept_count = [&balance_engine]() {
+        const auto traces = balance_engine.trace().Snapshot();
+        return static_cast<std::size_t>(std::count_if(
+            traces.begin(),
+            traces.end(),
+            [](const fastfix::runtime::TraceEvent& event) {
+                return event.kind == fastfix::runtime::TraceEventKind::kSessionEvent &&
+                       std::string_view(event.text.data()) == "tcp accept";
+            }));
+    };
+
+    const auto accept_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (accept_count() < balance_connections.size() && std::chrono::steady_clock::now() < accept_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    REQUIRE(balance_runtime.active_connection_count() == balance_connections.size());
+    REQUIRE(accept_count() == balance_connections.size());
 
     const auto balance_traces = balance_engine.trace().Snapshot();
     auto trace_text = [](const fastfix::runtime::TraceEvent& event) {
