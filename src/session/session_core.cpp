@@ -191,6 +191,12 @@ auto SessionCore::ObserveInboundSeq(std::uint32_t seq_num) -> base::Status {
     }
 
     ++next_in_seq_;
+    if (state_ == SessionState::kResendProcessing && pending_resend_.has_value() &&
+        next_in_seq_ > pending_resend_->end_seq) {
+        pending_resend_.reset();
+        state_ = resume_state_;
+        resend_completed_ = true;
+    }
     return base::Status::Ok();
 }
 

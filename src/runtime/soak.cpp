@@ -381,7 +381,9 @@ auto InjectInboundGap(
         return status;
     }
 
-    auto replayed = EncodeInboundFrame(app_message, dictionary, harness->counterparty, skipped_seq);
+    auto replayed = EncodeInboundFrame(
+        app_message, dictionary, harness->counterparty, skipped_seq,
+        true, "20260403-00:00:00.000");
     if (!replayed.ok()) {
         return replayed.status();
     }

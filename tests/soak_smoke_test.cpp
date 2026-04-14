@@ -7,8 +7,6 @@
 #include "fastfix/profile/dictgen_input.h"
 #include "fastfix/runtime/soak.h"
 
-#include "test_support.h"
-
 namespace {
 
 auto BuildSoakArtifact(const std::filesystem::path& artifact_path) -> fastfix::base::Status {

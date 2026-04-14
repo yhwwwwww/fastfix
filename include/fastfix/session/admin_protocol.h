@@ -1,11 +1,9 @@
 #pragma once
 
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
-#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -569,6 +567,7 @@ class AdminProtocol {
         std::uint32_t* reject_reason,
         std::string* text) const -> bool;
     auto EnsureInitialized() const -> base::Status;
+    auto DrainDeferredGapFrames(std::uint64_t timestamp_ns, ProtocolEvent* event) -> base::Status;
 
     AdminProtocolConfig config_;
     const profile::NormalizedDictionaryView& dictionary_;
@@ -586,6 +585,7 @@ class AdminProtocol {
     store::MessageRecordViewRange replay_range_buffer_;
     std::array<std::shared_ptr<ProtocolFrameList>, kReplayFrameBufferPoolSize> replay_frame_buffers_{};
     std::size_t replay_frame_buffer_cursor_{0U};
+    std::vector<std::vector<std::byte>> deferred_gap_frames_;
 };
 
 }  // namespace fastfix::session

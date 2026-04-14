@@ -1,7 +1,6 @@
 #include "fastfix/session/admin_protocol.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <string_view>
@@ -132,7 +131,7 @@ auto ComputeBodyStartOffset(std::span<const std::byte> frame) -> std::uint32_t {
         // Parse tag number
         std::uint32_t tag = 0;
         for (std::size_t i = pos; i < eq; ++i) {
-            const auto digit = static_cast<unsigned char>(data[i]) - '0';
+            const auto digit = static_cast<unsigned int>(static_cast<unsigned char>(data[i]) - '0');
             if (digit > 9U) {
                 return static_cast<std::uint32_t>(last_header_end);
             }
@@ -876,6 +875,7 @@ auto AdminProtocol::OnTransportClosed() -> base::Status {
     logout_sent_ = false;
     test_request_sent_ns_ = 0U;
     logout_sent_ns_ = 0U;
+    deferred_gap_frames_.clear();
     status = session_.OnTransportClosed();
     if (!status.ok()) {
         return status;
@@ -902,6 +902,10 @@ auto AdminProtocol::OnInbound(std::span<const std::byte> frame, std::uint64_t ti
     } else {
         event.value().MaterializeApplicationMessages();
     }
+    auto drain_status = DrainDeferredGapFrames(timestamp_ns, &event.value());
+    if (!drain_status.ok()) {
+        return drain_status;
+    }
     return std::move(event).value();
 }
 
@@ -927,6 +931,10 @@ auto AdminProtocol::OnInbound(std::vector<std::byte>&& frame, std::uint64_t time
         }
     } else {
         event.value().MaterializeApplicationMessages();
+    }
+    auto drain_status = DrainDeferredGapFrames(timestamp_ns, &event.value());
+    if (!drain_status.ok()) {
+        return drain_status;
     }
     return std::move(event).value();
 }
@@ -1072,6 +1080,10 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
                 return resend.status();
             }
             event.outbound_frames.push_back(std::move(resend).value());
+            // Queue the gap-triggering message for deferred replay after the gap
+            // is fully filled.  The message has seq > expected and cannot be
+            // processed yet, but will be lost if not saved here.
+            deferred_gap_frames_.emplace_back(decoded.raw.begin(), decoded.raw.end());
             return event;
         }
         return status;
@@ -1292,11 +1304,20 @@ auto AdminProtocol::OnTimer(std::uint64_t timestamp_ns) -> base::Result<Protocol
 
     const auto snapshot = session_.Snapshot();
     if (snapshot.state != SessionState::kActive && snapshot.state != SessionState::kAwaitingLogout &&
-        snapshot.state != SessionState::kResendProcessing) {
+        snapshot.state != SessionState::kResendProcessing && snapshot.state != SessionState::kPendingLogon) {
         return event;
     }
 
     const auto interval_ns = std::max<std::uint64_t>(1U, config_.heartbeat_interval_seconds) * kNanosPerSecond;
+
+    // PendingLogon timeout: disconnect if logon handshake not completed within 2*interval.
+    if (snapshot.state == SessionState::kPendingLogon && snapshot.last_outbound_ns != 0U &&
+        timestamp_ns > snapshot.last_outbound_ns + (interval_ns * 2U)) {
+        event.disconnect = true;
+    }
+    if (snapshot.state == SessionState::kPendingLogon) {
+        return event;
+    }
 
     // Logout timeout: disconnect if counterparty does not complete logout within one interval.
     if (snapshot.state == SessionState::kAwaitingLogout && logout_sent_ns_ != 0U &&
@@ -1345,7 +1366,7 @@ auto AdminProtocol::NextTimerDeadline(std::uint64_t timestamp_ns) const -> std::
 
     const auto snapshot = session_.Snapshot();
     if (snapshot.state != SessionState::kActive && snapshot.state != SessionState::kAwaitingLogout &&
-        snapshot.state != SessionState::kResendProcessing) {
+        snapshot.state != SessionState::kResendProcessing && snapshot.state != SessionState::kPendingLogon) {
         return std::nullopt;
     }
 
@@ -1356,6 +1377,16 @@ auto AdminProtocol::NextTimerDeadline(std::uint64_t timestamp_ns) const -> std::
             deadline = candidate_ns;
         }
     };
+
+    if (snapshot.state == SessionState::kPendingLogon && snapshot.last_outbound_ns != 0U) {
+        update_deadline(snapshot.last_outbound_ns + (interval_ns * 2U));
+    }
+    if (snapshot.state == SessionState::kPendingLogon) {
+        if (deadline.has_value() && *deadline < timestamp_ns) {
+            deadline = timestamp_ns;
+        }
+        return deadline;
+    }
 
     if (snapshot.state == SessionState::kAwaitingLogout && logout_sent_ns_ != 0U) {
         update_deadline(logout_sent_ns_ + interval_ns);
@@ -1434,6 +1465,45 @@ auto AdminProtocol::BeginLogout(std::string text, std::uint64_t timestamp_ns) ->
     logout_sent_ = true;
     logout_sent_ns_ = timestamp_ns;
     return EncodeFrame(std::move(builder).build(), true, timestamp_ns, true, false, true, 0U);
+}
+
+auto AdminProtocol::DrainDeferredGapFrames(std::uint64_t timestamp_ns, ProtocolEvent* event) -> base::Status {
+    while (!deferred_gap_frames_.empty() && !session_.pending_resend().has_value()) {
+        // Move + pop before OnInbound so re-entrant queuing works correctly.
+        auto frame = std::move(deferred_gap_frames_.front());
+        deferred_gap_frames_.erase(deferred_gap_frames_.begin());
+
+        // Decode to peek at the seq number.  If the gap fill / replay already
+        // advanced next_in_seq past this frame, skip it — it was accounted for
+        // by the counterparty's resend stream and would trip the stale-seq
+        // check if re-injected.
+        codec::DecodedMessageView peek;
+        auto decode_status = codec::DecodeFixMessageView(
+            std::span<const std::byte>(frame), dictionary_, decode_table_, &peek);
+        if (!decode_status.ok()) {
+            continue;  // corrupt frame — discard silently
+        }
+        if (peek.header.msg_seq_num < session_.Snapshot().next_in_seq) {
+            continue;  // already consumed via the normal resend stream
+        }
+
+        auto result = OnInbound(std::span<const std::byte>(frame), timestamp_ns);
+        if (!result.ok()) {
+            return result.status();
+        }
+        auto& inner = result.value();
+        for (auto& f : inner.outbound_frames) {
+            event->outbound_frames.push_back(std::move(f));
+        }
+        for (auto& m : inner.application_messages) {
+            event->application_messages.push_back(std::move(m));
+        }
+        if (inner.disconnect) {
+            event->disconnect = true;
+            break;
+        }
+    }
+    return base::Status::Ok();
 }
 
 }  // namespace fastfix::session
