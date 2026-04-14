@@ -28,8 +28,8 @@ FastFix was designed to answer: *what if every design decision optimized for the
 
 | Feature | Details |
 |---------|---------|
-| **Codec latency** | FIX44 benchmark: 180 ns header peek (p50), 992 ns full parse (p50), 461 ns typed writer encode (p50) |
-| **Low allocation pressure** | Parse path: 0 alloc/op; encode path: 5 alloc/op |
+| **Codec latency** | Current FIX44 compare run: 130 ns header peek (p50), 511 ns full parse (p50), 371 ns typed writer encode (p50) |
+| **Low allocation pressure** | Current compare run: encode/parse/session/replay all at 0 alloc/op; loopback at 3 alloc/op |
 | **Session management** | Full Logon/Logout/Heartbeat/TestRequest/ResendRequest/SequenceReset |
 | **Repeating groups** | Nested groups fully supported via dictionary metadata |
 | **Reconnect with backoff** | Configurable exponential backoff with jitter for initiator reconnect |
@@ -63,7 +63,7 @@ FastFix was designed to answer: *what if every design decision optimized for the
 ### Prerequisites
 
 - C++20 compiler (GCC 12+, Clang 15+)
-- `xmake` (preferred, used automatically when available)
+- `xmake` 3.0.0+ (preferred for the direct xmake path)
 - or CMake 3.20+ plus Ninja (preferred CMake generator) or make (fallback when Ninja is unavailable)
 
 ### Offline Dependency Layout
@@ -92,7 +92,7 @@ bash ./scripts/offline_build.sh --bench smoke
 bash ./scripts/offline_build.sh --bench full
 
 # Direct xmake path
-xmake f -m release -y
+xmake f -m release --ccache=n -y
 xmake build fastfix-tests
 xmake build fastfix-bench
 
@@ -122,11 +122,13 @@ cmake --build build/cmake/dev-release-manual-make
 ctest --test-dir build/cmake/dev-release-manual-make --output-on-failure
 
 # Direct xmake target build, using the pinned Catch2/pugixml submodules instead of package downloads
-xmake f -m release -y
+xmake f -m release --ccache=n -y
 xmake build fastfix-tests
 ```
 
-GitHub Actions CI uses the default xmake path on Ubuntu and still exercises these two named RHEL CMake presets via `ubi8/ubi:8.10` + `gcc-toolset-12` and `ubi9/ubi:9.7` + `gcc-toolset-14` container jobs on every push and pull request.
+The helper scripts auto-select `xmake >= 3.0.0`, then `cmake + Ninja`, then `cmake + make`. On Ubuntu 24.04 the distro xmake package is currently `2.8.7`, so the helper intentionally logs a fallback to CMake there unless you install a newer upstream xmake. Both helper scripts also default `FASTFIX_XMAKE_CCACHE=n` on the xmake path to avoid Linux `.build_cache/... file busy` failures seen on large targets.
+
+GitHub Actions CI uses that same auto-selection logic on Ubuntu and still exercises the named RHEL CMake presets via `ubi8/ubi:8.10` + `gcc-toolset-12` and `ubi9/ubi:9.7` + `gcc-toolset-14` container jobs on every push and pull request.
 
 When `build/generated/`, `build/bench/`, or `build/sample-basic.art` have been removed, `xmake build fastfix-tests` and `xmake build fastfix-bench` now regenerate the required shared assets automatically.
 
@@ -402,7 +404,7 @@ class HotPathApp : public fastfix::runtime::ApplicationCallbacks {
 };
 ```
 
-The `FixedLayoutWriter` path benchmarks at **~684 ns** per encode (p50 = 651 ns), roughly **46% faster** than the generic `MessageBuilder` path on the same message shape.
+The `FixedLayoutWriter` path is the lowest-allocation encode path in the library and is the same hot path measured as `encode` in the side-by-side benchmark section later in this README.
 
 ### Hybrid Path — FixedLayout + Extra Fields
 
@@ -675,64 +677,49 @@ config.queue_app_mode = fastfix::runtime::QueueAppThreadingMode::kThreaded;
 
 ### Why Compare with QuickFIX?
 
-QuickFIX is the most widely deployed open-source FIX engine, making it the natural baseline. Comparing against QuickFIX shows where the latency differences actually come from — parsing strategy, memory allocation patterns, and threading model.
+QuickFIX is still the reference implementation most teams already know and already run. FastFix therefore keeps an in-tree, pinned QuickFIX side-by-side suite so the comparison stays on the same FIX44 business-order fixture, the same dictionary lineage, and the same command wrapper.
 
 ### Test Methodology
 
-- **QuickFIX source**: `quickfix/quickfix` GitHub repository, commit `00dd20837c97578e725072e5514c8ffaa0e141d4`
-- **Dictionary**: QuickFIX `spec/FIX44.xml`; FastFix side uses the same XML converted through `fastfix-xml2ffd` + `fastfix-dictgen`
-- **Message**: Valid FIX.4.4 `NewOrderSingle` with `ClOrdID`, `Symbol`, `Side`, `TransactTime`, `OrderQty`, `OrdType`, `Price`, and one `NoPartyIDs=1` entry
-- **Allocation tracking**: Global `operator new` interception counts every heap allocation
-- **CPU counters**: Linux `perf_event_open` for cache misses and branch misses
-- **Percentiles**: p50, p95, p99, p999 computed from per-iteration `steady_clock` samples
+- Command: `./bench/bench.sh compare`
+- Default compare args: `--iterations 100000 --loopback 1000 --replay 1000 --replay-span 128`
+- Dictionary lineage: QuickFIX `bench/vendor/quickfix/spec/FIX44.xml` → `fastfix-xml2ffd` → `build/bench/quickfix_FIX44.ffd` → `fastfix-dictgen` → `build/bench/quickfix_FIX44.art`
+- Business fixture: one neutral FIX44 `NewOrderSingle` with a single `NoPartyIDs=1` group entry
+- Encode fairness: both engines pin `SendingTime` to the fixture timestamp so the encode tiers measure object-to-wire work, not per-iteration clock formatting
+- Allocation tracking: global `operator new` interception counts heap allocations per iteration
+- CPU counters: Linux `perf_event_open` feeds cache-miss and branch-miss columns when available
 
-### Benchmark Tiers
-
-| Tier | What it measures |
-|------|-----------------|
-| **encode** | Business object → generated typed writer → wire bytes (reused buffer) |
-| **peek** | Extract session header (MsgType, CompIDs) without full decode |
-| **parse** | Full message decode into zero-copy `MessageView` |
-| **session-inbound** | Full inbound path: decode → sequence validation → store → admin protocol |
-| **replay** | ResendRequest processing: retrieve + re-encode 128 stored messages |
-| **loopback-roundtrip** | Full TCP round-trip: send `NewOrderSingle`, wait for `ExecutionReport` ack |
-
-### Results
-
-**Test environment:**
+### Current Side-By-Side Snapshot (2026-04-14)
 
 | | |
 |---|---|
-| **CPU** | AMD Ryzen 7 7840HS (8C/16T, boost to 5.1 GHz) |
-| **RAM** | 28 GB DDR5 |
-| **OS** | Linux 6.19.6 CachyOS (x86_64) |
-| **Compiler** | GCC 15.2.1 20260209 |
-| **Build** | Release (`-O2`) |
-| **Iterations** | 100,000 codec iterations; 1,000 replay/loopback iterations |
+| **CPU** | AMD Ryzen 7 7840HS with Radeon 780M Graphics |
+| **OS** | Linux 6.19.10-1-cachyos x86_64 |
+| **Compiler** | `g++ (GCC) 15.2.1 20260209` |
+| **Build helper** | `xmake v3.0.8+20260324` via `./bench/bench.sh compare` |
 
-#### Cross-Engine Comparable Tiers
+#### Cross-Engine Shared Boundaries
 
-| Boundary | FastFix metric | QuickFIX metric | FastFix p50 | FastFix p95 | QuickFIX p50 | QuickFIX p95 | FF alloc/op | QF alloc/op |
-|----------|----------------|-----------------|-------------|-------------|--------------|--------------|-------------|-------------|
-| encode (object → wire) | `encode` | `quickfix-encode-buffer` | 0.46 µs | 0.49 µs | 1.25 µs | 1.43 µs | 0 | 29 |
-| parse (wire → object) | `parse` | `quickfix-parse` | 0.99 µs | 1.02 µs | 1.25 µs | 1.30 µs | 0 | 20 |
-| session-inbound | `session-inbound` | `quickfix-session-inbound` | 2.58 µs | 2.71 µs | 2.32 µs | 2.44 µs | 0 | 18 |
-| replay (128 msgs) | `replay` | `quickfix-replay` | 361 µs | 367 µs | 233 µs | 240 µs | 0 | 4,117 |
-| loopback RTT | `loopback-roundtrip` | `quickfix-loopback` | 20.01 µs | 26.60 µs | 20.30 µs | 24.68 µs | 3 | 77 |
+| Boundary | FastFix metric | QuickFIX metric | FastFix p50 | FastFix p95 | QuickFIX p50 | QuickFIX p95 | FastFix alloc/op | QuickFIX alloc/op |
+|----------|----------------|-----------------|-------------|-------------|--------------|--------------|------------------|-------------------|
+| object → wire (reused buffer) | `encode` | `quickfix-encode-buffer` | 371 ns | 401 ns | 1.24 us | 1.43 us | 0 | 29 |
+| wire → object | `parse` | `quickfix-parse` | 511 ns | 521 ns | 1.29 us | 1.33 us | 0 | 20 |
+| session inbound | `session-inbound` | `quickfix-session-inbound` | 1.65 us | 1.94 us | 2.38 us | 2.75 us | 0 | 18 |
+| replay (`replay_span=128`) | `replay` | `quickfix-replay` | 15.66 us | 16.81 us | 231.20 us | 269.07 us | 0 | 4117 |
+| TCP loopback round-trip | `loopback-roundtrip` | `quickfix-loopback` | 17.58 us | 20.75 us | 20.55 us | 24.68 us | 3 | 77 |
+
+#### FastFix-Only Tier
+
+| Metric | p50 | p95 | p99 | alloc/op | ops/sec |
+|--------|-----|-----|-----|----------|---------|
+| `peek` | 130 ns | 141 ns | 141 ns | 0 | 6.58M |
 
 Key observations:
-- **FastFix encode is ~2.7× faster than QuickFIX** — the generated typed writer with `FixedLayoutWriter` backend eliminates dynamic dispatch and most allocations.
-- **QuickFIX leads the pure parse path** by a modest but consistent margin — FastFix's dictionary-driven decode carries more per-field work than QuickFIX's simpler map-insert approach.
-- **Session-inbound is near parity** (≈10% difference), showing the overhead beyond codec is broadly similar between both engines.
-- **Loopback RTT is essentially identical** — both engines are dominated by the ~20 µs Linux TCP kernel floor.
-- **FastFix allocation pressure is materially lower**: encode is 0/op vs 29/op; parse is 0/op vs 20/op; loopback is 3/op vs 77/op.
-- **QuickFIX replay is faster** (233 µs vs 361 µs p50) but at extreme allocation cost — 4,117 alloc/op vs 0/op for FastFix, because QuickFIX allocates fresh string copies per resent message rather than re-encoding from the store.
 
-#### FastFix-Only Tiers
-
-| Tier | p50 | p95 | p99 | Allocs/op | Ops/sec |
-|------|-----|-----|-----|-----------|--------|
-| peek | 180 ns | 190 ns | 191 ns | 0 | 4,950,000 |
+- FastFix currently leads every shared tier in the checked-in side-by-side run: about 3.3x on object-to-wire encode, 2.5x on parse, 1.4x on session-inbound, 14.8x on replay, and 1.2x on loopback RTT.
+- The replay gap is the largest structural difference: FastFix re-encodes from store state with 0 alloc/op, while QuickFIX replay allocates about 4,117 times per measured iteration.
+- Loopback remains the closest tier because both engines are partly bounded by the same Linux TCP floor once the message leaves userspace.
+- `quickfix-encode` (fresh string) is still printed by the benchmark, but `quickfix-encode-buffer` is the tighter apples-to-apples comparison with FastFix's reused `EncodeBuffer` path.
 
 ### Run Benchmarks Yourself
 
@@ -747,7 +734,7 @@ Key observations:
 
 Every benchmark command above intentionally uses the pinned QuickFIX 4.4 inputs: `bench/vendor/quickfix/spec/FIX44.xml`, `build/bench/quickfix_FIX44.ffd`, or `build/bench/quickfix_FIX44.art`.
 
-For detailed benchmark methodology, metric definitions, and full result tables, see [bench/README.md](bench/README.md).
+For exact measurement boundaries, per-metric start/end points, and flow diagrams that mark where each metric sits in the pipeline, see [bench/README.md](bench/README.md).
 
 ---
 

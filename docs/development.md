@@ -6,12 +6,12 @@ This guide covers everything you need to contribute to or extend FastFix: buildi
 
 ## Build System
 
-FastFix supports both offline xmake and offline CMake flows. xmake is the primary path for normal local builds, tests, and benchmarks; CMake remains available as the alternative path for shared environments and the RHEL targets.
+FastFix supports both offline xmake and offline CMake flows. xmake is the primary path for local Linux work when you have a recent upstream xmake; CMake is the portability and CI fallback and remains the canonical path for the named RHEL presets.
 
 ### Prerequisites
 
 - C++20 compiler (GCC 12+ or Clang 15+)
-- xmake (preferred and auto-detected when available)
+- xmake 3.0.0+ (preferred direct path)
 - or CMake 3.20+ plus Ninja (preferred CMake generator) or make (fallback when Ninja is unavailable)
 - Linux x86_64 (primary platform)
 
@@ -35,12 +35,12 @@ FastFix supports both offline xmake and offline CMake flows. xmake is the primar
 ### Common Commands
 
 ```bash
-xmake f -m release -y        # Direct xmake path
+xmake f -c -m release --ccache=n -y
 xmake build fastfix-tests
 xmake build fastfix-bench
 xmake clean
 
-bash ./scripts/offline_build.sh --bench smoke   # Auto: xmake -> cmake + Ninja -> cmake + make
+bash ./scripts/offline_build.sh --bench smoke   # Auto: xmake >= 3.0.0 -> cmake + Ninja -> cmake + make
 
 # Alternative CMake path
 bash ./scripts/offline_build.sh --build-system cmake --preset dev-release --bench smoke
@@ -50,9 +50,28 @@ cmake --build --preset dev-release
 ctest --preset dev-release
 ```
 
-The helper scripts auto-select `xmake`, then `cmake + Ninja`, then `cmake + make`. Default xmake builds write executables to `./build/linux/x86_64/release/`. Ninja-based CMake presets remain available at `./build/cmake/<preset>/bin/`, and make-based fallback presets live at `./build/cmake/<preset>-make/bin/`. The examples below assume `BIN_DIR=./build/linux/x86_64/release` for the default path and invoke binaries directly for reproducibility and predictable argument handling.
+The helper scripts auto-select `xmake >= 3.0.0`, then `cmake + Ninja`, then `cmake + make`. Default xmake builds write executables to `./build/linux/x86_64/release/`. Ninja-based CMake presets remain available at `./build/cmake/<preset>/bin/`, and make-based fallback presets live at `./build/cmake/<preset>-make/bin/`. The examples below assume `BIN_DIR=./build/linux/x86_64/release` for the default path and invoke binaries directly for reproducibility and predictable argument handling.
 
-GitHub Actions CI uses xmake for the default Ubuntu path and keeps the named RHEL presets through `ubi8/ubi:8.10` + `gcc-toolset-12` and `ubi9/ubi:9.7` + `gcc-toolset-14` container jobs as alternative CMake coverage.
+Both `offline_build.sh` and `bench.sh` default `FASTFIX_XMAKE_CCACHE=n` on the xmake path. That mirrors the CI-safe setting and avoids Linux `.build_cache/... file busy` failures seen on the larger benchmark and QuickFIX targets.
+
+GitHub Actions CI now uses the same helper logic on Ubuntu. On Ubuntu 24.04 the distro xmake package is currently `2.8.7`, so the helper intentionally falls back to CMake there unless a newer upstream xmake is installed. The named RHEL coverage still runs through `ubi8/ubi:8.10` + `gcc-toolset-12` and `ubi9/ubi:9.7` + `gcc-toolset-14` container jobs.
+
+### Environment-Specific Notes
+
+| Environment | Recommended path | What to watch for |
+|-------------|------------------|-------------------|
+| Local Linux workstation | xmake helper auto path or direct `xmake f -c -m release --ccache=n -y` | use xmake 3.0.0+; if you switch compilers or stale config leaks in, re-run with `-c` |
+| Ubuntu 24.04 / GitHub Actions | helper auto path | distro xmake `2.8.7` is too old, so auto mode falls back to `cmake + Ninja`; explicit xmake requests need a newer upstream install |
+| Root shell / container repro | prefer helper auto path or CMake | newer xmake versions may refuse running as root; CMake is the least surprising path for container debugging |
+| RHEL 8.10 + GCC 12 | `cmake --preset rhel8-gcc12` | enable `gcc-toolset-12` first; use the RHEL preset instead of ad-hoc xmake |
+| RHEL 9.7 + GCC 14 | `cmake --preset rhel9-gcc14` | enable `gcc-toolset-14`; keep `liburing-devel` aligned with the container image |
+
+### Build Caches, Generators, And Submodules
+
+- xmake helper flows always reconfigure with `xmake f -c` so stale compiler or cache state does not leak across runs. If you drive xmake manually and change compilers or cache policy, do the same.
+- When switching the CMake generator between Ninja and make, either let the helper recreate the preset cache or clear the affected `build/cmake/<preset>*` directory yourself.
+- Helper scripts auto-run `git submodule sync --recursive` and `git submodule update --init --recursive` when a checkout has `.git` metadata and required vendored sources are missing.
+- Source archives without `.git` cannot self-heal their vendored dependencies; those archives must already contain `deps/src/*` and `bench/vendor/quickfix`.
 
 ### Dependencies
 
@@ -350,21 +369,24 @@ writer.encode_to_buffer(dictionary_view, options, &buf);
 ./bench/bench.sh fastfix-ffd
 ./bench/bench.sh quickfix
 ./bench/bench.sh builder
+./bench/bench.sh compare
 ```
 
-All of those benchmark entrypoints intentionally consume the pinned QuickFIX 4.4 inputs, either through `bench/vendor/quickfix/spec/FIX44.xml` or the generated `build/bench/quickfix_FIX44.ffd` / `build/bench/quickfix_FIX44.art` outputs. The benchmark-specific breakdown now lives in [bench/README.md](../bench/README.md), including what each suite measures, the object-to-wire timing boundary, and the meaning of every printed metric. This section stays intentionally short and points to the canonical bench-local workflow.
+`compare` is the command used for the published side-by-side README numbers. Its default args are `--iterations 100000 --loopback 1000 --replay 1000 --replay-span 128`.
+
+All benchmark entrypoints intentionally consume the pinned QuickFIX 4.4 inputs, either through `bench/vendor/quickfix/spec/FIX44.xml` or the generated `build/bench/quickfix_FIX44.ffd` / `build/bench/quickfix_FIX44.art` outputs. The canonical benchmark-local breakdown now lives in [bench/README.md](../bench/README.md), including exact timing boundaries, diagrams, and the meaning of every printed metric.
 
 ### What Gets Measured
 
-| Tier | What | Key Metric |
-|------|------|------------|
-| peek | Header extraction only | Latency percentiles, alloc/op, perf counters |
-| parse | Full decode to MessageView | Latency percentiles, alloc/op, perf counters |
-| encode | Build FIX frame (new buffer) | Latency percentiles, alloc/op, perf counters |
-| encode-buffer | Build FIX frame (reuse buffer) | Latency percentiles, alloc/op, perf counters |
-| session-inbound | Decode + seq check + store | End-to-end inbound hot-path latency |
-| replay | Recover + re-encode 128 msgs | Replay latency and throughput |
-| loopback | Full TCP round-trip | Socket-to-socket round-trip latency |
+| Boundary | FastFix metric | QuickFIX metric | What it means |
+|----------|----------------|-----------------|---------------|
+| header sniff | `peek` | — | FastFix-only header extraction before full decode |
+| object → wire | `encode` | `quickfix-encode-buffer` | closest shared encode boundary; both sides reuse an output buffer |
+| object → wire (fresh string) | — | `quickfix-encode` | QuickFIX-only serializer path that returns a fresh string |
+| wire → object | `parse` | `quickfix-parse` | full frame parse back into each engine's object/view model |
+| session inbound | `session-inbound` | `quickfix-session-inbound` | decode + session/admin rules + store interaction on an inbound app frame |
+| replay | `replay` | `quickfix-replay` | ResendRequest handling across `replay_span=128` stored messages |
+| TCP round-trip | `loopback-roundtrip` | `quickfix-loopback` | full userspace-to-kernel-to-userspace message RTT |
 
 ### Instrumentation
 

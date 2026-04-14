@@ -32,6 +32,23 @@ runtime ──► session ──► codec ──► message ──► profile
 
 Modules depend downward only. `base` has no FIX-specific dependencies. `transport` and `store` are independent of each other and of higher-level FIX semantics.
 
+## Program Structure
+
+The repository is split between the reusable engine surface, executable entrypoints, and operational helpers:
+
+| Path | Role |
+|------|------|
+| `include/fastfix/` + `src/` | Public library surface and implementation |
+| `tools/acceptor/` | Live acceptor binary that wires config into `Engine` + `LiveAcceptor` |
+| `tools/initiator/` | Live initiator binary that wires config into `Engine` + `LiveInitiator` |
+| `bench/` | Benchmark drivers plus the side-by-side QuickFIX comparison harness |
+| `tests/` | Regression, runtime, soak, and integration coverage |
+| `scripts/` | Helper entrypoints used by developers and CI for offline build/test/bench flows |
+| `samples/` | Example `.ffd` profiles and overlays used by docs, tests, and codegen fixtures |
+| `docs/` | Architecture and development documentation |
+
+At runtime, the tools do very little policy themselves. They parse CLI or config-file input, populate runtime config structs, and hand control to `Engine`, `LiveAcceptor`, or `LiveInitiator`. That keeps the hot-path logic inside the library rather than duplicated across binaries.
+
 ---
 
 ## Layer-by-Layer
@@ -165,11 +182,11 @@ Parsing and encoding FIX byte streams.
 ```
 Raw bytes (span<const byte>)
     │
-    ├── PeekSessionHeaderView()     ~198 ns, zero alloc
+    ├── PeekSessionHeaderView()     zero-copy fast header scan
     │   └── Extracts: MsgType, SenderCompID, TargetCompID,
     │       MsgSeqNum, BeginString without full decode
     │
-    └── DecodeFixMessageView()      ~1314 ns
+    └── DecodeFixMessageView()      full frame decode
         ├── SIMD SOH scanning (simd_scan.h)
         ├── Field tokenization (tag=value\x01 splitting)
         ├── Header validation (8/9/35 ordering, BodyLength, Checksum)
@@ -182,16 +199,18 @@ Raw bytes (span<const byte>)
 ```
 Message + EncodeOptions
     │
-    ├── EncodeFixMessage()          ~1471 ns, allocates output buffer
+    ├── EncodeFixMessage()          allocates output buffer
     │
-    └── EncodeFixMessageToBuffer()  ~1490 ns, reuses EncodeBuffer (reduced alloc)
+    └── EncodeFixMessageToBuffer()  reuses EncodeBuffer (reduced alloc)
     │
-    └── FixedLayoutWriter::encode_to_buffer()  ~684 ns, hot-path O(1) slot writes
+    └── FixedLayoutWriter::encode_to_buffer()  hot-path O(1) slot writes
         ├── Write header: 8=BeginString|9=<placeholder>|35=MsgType|...
         ├── Write body fields from Message
         ├── Backfill BodyLength
         └── Append 10=<checksum>
 ```
+
+See `bench/README.md` for the current measured latencies; this document intentionally stays focused on structure and flow so it does not go stale every time the benchmark snapshot changes.
 
 **FrameEncodeTemplate**: For high-frequency messages, pre-builds the fixed portion of the frame. Only variable fields + length + checksum are computed per message.
 
@@ -379,7 +398,7 @@ class TcpAcceptor {
 
 ### 8. Runtime (`include/fastfix/runtime/`)
 
-Top-level orchestration: engine lifecycle, worker threading, I/O polling, metrics, and tracing.
+The runtime layer is where the library becomes a process. It loads profiles, builds worker shards, binds sockets, owns timer wheels and wakeups, routes connections, exposes `SessionHandle`s, and turns configuration knobs into a concrete topology.
 
 #### Engine
 
@@ -393,6 +412,13 @@ class Engine {
     void SetSessionFactory(SessionFactory);  // Dynamic session acceptance
 };
 ```
+
+Primary responsibilities:
+
+- Load `.art` and/or `.ffd` profiles into `ProfileRegistry`
+- Materialize shared runtime services: metrics, trace, managed queues, store factories
+- Build the worker-shard inventory consumed by `LiveAcceptor` and `LiveInitiator`
+- Provide lifecycle (`Boot()`, `Run()`, `Stop()`) and `SessionHandle` surfaces for non-owner threads
 
 #### LiveInitiator / LiveAcceptor
 
@@ -419,6 +445,35 @@ LiveAcceptor                          LiveInitiator
             └── Heartbeat/timeout                 └── Heartbeat/timeout
 ```
 
+`LiveAcceptor` adds listener management and front-door connection routing. `LiveInitiator` adds outbound connect/reconnect loops. Both otherwise reuse the same worker-owned session, codec, store, transport, metrics, and tracing layers.
+
+#### Runtime Shape Matrix
+
+| Shape | Key knobs | Threads that exist | What changes materially |
+|-------|-----------|--------------------|-------------------------|
+| Single-worker inline | `worker_count=1`, `dispatch_mode=inline` | caller thread only | no worker `std::jthread`, no app queue hop, lowest complexity |
+| Multi-worker inline acceptor | `worker_count>1`, `dispatch_mode=inline` | front-door + `worker_count` session workers | accepts on front-door, hands each session to one owning shard |
+| Queue-decoupled co-scheduled | `dispatch_mode=queue-decoupled`, `queue_app_mode=co-scheduled` | same as inline topology | session workers enqueue app events, then explicitly poll/drain them on the same worker threads |
+| Queue-decoupled threaded | `dispatch_mode=queue-decoupled`, `queue_app_mode=threaded` | front-door or initiator workers + `worker_count` app workers | app callbacks move off the session workers onto per-worker SPSC queues |
+| Initiator runtime | `LiveInitiator` | no front-door thread | each worker owns connect, reconnect, timers, decode, encode, and send for its sessions |
+
+#### End-to-End Runtime Shape
+
+```mermaid
+flowchart LR
+    NET["TcpAcceptor / TcpConnection"] --> FD["front-door accept loop<br/>(acceptor only)"]
+    NET --> W["session worker shard"]
+    FD --> W
+    W --> TW["Poller + TimerWheel + wakeup"]
+    TW --> AP["AdminProtocol + SessionCore"]
+    AP --> DISP{"dispatch_mode"}
+    DISP -->|inline| APP["ApplicationCallbacks"]
+    DISP -->|queue-decoupled| Q["QueueApplication<br/>per-worker SPSC"] --> QR["managed queue runner"] --> APP
+    AP --> STORE["SessionStore"]
+    AP --> NET
+    AP --> OBS["Metrics + trace"]
+```
+
 #### Worker Sharding
 
 ```
@@ -437,28 +492,20 @@ Engine
       └── Accepts connections, routes to least-loaded worker
 ```
 
-**Session-to-worker routing**: `FindSessionShard(session_id)` determines which worker owns a session. If a connection arrives on the wrong worker (common with front-door accept), `MigrateConnectionToRoutedWorker()` transfers it.
+Each live session is owned by exactly one shard. That shard owns the socket registration, session state, timers, replay state, store interaction, and application dispatch for the session. The acceptor front-door can touch a connection only long enough to read the logon and decide which shard should adopt it. After handoff, the worker owns the session exclusively.
+
+`listener.worker_hint` influences the preferred landing shard for new acceptor sessions, while the front-door still keeps load and live connection counts in mind when multiple workers are available.
 
 #### Application Dispatch
 
-Two modes:
+`dispatch_mode` is the main topology switch after worker ownership is set:
 
-**Inline** (`kInline`): Callback runs directly on the session worker thread.
+- `kInline`: the application callback runs directly on the session worker thread.
+- `kQueueDecoupled`: the worker emits queue items into a per-worker SPSC queue.
+- `queue_app_mode=kCoScheduled`: the queue is drained on the same worker thread when the runtime polls managed queues.
+- `queue_app_mode=kThreaded`: a dedicated `ff-app-wN` thread drains the queue and runs callbacks off the hot path.
 
-```
-Worker thread: ReceiveFrame → Decode → AdminProtocol → OnAppMessage()
-```
-
-Lowest latency. Application must not block.
-
-**Queue-Decoupled** (`kQueueDecoupled`): Event is enqueued to a SPSC queue. Application drains from a separate thread.
-
-```
-Worker thread: ReceiveFrame → Decode → AdminProtocol → SpscQueue.push(event)
-App thread:    SpscQueue.pop() → OnAppMessage() → handle.Send()
-```
-
-Higher latency, but decouples application processing from I/O.
+Queue overflow handling is explicit through `queue_full_policy` (`kCloseSession`, `kBackpressure`, `kDropNewest`).
 
 #### Observability
 
@@ -470,113 +517,116 @@ Higher latency, but decouples application processing from I/O.
 
 ## Data Flow: Complete Inbound Path
 
+```mermaid
+flowchart LR
+    SOX["socket readable"] --> POLL["worker poll()/wakeup"]
+    POLL --> RX["TcpConnection::ReceiveFrameView()"]
+    RX --> PEEK["PeekSessionHeaderView()"]
+    PEEK --> IN["AdminProtocol::OnInbound(frame, now)"]
+    IN --> DEC["DecodeFixMessageView()"]
+    DEC --> CORE["SessionCore + admin rules"]
+    CORE --> STORE["SessionStore::SaveInbound()"]
+    CORE --> DISP{"dispatch_mode"}
+    DISP -->|inline| APP["ApplicationCallbacks"]
+    DISP -->|queue| QUEUE["QueueApplication event"]
+    CORE --> OUT["ProtocolEvent.outbound_frames"] --> TX["TcpConnection::Send*()"]
 ```
-                                    ┌──────────────┐
-TCP socket readable ──► poll() ──►  │ Worker Thread │
-                                    └──────┬───────┘
-                                           │
-                                    TcpConnection::ReceiveFrameView()
-                                           │
-                                    ┌──────▼───────┐
-                                    │  SIMD Scan   │ Find SOH boundaries
-                                    │  Tokenize    │ Split tag=value pairs
-                                    │  Checksum    │ Verify tag 10
-                                    └──────┬───────┘
-                                           │
-                                    PeekSessionHeaderView()
-                                           │ (if new connection: BindConnectionFromLogon)
-                                           │
-                                    DecodeFixMessageView()
-                                           │
-                                    ┌──────▼───────┐
-                                    │ AdminProtocol│
-                                    │  OnInbound() │
-                                    └──┬────┬──────┘
-                                       │    │
-                              Admin msg │    │ App msg
-                                       │    │
-                              ┌────────▼┐  ┌▼─────────────┐
-                              │Heartbeat│  │DispatchApp    │
-                              │Resend   │  │  Message()    │
-                              │SeqReset │  │               │
-                              │Logout   │  │ → Inline CB   │
-                              └─────────┘  │ → SPSC Queue  │
-                                           └───────────────┘
-```
+
+Step-by-step:
+
+1. A worker wakes because a socket is readable, a timer fired, or another thread signalled its wakeup pipe.
+2. `TcpConnection::ReceiveFrameView()` assembles a complete FIX frame from the socket buffer.
+3. `PeekSessionHeaderView()` performs a cheap header read to identify `MsgType`, the session key, and sequence context before the full decode.
+4. `AdminProtocol::OnInbound()` performs the full decode and feeds the result into `SessionCore`.
+5. `SessionCore` handles sequence rules, resend / gap logic, heartbeats, logout transitions, and protocol state updates.
+6. The worker persists inbound records and any updated recovery state through the configured `SessionStore`.
+7. Application messages are either delivered inline or published into the per-worker queue, depending on `dispatch_mode`.
+8. Any admin or replay response frames returned from the protocol layer are sent on the same worker that owns the session.
 
 ## Data Flow: Complete Outbound Path
 
+```mermaid
+flowchart LR
+    APP["application code / SessionHandle"] --> CMD["per-worker command queue"]
+    CMD --> WORKER["owning session worker"]
+    WORKER --> SEQ["SessionCore::AllocateOutboundSeq()"]
+    SEQ --> SEND["AdminProtocol::SendApplication()"]
+    SEND --> ENC["FixedLayoutWriter / FrameEncodeTemplate / EncodeFixMessageToBuffer()"]
+    ENC --> STORE["SessionStore::SaveOutbound()"]
+    STORE --> TX["TcpConnection::Send*()"]
+    TX --> WIRE["bytes on wire"]
 ```
-Application code
-    │
-    ├── MessageBuilder::build()
-    │
-    ├── SessionHandle::Send(message)
-    │   │
-    │   ├── SessionCore::AllocateOutboundSeq()
-    │   │
-    │   ├── AdminProtocol::SendApplication()
-    │   │   ├── EncodeFixMessage() or FrameEncodeTemplate
-    │   │   ├── SessionStore::SaveOutbound()
-    │   │   └── Returns ProtocolFrame (encoded bytes)
-    │   │
-    │   └── TcpConnection::Send(frame.bytes)
-    │
-    └── Done (frame on wire)
-```
+
+Step-by-step:
+
+1. Application code builds a `Message` or uses a typed writer and calls into `SessionHandle`.
+2. If the caller is not already on the owner thread, the send request is pushed into the worker's command queue and the worker is woken up.
+3. The owning worker allocates the next outbound sequence number through `SessionCore`.
+4. `AdminProtocol::SendApplication()` applies FIX-session fields, chooses the encode path, and materializes the outbound frame.
+5. The store persists the outbound message before the bytes leave the process so replay can recover it later.
+6. The same worker writes the bytes to the transport and updates metrics / trace state.
 
 ---
 
 ## Threading Model
 
-FastFix does not create threads behind your back. Every thread is explicitly configured, explicitly started, and pinnable to a specific CPU core. This section describes what threads exist, who owns them, and how the user controls them.
+FastFix does not hide topology decisions. Thread count, callback placement, polling strategy, and CPU pinning all come from explicit config, and each combination maps to a concrete process shape.
+
+### Knobs That Change The Shape
+
+| Knob | Typical values | What it changes |
+|------|----------------|-----------------|
+| `worker_count` | `1`, `N>1` | whether the runtime collapses onto the caller thread or spawns one worker per shard |
+| `dispatch_mode` | `inline`, `queue-decoupled` | whether app callbacks run on the session worker or hop through a queue |
+| `queue_app_mode` | `co-scheduled`, `threaded` | whether queue draining stays on the worker or moves to dedicated app threads |
+| `poll_mode` | `blocking`, `busy` | idle CPU burn vs minimum jitter |
+| `front_door_cpu` | unset or CPU id | acceptor front-door affinity |
+| `worker_cpu_affinity` | CSV list | per-worker pinning |
+| `app_cpu_affinity` | CSV list | per-app-worker pinning in threaded queue mode |
+| `listener.worker_hint` | worker id | preferred landing shard for new acceptor sessions |
 
 ### Thread Topology
 
-#### Acceptor
+```mermaid
+flowchart TB
+    CALLER["caller thread"] -->|worker_count=1| ONE["single worker runtime"]
+    CALLER -->|acceptor + worker_count>1| FD["ff-acc-main front-door"]
+    CALLER -->|initiator + worker_count>1| W0["ff-ini-w0"]
+    FD --> W1["ff-acc-w0"]
+    FD --> W2["ff-acc-w1..N"]
+    W0 -->|queue_app_mode=threaded| A0["ff-app-w0"]
+    W1 -->|queue_app_mode=threaded| A1["ff-app-w0"]
+    W2 -->|queue_app_mode=threaded| A2["ff-app-w1..N"]
+```
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ Front-door thread (ff-acc-main)          CPU: front_door_cpu    │
-│   accept() → read Logon → route to least-loaded worker          │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ inbox (mutex-protected handoff)
-          ┌────────────────┼────────────────┐
-          ▼                ▼                ▼
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│ Worker 0     │  │ Worker 1     │  │ Worker 2     │
-│ ff-acc-w0    │  │ ff-acc-w1    │  │ ff-acc-w2    │
-│ CPU: affn[0] │  │ CPU: affn[1] │  │ CPU: affn[2] │
-│              │  │              │  │              │
-│ ShardPoller  │  │ ShardPoller  │  │ ShardPoller  │
-│ TimerWheel   │  │ TimerWheel   │  │ TimerWheel   │
-│ Sessions[]   │  │ Sessions[]   │  │ Sessions[]   │
-└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-       │ SPSC              │ SPSC            │ SPSC
-       ▼                   ▼                 ▼
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│ App Worker 0 │  │ App Worker 1 │  │ App Worker 2 │  (optional, kThreaded only)
-│ ff-app-w0    │  │ ff-app-w1    │  │ ff-app-w2    │
-│ CPU: app[0]  │  │ CPU: app[1]  │  │ CPU: app[2]  │
-└──────────────┘  └──────────────┘  └──────────────┘
-```
+#### Acceptor
 
 | Thread | Name | Count | Role | CPU Pin |
 |--------|------|-------|------|---------|
-| Front-door | `ff-acc-main` | 1 | Accept TCP connections, read Logon, route to worker | `front_door_cpu` |
-| Session worker | `ff-acc-w{N}` | `worker_count` | Own sessions exclusively: decode, sequence, timer, encode, send | `worker_cpu_affinity[N]` |
-| App worker | `ff-app-w{N}` | `worker_count` (if `kThreaded`) | Drain SPSC queues, invoke business callbacks | `app_cpu_affinity[N]` |
+| Front-door | `ff-acc-main` | 1 | Accept TCP connections, read Logon, choose a worker, and hand off the socket | `front_door_cpu` |
+| Session worker | `ff-acc-w{N}` | `worker_count` | Own sessions exclusively: decode, sequence, timer, encode, send, replay | `worker_cpu_affinity[N]` |
+| App worker | `ff-app-w{N}` | `worker_count` (if `queue_app_mode=threaded`) | Drain SPSC queues and invoke business callbacks | `app_cpu_affinity[N]` |
 
 #### Initiator
 
-Same structure, minus the front-door thread:
+Same worker/app structure, minus the front-door thread:
 
 | Thread | Name | Count | Role | CPU Pin |
 |--------|------|-------|------|---------|
-| Session worker | `ff-ini-w{N}` | `worker_count` | Own sessions: connect, decode, sequence, timer, encode, send, reconnect | `worker_cpu_affinity[N]` |
-| App worker | `ff-app-w{N}` | `worker_count` (if `kThreaded`) | Drain SPSC queues, invoke business callbacks | `app_cpu_affinity[N]` |
+| Session worker | `ff-ini-w{N}` | `worker_count` | Own sessions: connect, reconnect, decode, sequence, timer, encode, send | `worker_cpu_affinity[N]` |
+| App worker | `ff-app-w{N}` | `worker_count` (if `queue_app_mode=threaded`) | Drain SPSC queues and invoke business callbacks | `app_cpu_affinity[N]` |
 
-When `worker_count=1`, the single worker runs on the caller's thread (no `std::jthread` spawned).
+When `worker_count=1`, the runtime stays on the caller's thread and does not spawn worker `std::jthread`s. Raising `worker_count` turns each shard into its own thread; enabling `queue_app_mode=threaded` then creates one app worker per session worker.
+
+### Common Topologies
+
+| Shape | Threads | Typical config | Why you would choose it |
+|-------|---------|----------------|-------------------------|
+| Single-thread initiator | caller thread only | `worker_count=1`, `dispatch_mode=inline` | simplest debugging and deterministic local testing |
+| Single-thread acceptor | caller thread only | `worker_count=1`, `dispatch_mode=inline` | single-session local harnesses and smoke setups |
+| Multi-worker acceptor | `ff-acc-main` + `ff-acc-wN` | `worker_count>1`, `dispatch_mode=inline` | isolate session hot paths without paying a queue hop |
+| Co-scheduled queue runtime | same as above | `dispatch_mode=queue-decoupled`, `queue_app_mode=co-scheduled` | decouple callback lifetime from decode while keeping thread count flat |
+| Threaded queue runtime | workers + `ff-app-wN` | `dispatch_mode=queue-decoupled`, `queue_app_mode=threaded` | protect session workers from blocking business logic |
 
 ### Thread Lifecycle
 
@@ -598,7 +648,7 @@ LiveAcceptor::Run()
     │
     └── Front-door loop on caller's thread
         ├── accept() + read Logon
-        ├── SelectAcceptWorkerId() → least-loaded worker
+        ├── SelectAcceptWorkerId() → hinted, then load-aware worker choice
         ├── EnqueuePendingConnection(worker_id, conn)  (lock inbox, push)
         └── SignalWorkerWakeup(worker_id)               (write 1 byte to pipe)
 ```
@@ -607,7 +657,7 @@ All threads are `std::jthread` — calling `Stop()` or destroying the runtime jo
 
 ### Session Ownership
 
-**Each session belongs to exactly one worker thread. That worker alone handles all protocol state for the session: decode, sequence numbers, timers, store persistence, encode, and write. No locks are needed on the hot path.**
+**Each session belongs to exactly one worker thread. That worker alone handles protocol state, timers, replay, store persistence, encode, and send for the session. No session-level locks are needed on the hot path.**
 
 When the front-door accepts a connection, it routes the connection to a worker via an inbox (mutex-protected push, then pipe-based wakeup). Once the worker adopts the connection, the front-door never touches it again.
 
@@ -653,6 +703,8 @@ Two sub-modes:
 |----------|------------------------|--------|
 | `kCoScheduled` | On session worker thread, during explicit `PollManagedQueueWorkerOnce()` call | Same as session worker |
 | `kThreaded` | On dedicated app worker thread (`ff-app-wN`) | Separate thread |
+
+`kCoScheduled` is useful when you want queue ownership semantics without increasing thread count. `kThreaded` is the runtime shape to choose when application code may block or when you want clean CPU isolation between protocol work and business logic.
 
 Queue overflow policies when SPSC fills up:
 
@@ -711,11 +763,11 @@ Core 6:  App worker 2
 1. Each `SessionCore` is owned by exactly one worker thread — never shared.
 2. Worker threads never take locks on the hot path.
 3. Cross-thread communication uses `SpscQueue` (lock-free, wait-free).
-4. `std::atomic` for counters (metrics, connection counts) — no mutex.
-5. `std::mutex` only for cold-path operations: profile registry, metrics snapshot, managed queue runner setup.
-6. Front-door thread (acceptor) hands off connections to workers via inbox + pipe wakeup.
-7. `MessageView` is thread-affine to the callback scope — if you need the data elsewhere, explicitly copy.
-8. Hot-path atomics use `std::memory_order_relaxed` for counters and `acquire/release` for SpscQueue head/tail.
+4. `std::atomic` counters cover metrics and connection counts; no mutex is required there.
+5. `std::mutex` is reserved for cold-path operations such as profile registry updates, metrics snapshots, and managed queue runner setup.
+6. Front-door handoff is the only acceptor cross-thread session transfer.
+7. `MessageView` is thread-affine to the callback scope — copy if you need to retain data elsewhere.
+8. Hot-path atomics use `std::memory_order_relaxed` for counters and `acquire/release` for SPSC queue head/tail.
 
 ---
 
