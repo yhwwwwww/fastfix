@@ -18,6 +18,7 @@ RESOLVED_BUILD_SYSTEM=""
 RESOLVED_CMAKE_GENERATOR=""
 RESOLVED_CMAKE_GENERATOR_KIND=""
 RESOLVED_CMAKE_PRESET=""
+DETECTED_XMAKE_VERSION=""
 
 QUICKFIX_SRC_DIR="$ROOT_DIR/bench/vendor/quickfix"
 QUICKFIX_BUILD_DIR="$BENCH_DIR/quickfix-build"
@@ -29,6 +30,7 @@ FASTFIX_BENCH_BIN=""
 XML2FFD_BIN=""
 DICTGEN_BIN=""
 QUICKFIX_BENCH_BIN=""
+XMAKE_CONFIGURED=0
 
 usage() {
     cat <<'EOF'
@@ -55,6 +57,61 @@ EOF
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+run_xmake() {
+    env -u CC -u CXX xmake "$@"
+}
+
+detect_xmake_version() {
+    if [ -n "$DETECTED_XMAKE_VERSION" ]; then
+        printf '%s\n' "$DETECTED_XMAKE_VERSION"
+        return
+    fi
+
+    DETECTED_XMAKE_VERSION="$(xmake --version 2>/dev/null | sed -n '1s/.*v\([0-9][0-9.]*\).*/\1/p')"
+    printf '%s\n' "$DETECTED_XMAKE_VERSION"
+}
+
+version_at_least() {
+    local current="$1"
+    local minimum="$2"
+    local current_major current_minor current_patch
+    local minimum_major minimum_minor minimum_patch
+
+    IFS=. read -r current_major current_minor current_patch <<EOF
+$current
+EOF
+    IFS=. read -r minimum_major minimum_minor minimum_patch <<EOF
+$minimum
+EOF
+
+    current_major="${current_major:-0}"
+    current_minor="${current_minor:-0}"
+    current_patch="${current_patch:-0}"
+    minimum_major="${minimum_major:-0}"
+    minimum_minor="${minimum_minor:-0}"
+    minimum_patch="${minimum_patch:-0}"
+
+    if [ "$current_major" -gt "$minimum_major" ]; then
+        return 0
+    fi
+    if [ "$current_major" -lt "$minimum_major" ]; then
+        return 1
+    fi
+    if [ "$current_minor" -gt "$minimum_minor" ]; then
+        return 0
+    fi
+    if [ "$current_minor" -lt "$minimum_minor" ]; then
+        return 1
+    fi
+    [ "$current_patch" -ge "$minimum_patch" ]
+}
+
+xmake_is_supported() {
+    local version
+    version="$(detect_xmake_version)"
+    [ -n "$version" ] && version_at_least "$version" "3.0.0"
 }
 
 validate_xmake_ccache() {
@@ -163,7 +220,15 @@ resolve_build_system() {
     case "$BUILD_SYSTEM" in
         auto)
             if command_exists xmake; then
-                RESOLVED_BUILD_SYSTEM="xmake"
+                if xmake_is_supported; then
+                    RESOLVED_BUILD_SYSTEM="xmake"
+                elif command_exists cmake; then
+                    echo "info: xmake $(detect_xmake_version) is too old for this project; falling back to cmake" >&2
+                    RESOLVED_BUILD_SYSTEM="cmake"
+                else
+                    echo "error: xmake $(detect_xmake_version) is too old for this project and cmake is not available" >&2
+                    exit 1
+                fi
             elif command_exists cmake; then
                 RESOLVED_BUILD_SYSTEM="cmake"
             else
@@ -175,6 +240,10 @@ resolve_build_system() {
             if ! command_exists xmake; then
                 echo "error: xmake is not available" >&2
                 echo "hint: install xmake or rerun with FASTFIX_BUILD_SYSTEM=cmake" >&2
+                exit 1
+            fi
+            if ! xmake_is_supported; then
+                echo "error: xmake $(detect_xmake_version) is too old for this project; install xmake >= 3.0.0 or rerun with FASTFIX_BUILD_SYSTEM=cmake" >&2
                 exit 1
             fi
             RESOLVED_BUILD_SYSTEM="xmake"
@@ -280,6 +349,23 @@ reset_incompatible_cmake_cache() {
     cmake -E rm -rf "$CMAKE_BUILD_DIR/CMakeFiles" "$CMAKE_BUILD_DIR/Testing"
 }
 
+fallback_to_cmake() {
+    if ! command_exists cmake; then
+        return 1
+    fi
+
+    echo "info: xmake auto path is unavailable in this environment; falling back to cmake" >&2
+    RESOLVED_BUILD_SYSTEM="cmake"
+    XMAKE_CONFIGURED=0
+    BIN_DIR=""
+    FASTFIX_BENCH_BIN=""
+    XML2FFD_BIN=""
+    DICTGEN_BIN=""
+    QUICKFIX_BENCH_BIN=""
+    resolve_paths
+    return 0
+}
+
 ensure_quickfix_source() {
     if [ ! -f "$QUICKFIX_XML" ]; then
         echo "error: missing QuickFIX submodule checkout at $QUICKFIX_XML" >&2
@@ -299,9 +385,41 @@ configure_cmake() {
 }
 
 configure_xmake() {
-    resolve_paths
+    if [ "$XMAKE_CONFIGURED" = "1" ]; then
+        return 0
+    fi
+
     validate_xmake_ccache
-    xmake f -m "$XMAKE_MODE" --ccache="$XMAKE_CCACHE" -y
+    local -a args=(f -c -m "$XMAKE_MODE" --ccache="$XMAKE_CCACHE" -y)
+
+    if [ -n "${CC:-}" ]; then
+        if command_exists "$CC"; then
+            args+=("--cc=$CC")
+        elif [ "$BUILD_SYSTEM" = "xmake" ]; then
+            echo "error: CC compiler '$CC' is not available" >&2
+            return 1
+        else
+            echo "info: ignoring unavailable CC='$CC' for xmake auto path" >&2
+        fi
+    fi
+    if [ -n "${CXX:-}" ]; then
+        if command_exists "$CXX"; then
+            args+=("--cxx=$CXX")
+        elif [ "$BUILD_SYSTEM" = "xmake" ]; then
+            echo "error: CXX compiler '$CXX' is not available" >&2
+            return 1
+        else
+            echo "info: ignoring unavailable CXX='$CXX' for xmake auto path" >&2
+        fi
+    fi
+
+    if run_xmake "${args[@]}"; then
+        XMAKE_CONFIGURED=1
+        return 0
+    fi
+
+    XMAKE_CONFIGURED=0
+    return 1
 }
 
 cmake_build() {
@@ -310,9 +428,16 @@ cmake_build() {
 }
 
 xmake_build() {
-    configure_xmake
+    if ! configure_xmake; then
+        if [ "$BUILD_SYSTEM" = "auto" ] && fallback_to_cmake; then
+            cmake_build "$@"
+            return
+        fi
+        return 1
+    fi
+
     for target_name in "$@"; do
-        xmake build "$target_name"
+        run_xmake build "$target_name"
     done
 }
 
