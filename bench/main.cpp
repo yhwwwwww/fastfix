@@ -112,6 +112,44 @@ auto BuildSampleMessage(bool include_price = true) -> fastfix::message::Message 
     return BuildFix44MessageFromBusinessOrder(BuildFix44BusinessOrder(include_price));
 }
 
+auto BuildEncodedMixedExtras() -> fastfix::codec::EncodedOutboundExtras {
+    return fastfix::codec::EncodedOutboundExtras{
+        .header_fragment =
+            "50=DESK-9\x01"
+            "57=ROUTE-7\x01"
+            "115=CLIENT-A\x01"
+            "128=VENUE-B\x01"
+            "97=Y\x01",
+        .body_fragment =
+            "1=ACC-77\x01"
+            "9999=TAIL\x01",
+    };
+}
+
+auto PopulateGeneratedWriter(
+    fastfix::generated::profile_4400::NewOrderSingleWriter* writer,
+    const Fix44BusinessOrder& business_order) -> void {
+    if (writer == nullptr) {
+        return;
+    }
+
+    writer->clear();
+    writer->set_cl_ord_id(business_order.cl_ord_id);
+    writer->set_symbol(business_order.symbol);
+    writer->set_side(business_order.side);
+    writer->set_transact_time(business_order.transact_time.text);
+    writer->set_order_qty(business_order.order_qty);
+    writer->set_ord_type(business_order.ord_type);
+    if (business_order.price.has_value()) {
+        writer->set_price(business_order.price.value());
+    }
+    writer->reserve_no_party_i_ds(1U);
+    writer->add_no_party_i_ds()
+        .set_party_id(business_order.party_id)
+        .set_party_id_source(business_order.party_id_source)
+        .set_party_role(business_order.party_role);
+}
+
 auto ExtractOrderQty(fastfix::message::MessageView order) -> std::optional<double> {
     if (auto qty = order.get_float(38U); qty.has_value()) {
         return qty.value();
@@ -169,6 +207,7 @@ auto RunEncodeBenchmark(
     if (!layout.ok()) {
         return layout.status();
     }
+    const auto extras = BuildEncodedMixedExtras();
     BenchmarkResult result;
     result.samples_ns.reserve(iterations);
     BenchmarkMeasurement measurement;
@@ -179,22 +218,8 @@ auto RunEncodeBenchmark(
     for (std::uint32_t index = 0; index < iterations; ++index) {
         const auto sample_started = std::chrono::steady_clock::now();
         options.msg_seq_num = index + 1U;
-        writer.clear();
-        writer.set_cl_ord_id(business_order.cl_ord_id);
-        writer.set_symbol(business_order.symbol);
-        writer.set_side(business_order.side);
-        writer.set_transact_time(business_order.transact_time.text);
-        writer.set_order_qty(business_order.order_qty);
-        writer.set_ord_type(business_order.ord_type);
-        if (business_order.price.has_value()) {
-            writer.set_price(business_order.price.value());
-        }
-        writer.reserve_no_party_i_ds(1U);
-        writer.add_no_party_i_ds()
-            .set_party_id(business_order.party_id)
-            .set_party_id_source(business_order.party_id_source)
-            .set_party_role(business_order.party_role);
-        auto status = writer.encode_to_buffer(dictionary, options, &encode_buffer);
+        PopulateGeneratedWriter(&writer, business_order);
+        auto status = writer.encode_to_buffer(dictionary, options, extras.view(), &encode_buffer);
         if (!status.ok()) {
             return status;
         }
