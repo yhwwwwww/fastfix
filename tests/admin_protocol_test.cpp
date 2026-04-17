@@ -28,6 +28,7 @@ auto EncodeInboundFrame(
     options.default_appl_ver_id = std::move(default_appl_ver_id);
     options.msg_seq_num = seq_num;
     options.poss_dup = poss_dup;
+    options.poss_resend = message.view().get_boolean(kPossResend).value_or(false);
     options.sending_time = "20260402-12:00:00.000";
     options.orig_sending_time = std::move(orig_sending_time);
     return fastfix::codec::EncodeFixMessage(message, dictionary, options);
