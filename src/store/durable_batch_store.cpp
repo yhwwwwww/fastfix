@@ -106,6 +106,7 @@ struct OutboundLocation {
     std::uint64_t segment_id{0};
     std::uint64_t log_offset{0};
     std::uint32_t payload_size{0};
+    std::uint32_t body_start_offset{0};
     std::uint16_t flags{0};
     std::uint64_t timestamp_ns{0};
 };
@@ -129,6 +130,7 @@ struct PendingEntry {
     std::uint16_t flags{0};
     std::uint32_t payload_offset{0};
     std::uint32_t payload_size{0};
+    std::uint32_t body_start_offset{0};
     SessionRecoveryState recovery_state;
 };
 
@@ -146,6 +148,9 @@ auto ValidateRecord(const MessageRecord& record) -> base::Status {
     if (record.payload.size() > std::numeric_limits<std::uint32_t>::max()) {
         return base::Status::InvalidArgument("message payload exceeds durable store limits");
     }
+    if (record.body_start_offset > record.payload.size()) {
+        return base::Status::InvalidArgument("message record body_start_offset exceeds payload size");
+    }
     return base::Status::Ok();
 }
 
@@ -158,6 +163,9 @@ auto ValidateRecordView(const MessageRecordView& record) -> base::Status {
     }
     if (record.payload.size() > std::numeric_limits<std::uint32_t>::max()) {
         return base::Status::InvalidArgument("message payload exceeds durable store limits");
+    }
+    if (record.body_start_offset > record.payload.size()) {
+        return base::Status::InvalidArgument("message record body_start_offset exceeds payload size");
     }
     return base::Status::Ok();
 }
@@ -315,12 +323,23 @@ auto OpenStoreFile(
         return base::Status::FormatError("durable batch store file segment id does not match its companion file");
     }
 
-    if (opened.header.file_size != opened.size) {
-        if (!SyncFileHeader(opened.fd, &opened.header, opened.size)) {
-            const auto message = IoErrorMessage(path, "unable to repair durable batch store header");
+    if (opened.header.file_size < sizeof(StoreFileHeader)) {
+        CloseFd(opened.fd);
+        return base::Status::FormatError("durable batch store file header commits an invalid size");
+    }
+
+    if (opened.header.file_size > opened.size) {
+        CloseFd(opened.fd);
+        return base::Status::FormatError("durable batch store file is truncated below its committed size");
+    }
+
+    if (opened.header.file_size < opened.size) {
+        if (::ftruncate(opened.fd, static_cast<off_t>(opened.header.file_size)) != 0) {
+            const auto message = IoErrorMessage(path, "unable to truncate durable batch store tail");
             CloseFd(opened.fd);
             return base::Status::IoError(message);
         }
+        opened.size = opened.header.file_size;
     }
 
     return opened;
@@ -394,11 +413,15 @@ auto LoadSegmentIndex(
         if (entry.log_offset + sizeof(StoreRecordHeader) + entry.payload_size > segment.log_size) {
             return base::Status::FormatError("durable batch store index points past the end of the log");
         }
+        if (entry.reserved1 > entry.payload_size) {
+            return base::Status::FormatError("durable batch store index entry has an invalid body_start_offset");
+        }
 
         (*outbound_index)[entry.session_id][entry.seq_num] = OutboundLocation{
             .segment_id = segment.segment_id,
             .log_offset = entry.log_offset,
             .payload_size = entry.payload_size,
+            .body_start_offset = entry.reserved1,
             .flags = entry.flags,
             .timestamp_ns = entry.timestamp_ns,
         };
@@ -535,6 +558,53 @@ auto ResolveSegmentHandle(
         return nullptr;
     }
     return &archived->second;
+}
+
+template <typename Fn>
+auto VisitSegmentRecords(const SegmentHandle& segment, Fn&& fn) -> base::Status {
+    std::uint64_t offset = sizeof(StoreFileHeader);
+    std::vector<std::byte> payload;
+    while (offset < segment.log_size) {
+        if (offset + sizeof(StoreRecordHeader) > segment.log_size) {
+            return base::Status::FormatError("durable batch store log contains a truncated record header");
+        }
+
+        StoreRecordHeader header{};
+        if (!ReadExact(segment.log_fd, &header, sizeof(header), offset)) {
+            return base::Status::IoError(IoErrorMessage(segment.log_path, "unable to read durable log record"));
+        }
+        if (header.header_size != sizeof(StoreRecordHeader)) {
+            return base::Status::FormatError("durable batch store log contains a record with an unexpected header size");
+        }
+        if (header.reserved0 > header.payload_size) {
+            return base::Status::FormatError("durable batch store log contains an invalid body_start_offset");
+        }
+
+        const auto record_end = offset + sizeof(StoreRecordHeader) + header.payload_size;
+        if (record_end > segment.log_size) {
+            return base::Status::FormatError("durable batch store log contains a truncated payload");
+        }
+
+        payload.resize(header.payload_size);
+        if (header.payload_size != 0U &&
+            !ReadExact(
+                segment.log_fd,
+                payload.data(),
+                header.payload_size,
+                offset + sizeof(StoreRecordHeader))) {
+            return base::Status::IoError(IoErrorMessage(segment.log_path, "unable to read durable log payload"));
+        }
+
+        const auto* payload_data = header.payload_size == 0U ? nullptr : payload.data();
+        auto status = fn(header, std::span<const std::byte>(payload_data, header.payload_size));
+        if (!status.ok()) {
+            return status;
+        }
+
+        offset = record_end;
+    }
+
+    return base::Status::Ok();
 }
 
 }  // namespace
@@ -781,6 +851,7 @@ auto DurableBatchSessionStore::AppendMessageView(bool outbound, const MessageRec
     entry.flags = record.flags;
     entry.payload_offset = static_cast<std::uint32_t>(impl_->pending_payload_arena.size());
     entry.payload_size = static_cast<std::uint32_t>(record.payload.size());
+    entry.body_start_offset = record.body_start_offset;
     impl_->pending_payload_arena.insert(
         impl_->pending_payload_arena.end(),
         record.payload.begin(),
@@ -872,6 +943,7 @@ auto DurableBatchSessionStore::Flush() -> base::Status {
         header.seq_num = entry.seq_num;
         header.payload_size = entry.payload_size;
         header.timestamp_ns = entry.timestamp_ns;
+        header.reserved0 = entry.body_start_offset;
 
         const auto log_offset = impl_->active_segment.log_size;
         if (!WriteExact(impl_->active_segment.log_fd, &header, sizeof(header), log_offset)) {
@@ -899,6 +971,7 @@ auto DurableBatchSessionStore::Flush() -> base::Status {
             index_entry.timestamp_ns = entry.timestamp_ns;
             index_entry.log_offset = log_offset;
             index_entry.payload_size = entry.payload_size;
+                index_entry.reserved1 = entry.body_start_offset;
             if (!WriteExact(
                     impl_->active_segment.index_fd,
                     &index_entry,
@@ -912,6 +985,7 @@ auto DurableBatchSessionStore::Flush() -> base::Status {
                 .segment_id = impl_->active_segment.segment_id,
                 .log_offset = index_entry.log_offset,
                 .payload_size = index_entry.payload_size,
+                .body_start_offset = index_entry.reserved1,
                 .flags = index_entry.flags,
                 .timestamp_ns = index_entry.timestamp_ns,
             };
@@ -1169,12 +1243,16 @@ auto DurableBatchSessionStore::LoadOutboundRange(
             header.header_size != sizeof(StoreRecordHeader)) {
             return base::Status::FormatError("durable batch store outbound index points to an invalid log record");
         }
+        if (header.reserved0 > header.payload_size) {
+            return base::Status::FormatError("durable batch store outbound record has an invalid body_start_offset");
+        }
 
         MessageRecord record;
         record.session_id = header.session_id;
         record.seq_num = header.seq_num;
         record.timestamp_ns = header.timestamp_ns;
         record.flags = header.flags;
+        record.body_start_offset = header.reserved0;
         record.payload.resize(header.payload_size);
         if (header.payload_size != 0U &&
             !ReadExact(
@@ -1218,6 +1296,7 @@ auto DurableBatchSessionStore::LoadOutboundRangeViews(
         std::uint64_t timestamp_ns{0};
         std::uint64_t log_offset{0};
         std::uint32_t payload_size{0};
+        std::uint32_t body_start_offset{0};
     };
 
     std::vector<IndexedRecord> indexed;
@@ -1238,6 +1317,7 @@ auto DurableBatchSessionStore::LoadOutboundRangeViews(
             .timestamp_ns = it->second.timestamp_ns,
             .log_offset = it->second.log_offset,
             .payload_size = it->second.payload_size,
+            .body_start_offset = it->second.body_start_offset,
         });
         total_payload_size += it->second.payload_size;
     }
@@ -1264,6 +1344,7 @@ auto DurableBatchSessionStore::LoadOutboundRangeViews(
             .timestamp_ns = entry.timestamp_ns,
             .flags = entry.flags,
             .payload = std::span<const std::byte>(payload, entry.payload_size),
+            .body_start_offset = entry.body_start_offset,
         });
         payload_offset += entry.payload_size;
     }
@@ -1309,16 +1390,104 @@ auto DurableBatchSessionStore::Refresh() -> base::Status {
 }
 
 auto DurableBatchSessionStore::ResetSession(std::uint64_t session_id) -> base::Status {
-    (void)session_id;
+    if (session_id == 0U) {
+        return base::Status::InvalidArgument("session reset requires a valid session id");
+    }
 
     auto status = Flush();
     if (!status.ok()) {
         return status;
     }
 
-    status = Refresh();
+    status = Open();
     if (!status.ok()) {
         return status;
+    }
+
+    std::filesystem::path rebuilt_root = root_;
+    rebuilt_root += ".reset.tmp";
+    std::error_code error;
+    std::filesystem::remove_all(rebuilt_root, error);
+    if (error) {
+        return base::Status::IoError(
+            "unable to prepare temporary durable batch store root '" + rebuilt_root.string() + "': " +
+            error.message());
+    }
+
+    {
+        DurableBatchSessionStore rebuilt(rebuilt_root, options_);
+        status = rebuilt.Open();
+        if (!status.ok()) {
+            return status;
+        }
+
+        for (const auto& [segment_id, segment] : impl_->archived_segments) {
+            (void)segment_id;
+            status = VisitSegmentRecords(segment, [&](const StoreRecordHeader& header, std::span<const std::byte> payload) {
+                if (header.session_id == session_id) {
+                    return base::Status::Ok();
+                }
+
+                MessageRecordView record{
+                    .session_id = header.session_id,
+                    .seq_num = header.seq_num,
+                    .timestamp_ns = header.timestamp_ns,
+                    .flags = header.flags,
+                    .payload = payload,
+                    .body_start_offset = header.reserved0,
+                };
+                if (header.record_type == static_cast<std::uint32_t>(StoreRecordType::kOutbound)) {
+                    return rebuilt.SaveOutboundView(record);
+                }
+                if (header.record_type == static_cast<std::uint32_t>(StoreRecordType::kInbound)) {
+                    return rebuilt.SaveInboundView(record);
+                }
+                return base::Status::FormatError("durable batch store log contains an unknown record type");
+            });
+            if (!status.ok()) {
+                return status;
+            }
+        }
+
+        status = VisitSegmentRecords(impl_->active_segment, [&](const StoreRecordHeader& header, std::span<const std::byte> payload) {
+            if (header.session_id == session_id) {
+                return base::Status::Ok();
+            }
+
+            MessageRecordView record{
+                .session_id = header.session_id,
+                .seq_num = header.seq_num,
+                .timestamp_ns = header.timestamp_ns,
+                .flags = header.flags,
+                .payload = payload,
+                .body_start_offset = header.reserved0,
+            };
+            if (header.record_type == static_cast<std::uint32_t>(StoreRecordType::kOutbound)) {
+                return rebuilt.SaveOutboundView(record);
+            }
+            if (header.record_type == static_cast<std::uint32_t>(StoreRecordType::kInbound)) {
+                return rebuilt.SaveInboundView(record);
+            }
+            return base::Status::FormatError("durable batch store log contains an unknown record type");
+        });
+        if (!status.ok()) {
+            return status;
+        }
+
+        for (const auto& [sid, state] : impl_->recovery_states) {
+            if (sid == session_id) {
+                continue;
+            }
+            status = rebuilt.SaveRecoveryState(state);
+            if (!status.ok()) {
+                return status;
+            }
+        }
+
+        status = rebuilt.Flush();
+        if (!status.ok()) {
+            return status;
+        }
     }
 
     CloseSegment(impl_->active_segment);
@@ -1331,11 +1500,16 @@ auto DurableBatchSessionStore::ResetSession(std::uint64_t session_id) -> base::S
     CloseFd(impl_->recovery_fd);
     impl_->recovery_size = 0U;
 
-    std::error_code error;
     std::filesystem::remove_all(root_, error);
     if (error) {
         return base::Status::IoError(
             "unable to reset durable batch store root '" + root_.string() + "': " + error.message());
+    }
+
+    std::filesystem::rename(rebuilt_root, root_, error);
+    if (error) {
+        return base::Status::IoError(
+            "unable to replace durable batch store root '" + root_.string() + "': " + error.message());
     }
 
     impl_->outbound_index.clear();

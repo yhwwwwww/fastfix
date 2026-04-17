@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -72,11 +73,13 @@ inline constexpr std::size_t kMessageRecordViewRangeInlineCapacity = 4U;
 struct MessageRecordViewRange {
     std::vector<MessageRecord> owned_storage;
     std::vector<std::byte> payload_storage;
+    std::shared_ptr<const void> borrowed_payload_owner;
     base::InlineSplitVector<MessageRecordView, kMessageRecordViewRangeInlineCapacity> records;
 
     auto clear() -> void {
         owned_storage.clear();
         payload_storage.clear();
+        borrowed_payload_owner.reset();
         records.clear();
     }
 

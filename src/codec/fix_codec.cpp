@@ -14,6 +14,8 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace fastfix::codec {
 
@@ -1112,10 +1114,6 @@ auto AppendTrackedGenericGroup(
     AccumulateAppendedRange(out, start_offset, checksum);
 }
 
-auto HasGroupCountTag(const std::vector<message::GroupData>& groups, std::uint32_t tag) -> bool {
-    return std::any_of(groups.begin(), groups.end(), [&](const auto& group) { return group.count_tag == tag; });
-}
-
 auto HasGroupCountTag(message::MessageView view, std::uint32_t tag) -> bool {
     for (std::size_t index = 0; index < view.group_count(); ++index) {
         const auto group = view.group_at(index);
@@ -1126,16 +1124,81 @@ auto HasGroupCountTag(message::MessageView view, std::uint32_t tag) -> bool {
     return false;
 }
 
+struct OwnedEncodeIndex {
+    explicit OwnedEncodeIndex(
+        const message::MessageData& data,
+        std::span<const profile::FieldRuleRecord> rules = {}) {
+        group_count_tags.reserve(data.groups.size());
+        groups.reserve(data.groups.size());
+        for (const auto& group : data.groups) {
+            group_count_tags.insert(group.count_tag);
+            groups.emplace(group.count_tag, &group);
+        }
+
+        fields.reserve(data.fields.size());
+        for (const auto& field : data.fields) {
+            fields.emplace(field.tag, &field);
+        }
+
+        rule_tags.reserve(rules.size());
+        for (const auto& rule : rules) {
+            rule_tags.insert(rule.tag);
+        }
+    }
+
+    std::unordered_set<std::uint32_t> group_count_tags;
+    std::unordered_map<std::uint32_t, const message::GroupData*> groups;
+    std::unordered_map<std::uint32_t, const message::FieldValue*> fields;
+    std::unordered_set<std::uint32_t> rule_tags;
+};
+
+struct ViewEncodeIndex {
+    explicit ViewEncodeIndex(
+        message::MessageView view,
+        std::span<const profile::FieldRuleRecord> rules = {}) {
+        groups.reserve(view.group_count());
+        group_count_tags.reserve(view.group_count());
+        for (std::size_t index = 0; index < view.group_count(); ++index) {
+            const auto group = view.group_at(index);
+            if (!group.has_value()) {
+                continue;
+            }
+            group_count_tags.insert(group->count_tag());
+            groups.emplace(group->count_tag(), *group);
+        }
+
+        fields.reserve(view.field_count());
+        for (std::size_t index = 0; index < view.field_count(); ++index) {
+            const auto field = view.field_at(index);
+            if (!field.has_value()) {
+                continue;
+            }
+            fields.emplace(field->tag, *field);
+        }
+
+        rule_tags.reserve(rules.size());
+        for (const auto& rule : rules) {
+            rule_tags.insert(rule.tag);
+        }
+    }
+
+    std::unordered_set<std::uint32_t> group_count_tags;
+    std::unordered_map<std::uint32_t, message::GroupView> groups;
+    std::unordered_map<std::uint32_t, message::FieldView> fields;
+    std::unordered_set<std::uint32_t> rule_tags;
+};
+
 auto EncodeMessageBody(
     std::string& out,
     const message::MessageData& data,
     char delimiter,
     bool skip_standard_header) -> void {
+    const OwnedEncodeIndex encode_index(data);
     for (const auto& field : data.fields) {
         if (ShouldSkipField(field.tag)) {
             continue;
         }
-        if (HasGroupCountTag(data.groups, field.tag)) {
+        if (encode_index.group_count_tags.contains(field.tag)) {
             continue;
         }
         if (skip_standard_header && IsTemplateManagedHeaderField(field.tag)) {
@@ -1159,6 +1222,8 @@ auto EncodeMessageBody(
     std::span<const profile::FieldRuleRecord> rules,
     char delimiter,
     bool skip_standard_header) -> void {
+    const OwnedEncodeIndex encode_index(data, rules);
+
     // Emit fields and groups in dictionary rule order.
     for (const auto& rule : rules) {
         const auto tag = rule.tag;
@@ -1170,18 +1235,16 @@ auto EncodeMessageBody(
         }
 
         // Check if this tag is a group count field.
-        const auto group_it = std::find_if(data.groups.begin(), data.groups.end(),
-            [&](const auto& g) { return g.count_tag == tag; });
-        if (group_it != data.groups.end()) {
-            EncodeGroupData(out, *group_it, dictionary, delimiter);
+        const auto group_it = encode_index.groups.find(tag);
+        if (group_it != encode_index.groups.end()) {
+            EncodeGroupData(out, *group_it->second, dictionary, delimiter);
             continue;
         }
 
         // Otherwise look for a scalar field.
-        const auto field_it = std::find_if(data.fields.begin(), data.fields.end(),
-            [&](const auto& f) { return f.tag == tag; });
-        if (field_it != data.fields.end()) {
-            EncodeFieldValue(out, *field_it, delimiter);
+        const auto field_it = encode_index.fields.find(tag);
+        if (field_it != encode_index.fields.end()) {
+            EncodeFieldValue(out, *field_it->second, delimiter);
         }
     }
 
@@ -1190,16 +1253,14 @@ auto EncodeMessageBody(
         if (ShouldSkipField(field.tag)) {
             continue;
         }
-        if (HasGroupCountTag(data.groups, field.tag)) {
+        if (encode_index.group_count_tags.contains(field.tag)) {
             continue;
         }
         if (skip_standard_header && IsTemplateManagedHeaderField(field.tag)) {
             continue;
         }
         // Skip if already emitted by the rules pass.
-        bool in_rules = std::any_of(rules.begin(), rules.end(),
-            [&](const auto& r) { return r.tag == field.tag; });
-        if (in_rules) {
+        if (encode_index.rule_tags.contains(field.tag)) {
             continue;
         }
         EncodeFieldValue(out, field, delimiter);
@@ -1207,9 +1268,7 @@ auto EncodeMessageBody(
 
     // Sweep extra groups not covered by dictionary rules.
     for (const auto& group : data.groups) {
-        bool in_rules = std::any_of(rules.begin(), rules.end(),
-            [&](const auto& r) { return r.tag == group.count_tag; });
-        if (in_rules) {
+        if (encode_index.rule_tags.contains(group.count_tag)) {
             continue;
         }
         EncodeGroupData(out, group, dictionary, delimiter);
@@ -1221,6 +1280,7 @@ auto EncodeMessageBody(
     message::MessageView view,
     char delimiter,
     bool skip_standard_header) -> void {
+    const ViewEncodeIndex encode_index(view);
     for (std::size_t index = 0; index < view.field_count(); ++index) {
         const auto field = view.field_at(index);
         if (!field.has_value()) {
@@ -1229,7 +1289,7 @@ auto EncodeMessageBody(
         if (ShouldSkipField(field->tag)) {
             continue;
         }
-        if (HasGroupCountTag(view, field->tag)) {
+        if (encode_index.group_count_tags.contains(field->tag)) {
             continue;
         }
         if (skip_standard_header && IsTemplateManagedHeaderField(field->tag)) {
@@ -1278,6 +1338,8 @@ auto EncodeMessageBody(
     std::span<const profile::FieldRuleRecord> rules,
     char delimiter,
     bool skip_standard_header) -> void {
+    const ViewEncodeIndex encode_index(view, rules);
+
     // Emit fields and groups in dictionary rule order.
     for (const auto& rule : rules) {
         const auto tag = rule.tag;
@@ -1289,19 +1351,19 @@ auto EncodeMessageBody(
         }
 
         // Check if this tag is a group.
-        const auto group = view.group(tag);
-        if (group.has_value()) {
-            EncodeGroupData(out, *group, dictionary, delimiter);
+        const auto group_it = encode_index.groups.find(tag);
+        if (group_it != encode_index.groups.end()) {
+            EncodeGroupData(out, group_it->second, dictionary, delimiter);
             continue;
         }
 
         // Otherwise look for a scalar field.
-        if (HasGroupCountTag(view, tag)) {
+        if (encode_index.group_count_tags.contains(tag)) {
             continue;
         }
-        const auto field = view.find_field_view(tag);
-        if (field.has_value()) {
-            EncodeFieldValue(out, *field, delimiter);
+        const auto field_it = encode_index.fields.find(tag);
+        if (field_it != encode_index.fields.end()) {
+            EncodeFieldValue(out, field_it->second, delimiter);
         }
     }
 
@@ -1314,15 +1376,13 @@ auto EncodeMessageBody(
         if (ShouldSkipField(field->tag)) {
             continue;
         }
-        if (HasGroupCountTag(view, field->tag)) {
+        if (encode_index.group_count_tags.contains(field->tag)) {
             continue;
         }
         if (skip_standard_header && IsTemplateManagedHeaderField(field->tag)) {
             continue;
         }
-        bool in_rules = std::any_of(rules.begin(), rules.end(),
-            [&](const auto& r) { return r.tag == field->tag; });
-        if (in_rules) {
+        if (encode_index.rule_tags.contains(field->tag)) {
             continue;
         }
         EncodeFieldValue(out, *field, delimiter);
@@ -1334,9 +1394,7 @@ auto EncodeMessageBody(
         if (!group.has_value()) {
             continue;
         }
-        bool in_rules = std::any_of(rules.begin(), rules.end(),
-            [&](const auto& r) { return r.tag == group->count_tag(); });
-        if (in_rules) {
+        if (encode_index.rule_tags.contains(group->count_tag())) {
             continue;
         }
         EncodeGroupData(out, *group, dictionary, delimiter);
@@ -2866,6 +2924,10 @@ auto PeekSessionHeaderView(
             break;
         }
 
+        if (!IsAggregateSessionEnvelopeTag(tag.value())) {
+            break;
+        }
+
         switch (tag.value()) {
             case kMsgType:
                 header.msg_type = value;
@@ -2928,7 +2990,7 @@ auto PeekSessionHeaderView(
         field_start = index + 1U;
     }
 
-    if (field_start != bytes.size()) {
+    if (bytes.empty() || bytes.back() != delimiter_byte) {
         return base::Status::FormatError("FIX frame is missing its final delimiter");
     }
     if (field_count == 0U) {
@@ -2938,7 +3000,39 @@ auto PeekSessionHeaderView(
         return base::Status::FormatError("FIX frame is too short");
     }
     if (!saw_checksum) {
-        return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
+        std::size_t checksum_start = bytes.size() - 1U;
+        while (checksum_start > 0U && bytes[checksum_start - 1U] != delimiter_byte) {
+            --checksum_start;
+        }
+        if (checksum_start == 0U) {
+            return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
+        }
+
+        const auto checksum_length = bytes.size() - checksum_start - 1U;
+        const auto* checksum_bytes = reinterpret_cast<const char*>(bytes.data() + checksum_start);
+        const auto* checksum_equals_ptr = FindByte(bytes.data() + checksum_start, checksum_length, equals_byte);
+        const auto checksum_equals = static_cast<std::size_t>(checksum_equals_ptr - (bytes.data() + checksum_start));
+        if (checksum_equals >= checksum_length || checksum_equals == 0U || checksum_equals == checksum_length - 1U) {
+            return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
+        }
+
+        auto checksum_tag = ParseUnsigned(std::string_view(checksum_bytes, checksum_equals), "field tag");
+        if (!checksum_tag.ok()) {
+            return checksum_tag.status();
+        }
+        if (checksum_tag.value() != kCheckSum) {
+            return base::Status::FormatError("FIX frame must begin with 8 and 9 and end with 10");
+        }
+
+        auto expected_checksum = ParseUnsigned(
+            std::string_view(checksum_bytes + checksum_equals + 1U, checksum_length - checksum_equals - 1U),
+            "CheckSum");
+        if (!expected_checksum.ok()) {
+            return expected_checksum.status();
+        }
+        header.checksum = expected_checksum.value();
+        checksum_field_start = checksum_start;
+        saw_checksum = true;
     }
 
     const auto actual_body_length = checksum_field_start - body_start_offset;

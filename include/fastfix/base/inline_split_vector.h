@@ -140,6 +140,7 @@ class InlineSplitVector {
 
     auto clear() -> void {
         if constexpr (!std::is_trivially_destructible_v<T>) {
+            // Assigning T{} drops resources held by the inline slots before we logically reset the vector.
             for (std::size_t i = 0; i < inline_size_; ++i) {
                 inline_storage_[i] = T{};
             }

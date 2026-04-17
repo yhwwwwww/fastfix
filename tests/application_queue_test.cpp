@@ -1,7 +1,11 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
+#include <thread>
+
 #include "fastfix/codec/fix_tags.h"
 #include "fastfix/runtime/application.h"
+#include "fastfix/runtime/live_runtime_support.h"
 
 #include "test_support.h"
 
@@ -112,6 +116,48 @@ class EncodedCommandSink final : public fastfix::session::SessionCommandSink {
     fastfix::session::SessionSendEnvelopeRef last_encoded_envelope_{};
     std::uint64_t plain_enqueued_{0};
     std::uint64_t encoded_enqueued_{0};
+};
+
+class SingleProducerCommandSink final : public fastfix::session::SessionCommandSink {
+  public:
+    auto EnqueueSend(std::uint64_t session_id, fastfix::message::MessageRef message) -> fastfix::base::Status override {
+        return EnqueueSendWithEnvelope(session_id, std::move(message), {});
+    }
+
+    auto EnqueueSendWithEnvelope(
+        std::uint64_t session_id,
+        fastfix::message::MessageRef message,
+        fastfix::session::SessionSendEnvelopeRef envelope) -> fastfix::base::Status override {
+        (void)session_id;
+        (void)message;
+        (void)envelope;
+        auto status = producer_guard_.Validate();
+        if (!status.ok()) {
+            return status;
+        }
+        enqueued_.fetch_add(1U, std::memory_order_relaxed);
+        return fastfix::base::Status::Ok();
+    }
+
+    auto LoadSnapshot(std::uint64_t session_id) const -> fastfix::base::Result<fastfix::session::SessionSnapshot> override {
+        (void)session_id;
+        return fastfix::base::Status::InvalidArgument("snapshot unsupported in test sink");
+    }
+
+    auto Subscribe(std::uint64_t session_id, std::size_t queue_capacity)
+        -> fastfix::base::Result<fastfix::session::SessionSubscription> override {
+        (void)session_id;
+        (void)queue_capacity;
+        return fastfix::base::Status::InvalidArgument("subscribe unsupported in test sink");
+    }
+
+    [[nodiscard]] auto enqueued() const -> std::uint64_t {
+        return enqueued_.load(std::memory_order_relaxed);
+    }
+
+  private:
+    fastfix::runtime::SingleProducerGuard producer_guard_{};
+    std::atomic<std::uint64_t> enqueued_{0U};
 };
 
 auto MakeEvent(
@@ -297,6 +343,28 @@ TEST_CASE("application-queue", "[application-queue]") {
         }, {.sender_sub_id = "DESK-2"});
         REQUIRE(borrowed.code() == fastfix::base::ErrorCode::kInvalidArgument);
         REQUIRE(sink->encoded_enqueued() == 1U);
+    }
+
+    SECTION("single-producer send fast-fail") {
+        auto sink = std::make_shared<SingleProducerCommandSink>();
+        fastfix::session::SessionHandle handle(4003U, 0U, sink);
+
+        fastfix::message::MessageBuilder builder("D");
+        builder.set_string(fastfix::codec::tags::kMsgType, "D");
+        builder.set_string(fastfix::codec::tags::kClOrdID, "ORD-SP");
+        const auto message = std::move(builder).build();
+
+        REQUIRE(handle.Send(message.view()).ok());
+        REQUIRE(handle.Send(message.view()).ok());
+
+        fastfix::base::Status cross_thread_status = fastfix::base::Status::Ok();
+        std::jthread other_thread([&]() {
+            cross_thread_status = handle.Send(message.view());
+        });
+        other_thread.join();
+
+        REQUIRE(cross_thread_status.code() == fastfix::base::ErrorCode::kInvalidArgument);
+        REQUIRE(sink->enqueued() == 2U);
     }
 
 }

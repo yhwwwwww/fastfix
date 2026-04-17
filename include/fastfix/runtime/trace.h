@@ -1,7 +1,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string_view>
 #include <vector>
@@ -32,15 +34,15 @@ struct TraceEvent {
 
 class TraceRecorder {
   public:
-    auto Configure(TraceMode mode, std::uint32_t capacity) -> void;
+    auto Configure(TraceMode mode, std::uint32_t capacity, std::uint32_t worker_count = 1U) -> void;
     auto Clear() -> void;
 
     [[nodiscard]] bool enabled() const {
-        return mode_ != TraceMode::kDisabled && !ring_.empty();
+        return mode_ != TraceMode::kDisabled && capacity_ != 0U && !buffers_.empty();
     }
 
     [[nodiscard]] std::uint32_t capacity() const {
-        return static_cast<std::uint32_t>(ring_.size());
+        return capacity_;
     }
 
     auto Record(
@@ -55,12 +57,19 @@ class TraceRecorder {
     [[nodiscard]] auto Snapshot() const -> std::vector<TraceEvent>;
 
   private:
-    mutable std::mutex mutex_;
+        struct TraceBuffer {
+                mutable std::mutex mutex;
+                std::vector<TraceEvent> ring;
+                std::size_t next_index{0U};
+                std::size_t size{0U};
+        };
+
+        [[nodiscard]] auto ResolveBufferIndex(std::uint32_t worker_id) const -> std::size_t;
+
     TraceMode mode_{TraceMode::kDisabled};
-    std::vector<TraceEvent> ring_;
-    std::uint64_t next_sequence_{1};
-    std::size_t next_index_{0};
-    std::size_t size_{0};
+        std::uint32_t capacity_{0U};
+        std::vector<std::unique_ptr<TraceBuffer>> buffers_;
+        std::atomic<std::uint64_t> next_sequence_{1U};
 };
 
 }  // namespace fastfix::runtime

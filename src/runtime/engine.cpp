@@ -126,7 +126,7 @@ auto Engine::Boot(const EngineConfig& config) -> base::Status {
     counterparties_.clear();
     runtime_.emplace(config.worker_count);
     metrics_.Reset(config.worker_count);
-    trace_.Configure(config.trace_mode, config.trace_capacity);
+    trace_.Configure(config.trace_mode, config.trace_capacity, config.worker_count);
     trace_.Record(
         TraceEventKind::kConfigLoaded,
         0U,

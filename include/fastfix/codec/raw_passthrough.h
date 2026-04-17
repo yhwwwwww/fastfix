@@ -30,6 +30,7 @@ struct RawPassThroughView {
     // Raw message body (unparsed application fields)
     // Points into the original receive buffer
     std::span<const std::byte> raw_body;
+    std::uint32_t body_start_offset{0};
 
     // Full raw message for reference
     std::span<const std::byte> raw_message;
@@ -83,6 +84,12 @@ struct ReplayOptions {
 
 auto DecodeRawPassThrough(
     std::span<const std::byte> data,
+    char delimiter = kFixSoh,
+    bool verify_checksum = true) -> base::Result<RawPassThroughView>;
+
+auto DecodeRawPassThrough(
+    std::span<const std::byte> data,
+    std::uint32_t body_start_offset,
     char delimiter = kFixSoh,
     bool verify_checksum = true) -> base::Result<RawPassThroughView>;
 

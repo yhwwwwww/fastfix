@@ -95,14 +95,15 @@ Initialize them with `git submodule update --init --recursive` before the first 
 
 ```
 include/fastfix/
-├── base/       Status, Result, SpscQueue, InlineSplitVector, TimerWheel
+├── base/       Status, Result, SpscQueue, InlineSplitVector
 ├── codec/      DecodeFixMessageView, EncodeFixMessage, SIMD scan, FrameEncodeTemplate
 ├── message/    Message, MessageView, MessageBuilder, TypedMessageView, FixedLayoutWriter, GroupView
-├── profile/    LoadedProfile, NormalizedDictionaryView, ProfileLoader, ProfileRegistry
+├── profile/    LoadedProfile, NormalizedDictionaryView, ProfileLoader
 ├── session/    SessionCore, AdminProtocol, ResendRecovery
-├── store/      MemorySessionStore, MmapSessionStore, DurableBatchStore
+├── store/      MemorySessionStore, MmapSessionStore, DurableBatchSessionStore
 ├── transport/  TcpConnection, TcpAcceptor
-└── runtime/    Engine, LiveInitiator, LiveAcceptor, ShardedRuntime, Metrics, Trace
+└── runtime/    Engine, LiveInitiator, LiveAcceptor, ShardedRuntime, ProfileRegistry,
+                TimerWheel, Metrics, Trace, ShardPoller
 ```
 
 Each module has a corresponding source directory under `src/` and tests under `tests/`.
@@ -146,6 +147,7 @@ $BIN_DIR/fastfix-tests --list-tags
 | `[edge]` | Edge cases (disconnect/reconnect) |
 | `[recovery]` / `[gap]` | Message recovery and gap fill |
 | `[lifecycle]` | Full session lifecycle |
+| `[admin-protocol]` | Admin message handling (Logon, Heartbeat, etc.) |
 | `[transport-fault]` | Network fault injection |
 | `[store-recovery]` | Store persistence and recovery |
 | `[socket-loopback]` | TCP loopback |
@@ -153,20 +155,37 @@ $BIN_DIR/fastfix-tests --list-tags
 | `[profile-loader]` | Artifact loading |
 | `[timer-wheel]` | Timer scheduling |
 | `[message-api]` | Message builder/view API |
+| `[fixed-layout]` | FixedLayout / FixedLayoutWriter |
+| `[generated-writer]` | Generated typed writer classes |
 | `[typed-message]` | Typed message accessors |
 | `[normalized-dictionary]` | FIX dictionary structures |
 | `[dictgen]` | Dictionary compilation |
 | `[overlay-merge]` | Profile overlay merging |
 | `[parser-surface]` | Input format parsing |
 | `[resend-recovery]` | Resend request handling |
+| `[gap-transition]` | Gap state transition edge cases |
 | `[metrics-trace]` | Metrics and trace collection |
 | `[runtime-config]` | Configuration parsing |
 | `[admin-fuzz-corpus]` | Admin protocol corpus |
 | `[application-queue]` | App message queueing |
 | `[application-poller]` | App polling |
 | `[live-runtime]` | End-to-end runtime |
+| `[live-backpressure]` | Backpressure handling |
+| `[live-session-factory]` | Dynamic session factory |
 | `[interop-harness]` | Interop scenarios |
 | `[live-initiator]` | Live initiator mode |
+| `[live-initiator-queue]` | Queue-decoupled initiator |
+| `[outbound-fragment]` | Outbound fragment encoding |
+| `[raw-passthrough]` | Raw pass-through mode |
+| `[precompiled-table]` | Precompiled template table |
+| `[xml2ffd]` | QuickFIX XML to FFD conversion |
+| `[wraparound]` | Sequence number wraparound |
+| `[soak-smoke]` | Basic soak test |
+| `[soak-long]` | Extended soak test |
+| `[soak-multihour]` | Multi-hour soak test |
+| `[soak-multiworker]` | Multi-worker soak test |
+| `[reset-seq]` | Sequence reset behavior |
+| `[timer-deadline]` | Timer deadline semantics |
 
 ### Test Utilities
 
@@ -385,6 +404,8 @@ All benchmark entrypoints intentionally consume the pinned QuickFIX 4.4 inputs, 
 | object → wire (fresh string) | — | `quickfix-encode` | QuickFIX-only serializer path that returns a fresh string |
 | wire → object | `parse` | `quickfix-parse` | full frame parse back into each engine's object/view model |
 | session inbound | `session-inbound` | `quickfix-session-inbound` | decode + session/admin rules + store interaction on an inbound app frame |
+| session outbound | `session-outbound` | — | `AdminProtocol::SendApplication(...)` — send path including session envelope, store, and encode |
+| session outbound (pre-encoded) | `session-outbound-pre-encoded` | — | `SendEncodedApplication(...)` — same path but business body already serialized |
 | replay | `replay` | `quickfix-replay` | ResendRequest handling across `replay_span=128` stored messages |
 | TCP round-trip | `loopback-roundtrip` | `quickfix-loopback` | full userspace-to-kernel-to-userspace message RTT |
 
@@ -534,10 +555,33 @@ engine.enable_metrics=true
 engine.trace_mode=ring
 engine.trace_capacity=8
 profile=path/to/profile.art
-dictionary=path/to/profile.ffd
-counterparty|name|session_id|profile_id|begin_string|sender|target|store_mode|durable_dir|validation|dispatch|heartbeat_sec|is_initiator
+listener|main|127.0.0.1|9921|0
+counterparty|fix44-demo|4201|1001|FIX.4.4|SELL|BUY|memory||memory|inline|30|false
 
-# Full counterparty record order used by current tools/tests:
+# FIXT.1.1 adds DefaultApplVerID as the optional 14th field:
+counterparty|fixt11-demo|5101|1001|FIXT.1.1|SELL|BUY|memory||memory|inline|30|false|9
+```
+
+Minimal counterparty record order (13 fields):
+
+```text
+counterparty|name|session_id|profile_id|begin_string|sender|target|store_mode|store_path|recovery_mode|dispatch_mode|heartbeat_sec|is_initiator
+```
+
+`profile=` may be repeated. `dictionary=` may also be repeated, and each `dictionary=` line accepts a comma-separated base-plus-overlay `.ffd` group that is loaded as one merged dictionary set.
+
+`dispatch_mode` is per-counterparty (`inline` or `queue`). `engine.queue_app_mode` is engine-wide (`co-scheduled` or `threaded`) and only affects counterparties that use queue dispatch. When every counterparty uses `inline`, `engine.queue_app_mode` has no effect.
+
+`SessionHandle::Snapshot()` / `Subscribe()` may be called from any thread. `SessionHandle::Send*()` / `SendEncoded*()` use a single-producer SPSC command queue per worker, so one producer thread must own a given handle's send path; a second producer thread will now get `kInvalidArgument`. `SendBorrowed*()` is narrower still: it is only valid inside inline runtime callbacks where the borrowed message/view lifetime is tied to the callback scope.
+
+Ready-to-run examples live in:
+
+- `tests/data/interop/loopback-runtime.ffcfg`
+- `tests/data/interop/runtime-multiversion.ffcfg`
+
+Full counterparty record order used by current tools/tests:
+
+```text
 counterparty|name|session_id|profile_id|begin_string|sender|target|store_mode|store_path|recovery_mode|dispatch_mode|heartbeat_sec|is_initiator|default_appl_ver_id|validation_mode|durable_flush_threshold|durable_rollover_mode|durable_archive_limit|reconnect_enabled|reconnect_initial_ms|reconnect_max_ms|reconnect_max_retries|durable_local_utc_offset_seconds|durable_use_system_timezone|day_cut_mode|day_cut_hour|day_cut_minute|day_cut_utc_offset|reset_seq_num_on_logon|reset_seq_num_on_logout|reset_seq_num_on_disconnect|refresh_on_logon|send_next_expected_msg_seq_num|use_local_time|non_stop_session|start_time|end_time|start_day|end_day|logon_time|logout_time|logon_day|logout_day
 ```
 

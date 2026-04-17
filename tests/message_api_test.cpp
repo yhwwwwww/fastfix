@@ -1,12 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <limits>
+#include <string>
+
 #include "fastfix/codec/fix_tags.h"
 #include "fastfix/codec/fix_codec.h"
 #include "fastfix/message/fixed_layout_writer.h"
 #include "fastfix/message/message.h"
-#include "fastfix/profile/artifact_builder.h"
-#include "fastfix/profile/dictgen_input.h"
-#include "fastfix/profile/profile_loader.h"
 #include "fix44_builders.h"
 
 #include "test_support.h"
@@ -62,6 +62,35 @@ TEST_CASE("message-api", "[message-api]") {
     REQUIRE((*group)[0].get_string(kPartyID).value() == "PTY1");
     REQUIRE((*group)[0].get_char(kPartyIDSource).value() == 'D');
     REQUIRE((*group)[0].get_int(kPartyRole).value() == 1);
+}
+
+TEST_CASE("group-entry-builder survives sibling growth", "[message-api]") {
+    fastfix::message::MessageBuilder builder("D");
+    builder.set_string(kMsgType, "D");
+
+    auto first_party = builder.add_group_entry(kNoPartyIDs);
+    first_party.reserve_fields(4);
+    first_party.set_string(kPartyID, "PTY-1").set_char(kPartyIDSource, 'D').set_int(kPartyRole, 1);
+
+    for (int index = 0; index < 32; ++index) {
+        auto party = builder.add_group_entry(kNoPartyIDs);
+        party.set_string(kPartyID, "EXTRA-" + std::to_string(index)).set_char(kPartyIDSource, 'D').set_int(kPartyRole, 2);
+    }
+
+    first_party.set_string(kPartyID, "PTY-1-UPDATED");
+    auto nested = first_party.add_group_entry(802U);
+    nested.set_string(523U, "SUB-1");
+
+    const auto message = std::move(builder).build();
+    const auto parties = message.view().group(kNoPartyIDs);
+    REQUIRE(parties.has_value());
+    REQUIRE(parties->size() == 33U);
+    REQUIRE((*parties)[0].get_string(kPartyID).value() == "PTY-1-UPDATED");
+
+    const auto nested_group = (*parties)[0].group(802U);
+    REQUIRE(nested_group.has_value());
+    REQUIRE(nested_group->size() == 1U);
+    REQUIRE((*nested_group)[0].get_string(523U).value() == "SUB-1");
 }
 
 TEST_CASE("fixed-layout-build", "[message-api][fixed-layout]") {
@@ -263,6 +292,33 @@ TEST_CASE("fixed-layout-writer-all-value-types", "[message-api][fixed-layout]") 
     CHECK(view.get_string(kAccount).value() == "ACC-1");
     REQUIRE(view.get_string(kClOrdID).has_value());
     CHECK(view.get_string(kClOrdID).value() == "ORD-001");
+}
+
+TEST_CASE("fixed-layout group builder skips non-finite floats", "[message-api][fixed-layout]") {
+    auto dictionary_view = fastfix::tests::LoadFix44DictionaryViewOrSkip();
+    auto dictionary = fastfix::base::Result<fastfix::profile::NormalizedDictionaryView>(std::move(dictionary_view));
+
+    auto layout = fastfix::message::FixedLayout::Build(dictionary.value(), "D");
+    REQUIRE(layout.ok());
+
+    fastfix::message::FixedLayoutWriter writer(layout.value());
+    writer.set_string(kSenderCompID, "BUY");
+    writer.set_string(kTargetCompID, "SELL");
+    auto party = writer.add_group_entry(kNoPartyIDs);
+    party.set_string(kPartyID, "PTY1").set_float(44U, std::numeric_limits<double>::infinity()).set_int(kPartyRole, 1);
+
+    fastfix::codec::EncodeOptions options;
+    options.begin_string = "FIX.4.4";
+    options.sender_comp_id = "BUY";
+    options.target_comp_id = "SELL";
+    options.msg_seq_num = 1U;
+    options.sending_time = "20260406-12:00:00.000";
+
+    fastfix::codec::EncodeBuffer buf;
+    REQUIRE(writer.encode_to_buffer(dictionary.value(), options, &buf).ok());
+
+    const auto wire = std::string(reinterpret_cast<const char*>(buf.bytes().data()), buf.bytes().size());
+    REQUIRE(wire.find("44=") == std::string::npos);
 }
 
 TEST_CASE("fixed-layout-writer-encode-roundtrip", "[message-api][fixed-layout]") {

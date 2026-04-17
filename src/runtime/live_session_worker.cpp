@@ -16,6 +16,7 @@
 #include "fastfix/store/durable_batch_store.h"
 #include "fastfix/store/memory_store.h"
 #include "fastfix/store/mmap_store.h"
+#include "fastfix/runtime/live_runtime_support.h"
 
 namespace fastfix::runtime {
 
@@ -60,37 +61,6 @@ auto MakeProtocolConfig(const CounterpartyConfig& counterparty) -> session::Admi
         .validation_policy = counterparty.validation_policy,
     };
 }
-
-thread_local const void* g_inline_borrow_send_sink = nullptr;
-
-class BorrowedSendScope {
-  public:
-    explicit BorrowedSendScope(const void* sink) : previous_(g_inline_borrow_send_sink) {
-        g_inline_borrow_send_sink = sink;
-    }
-    BorrowedSendScope(const BorrowedSendScope&) = delete;
-    auto operator=(const BorrowedSendScope&) -> BorrowedSendScope& = delete;
-    ~BorrowedSendScope() { g_inline_borrow_send_sink = previous_; }
-
-  private:
-    const void* previous_{nullptr};
-};
-
-class SubscriberStream final : public session::SessionSubscriptionStream {
-  public:
-    explicit SubscriberStream(std::size_t queue_capacity) : queue_(queue_capacity) {}
-
-    auto TryPop() -> base::Result<std::optional<session::SessionNotification>> override {
-        return queue_.TryPop();
-    }
-
-    auto TryPush(const session::SessionNotification& notification) -> bool {
-        return queue_.TryPush(notification);
-    }
-
-  private:
-    base::SpscQueue<session::SessionNotification> queue_;
-};
 
 }  // namespace
 
@@ -550,76 +520,26 @@ auto LiveSessionWorker::SendFramesBatch(
 
 auto LiveSessionWorker::LoadSessionSnapshot(std::uint64_t session_id) const
     -> base::Result<session::SessionSnapshot> {
-    std::lock_guard lock(control_mutex_);
-    const auto it = session_snapshots_.find(session_id);
-    if (it == session_snapshots_.end()) {
-        return base::Status::NotFound("session snapshot was not found");
-    }
-    return it->second;
+    return session_registry_.LoadSnapshot(session_id);
 }
 
 auto LiveSessionWorker::RegisterSessionSubscriber(std::uint64_t session_id,
                                                   std::size_t queue_capacity)
     -> base::Result<session::SessionSubscription> {
-    auto stream = std::make_shared<SubscriberStream>(queue_capacity);
-    std::lock_guard lock(control_mutex_);
-    if (!session_snapshots_.contains(session_id)) {
-        return base::Status::NotFound("session subscription target was not found");
-    }
-    session_subscribers_[session_id].push_back(stream);
-    return session::SessionSubscription(std::move(stream));
+    return session_registry_.RegisterSubscriber(session_id, queue_capacity);
 }
 
 auto LiveSessionWorker::HasSessionSubscribers(std::uint64_t session_id) -> bool {
-    std::lock_guard lock(control_mutex_);
-    const auto it = session_subscribers_.find(session_id);
-    if (it == session_subscribers_.end()) {
-        return false;
-    }
-    auto& weak_subscribers = it->second;
-    for (auto weak_it = weak_subscribers.begin(); weak_it != weak_subscribers.end();) {
-        if (weak_it->expired()) {
-            weak_it = weak_subscribers.erase(weak_it);
-            continue;
-        }
-        return true;
-    }
-    session_subscribers_.erase(it);
-    return false;
+    return session_registry_.HasSubscribers(session_id);
 }
 
 auto LiveSessionWorker::UpdateSessionSnapshot(const ActiveSession& session) -> void {
-    std::lock_guard lock(control_mutex_);
-    session_snapshots_[session.counterparty.session.session_id] =
-        session.protocol->session().Snapshot();
+    session_registry_.UpdateSnapshot(session.protocol->session().Snapshot());
 }
 
 auto LiveSessionWorker::PublishNotification(
     const session::SessionNotification& notification) -> void {
-    publish_scratch_.clear();
-    {
-        std::lock_guard lock(control_mutex_);
-        session_snapshots_[notification.snapshot.session_id] = notification.snapshot;
-        auto it = session_subscribers_.find(notification.snapshot.session_id);
-        if (it == session_subscribers_.end()) {
-            return;
-        }
-        auto& weak_subscribers = it->second;
-        for (auto weak_it = weak_subscribers.begin(); weak_it != weak_subscribers.end();) {
-            auto subscriber = weak_it->lock();
-            if (subscriber == nullptr) {
-                weak_it = weak_subscribers.erase(weak_it);
-                continue;
-            }
-            publish_scratch_.push_back(std::move(subscriber));
-            ++weak_it;
-        }
-    }
-    for (const auto& subscriber : publish_scratch_) {
-        auto* queue = static_cast<SubscriberStream*>(subscriber.get());
-        static_cast<void>(queue->TryPush(notification));
-    }
-    publish_scratch_.clear();
+    session_registry_.PublishNotification(notification);
 }
 
 auto LiveSessionWorker::PollManagedApplicationWorker(std::uint32_t worker_id) -> base::Status {
@@ -908,34 +828,23 @@ auto LiveSessionWorker::FindWorkerShard(std::uint32_t worker_id) const
 }
 
 auto LiveSessionWorker::SetTerminalStatus(base::Status status) -> void {
-    std::lock_guard lock(control_mutex_);
-    if (!terminal_status_.has_value()) {
-        terminal_status_ = std::move(status);
-        terminal_status_set_.store(true, std::memory_order_release);
-    }
+    session_registry_.SetTerminalStatus(std::move(status));
 }
 
 auto LiveSessionWorker::LoadTerminalStatus() const -> std::optional<base::Status> {
-    if (!terminal_status_set_.load(std::memory_order_acquire)) {
-        return std::nullopt;
-    }
-    std::lock_guard lock(control_mutex_);
-    return terminal_status_;
+    return session_registry_.LoadTerminalStatus();
 }
 
 auto LiveSessionWorker::HasActiveSession(std::uint64_t session_id) const -> bool {
-    std::lock_guard lock(control_mutex_);
-    return active_session_ids_.contains(session_id);
+    return session_registry_.HasActiveSession(session_id);
 }
 
 auto LiveSessionWorker::RegisterActiveSession(std::uint64_t session_id) -> bool {
-    std::lock_guard lock(control_mutex_);
-    return active_session_ids_.emplace(session_id).second;
+    return session_registry_.RegisterActiveSession(session_id);
 }
 
 auto LiveSessionWorker::UnregisterActiveSession(std::uint64_t session_id) -> void {
-    std::lock_guard lock(control_mutex_);
-    active_session_ids_.erase(session_id);
+    session_registry_.UnregisterActiveSession(session_id);
 }
 
 auto LiveSessionWorker::MakeStore(const CounterpartyConfig& counterparty) const

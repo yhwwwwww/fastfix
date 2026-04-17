@@ -1024,7 +1024,9 @@ auto AdminProtocol::ReplayOutbound(
         }
 
         // Lightweight header-only scan — skip checksum verification since we encoded these bytes.
-        auto parsed = codec::DecodeRawPassThrough(record->payload, codec::kFixSoh, false);
+        auto parsed = record->body_start_offset == 0U
+            ? codec::DecodeRawPassThrough(record->payload, codec::kFixSoh, false)
+            : codec::DecodeRawPassThrough(record->payload, record->body_start_offset, codec::kFixSoh, false);
         if (!parsed.ok()) {
             return parsed.status();
         }
@@ -1208,8 +1210,11 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
     const auto view = decoded.message.view();
     const auto msg_type = view.msg_type();
     const bool is_logon = msg_type == "A";
-    const bool inbound_gap_fill = msg_type == "4" && HasBoolean(view, kGapFillFlag);
+    const bool is_sequence_reset = msg_type == "4";
+    const bool inbound_gap_fill = is_sequence_reset && HasBoolean(view, kGapFillFlag);
     const bool inbound_logon_reset = is_logon && HasBoolean(view, kResetSeqNumFlag);
+    const bool acceptor_config_logon_reset =
+        is_logon && !config_.session.is_initiator && config_.reset_seq_num_on_logon && !inbound_logon_reset;
 
     std::uint32_t ref_tag_id = 0U;
     std::uint32_t reject_reason = 0U;
@@ -1244,7 +1249,7 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
     }
 
     auto snapshot_before = session_.Snapshot();
-    if (inbound_logon_reset) {
+    if (inbound_logon_reset || acceptor_config_logon_reset) {
         const auto next_out_seq = config_.session.is_initiator ? snapshot_before.next_out_seq : 1U;
         status = ResetSessionState(1U, next_out_seq, !config_.session.is_initiator);
         if (!status.ok()) {
@@ -1270,11 +1275,39 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
         if (!activity_status.ok()) {
             return activity_status;
         }
+
+        if (store_ != nullptr) {
+            std::uint16_t inbound_flags = 0U;
+            if (IsAdminMessage(decoded.header.msg_type)) {
+                inbound_flags |= MessageRecordFlagValue(store::MessageRecordFlags::kAdmin);
+            }
+            if (decoded.header.poss_dup) {
+                inbound_flags |= MessageRecordFlagValue(store::MessageRecordFlags::kPossDup);
+            }
+            const auto snapshot = session_.Snapshot();
+            return store_->SaveInboundViewAndRecoveryState(
+                store::MessageRecordView{
+                    .session_id = session_.session_id(),
+                    .seq_num = decoded.header.msg_seq_num,
+                    .timestamp_ns = timestamp_ns,
+                    .flags = inbound_flags,
+                    .payload = decoded.raw,
+                },
+                store::SessionRecoveryState{
+                    .session_id = snapshot.session_id,
+                    .next_in_seq = snapshot.next_in_seq,
+                    .next_out_seq = snapshot.next_out_seq,
+                    .last_inbound_ns = snapshot.last_inbound_ns,
+                    .last_outbound_ns = snapshot.last_outbound_ns,
+                    .active = snapshot.state != SessionState::kDisconnected,
+                });
+        }
+
         return PersistRecoveryState();
     };
 
     if (decoded.header.msg_seq_num < snapshot_before.next_in_seq) {
-        if (inbound_gap_fill) {
+        if (is_sequence_reset) {
             std::uint32_t new_seq_num = 0U;
             if (!ParseSequenceResetNewSeq(view, &new_seq_num, &reject_reason, &reject_text)) {
                 return RejectInbound(
@@ -1286,10 +1319,23 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
                     false);
             }
 
+            if (new_seq_num < snapshot_before.next_in_seq) {
+                return RejectInbound(
+                    decoded,
+                    kNewSeqNo,
+                    kSessionRejectValueIncorrect,
+                    "SequenceReset NewSeqNo must not move inbound sequence backwards",
+                    timestamp_ns,
+                    false);
+            }
+
             if (new_seq_num > snapshot_before.next_in_seq) {
                 status = session_.AdvanceInboundExpectedSeq(new_seq_num);
                 if (!status.ok()) {
                     return status;
+                }
+                if (session_.ConsumeResendCompleted()) {
+                    outstanding_test_request_id_.clear();
                 }
             }
 
@@ -1320,6 +1366,64 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
         }
         event.outbound_frames.push_back(std::move(logout).value());
         event.disconnect = true;
+        return event;
+    }
+
+    if (is_sequence_reset && !inbound_gap_fill) {
+        std::uint32_t new_seq_num = 0U;
+        if (!ParseSequenceResetNewSeq(view, &new_seq_num, &reject_reason, &reject_text)) {
+            return RejectInbound(
+                decoded,
+                kNewSeqNo,
+                reject_reason,
+                std::move(reject_text),
+                timestamp_ns,
+                false);
+        }
+
+        if (new_seq_num < snapshot_before.next_in_seq) {
+            return RejectInbound(
+                decoded,
+                kNewSeqNo,
+                kSessionRejectValueIncorrect,
+                "SequenceReset NewSeqNo must not move inbound sequence backwards",
+                timestamp_ns,
+                false);
+        }
+
+        if (new_seq_num > snapshot_before.next_in_seq) {
+            status = session_.AdvanceInboundExpectedSeq(new_seq_num);
+            if (!status.ok()) {
+                return status;
+            }
+            if (session_.ConsumeResendCompleted()) {
+                outstanding_test_request_id_.clear();
+            }
+        }
+
+        status = record_inbound_liveness();
+        if (!status.ok()) {
+            return status;
+        }
+
+        if (phase_violation_text.has_value()) {
+            return send_phase_violation_logout(*phase_violation_text);
+        }
+
+        ref_tag_id = 0U;
+        reject_reason = 0U;
+        reject_text.clear();
+        disconnect = false;
+        if (!ValidateAdministrativeMessage(decoded, &ref_tag_id, &reject_reason, &reject_text, &disconnect)) {
+            return RejectInbound(
+                decoded,
+                ref_tag_id,
+                reject_reason,
+                std::move(reject_text),
+                timestamp_ns,
+                disconnect);
+        }
+
         return event;
     }
 
@@ -1355,44 +1459,9 @@ auto AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uin
         return status;
     }
 
-    status = session_.RecordInboundActivity(timestamp_ns);
+    status = record_inbound_liveness();
     if (!status.ok()) {
         return status;
-    }
-
-    if (store_ != nullptr) {
-        std::uint16_t inbound_flags = 0U;
-        if (IsAdminMessage(decoded.header.msg_type)) {
-            inbound_flags |= MessageRecordFlagValue(store::MessageRecordFlags::kAdmin);
-        }
-        if (decoded.header.poss_dup) {
-            inbound_flags |= MessageRecordFlagValue(store::MessageRecordFlags::kPossDup);
-        }
-        const auto snapshot = session_.Snapshot();
-        status = store_->SaveInboundViewAndRecoveryState(
-            store::MessageRecordView{
-                .session_id = session_.session_id(),
-                .seq_num = decoded.header.msg_seq_num,
-                .timestamp_ns = timestamp_ns,
-                .flags = inbound_flags,
-                .payload = decoded.raw,
-            },
-            store::SessionRecoveryState{
-                .session_id = snapshot.session_id,
-                .next_in_seq = snapshot.next_in_seq,
-                .next_out_seq = snapshot.next_out_seq,
-                .last_inbound_ns = snapshot.last_inbound_ns,
-                .last_outbound_ns = snapshot.last_outbound_ns,
-                .active = snapshot.state != SessionState::kDisconnected,
-            });
-        if (!status.ok()) {
-            return status;
-        }
-    } else {
-        status = PersistRecoveryState();
-        if (!status.ok()) {
-            return status;
-        }
     }
 
     if (phase_violation_text.has_value()) {
@@ -1804,30 +1873,42 @@ auto AdminProtocol::BeginLogout(std::string text, std::uint64_t timestamp_ns) ->
 }
 
 auto AdminProtocol::DrainDeferredGapFrames(std::uint64_t timestamp_ns, ProtocolEvent* event) -> base::Status {
-    while (!deferred_gap_frames_.empty() && !session_.pending_resend().has_value()) {
-        // Move + pop before OnInbound so re-entrant queuing works correctly.
-        auto frame = std::move(deferred_gap_frames_.front());
-        deferred_gap_frames_.erase(deferred_gap_frames_.begin());
+    // Iterative drain: we process deferred frames one at a time instead of
+    // recursing through OnInbound(span, ...).  OnInbound(DecodedMessageView)
+    // may trigger further resends that re-queue into deferred_gap_frames_, but
+    // the loop guard (!session_.pending_resend()) prevents unbounded iteration:
+    // a new resend request stops the drain until the resend completes.
+    std::size_t index = 0;
+    while (index < deferred_gap_frames_.size() && !session_.pending_resend().has_value()) {
+        // Move the frame out; leave a moved-from entry that we skip on cleanup.
+        auto frame = std::move(deferred_gap_frames_[index]);
+        ++index;
 
-        // Decode to peek at the seq number.  If the gap fill / replay already
-        // advanced next_in_seq past this frame, skip it — it was accounted for
-        // by the counterparty's resend stream and would trip the stale-seq
-        // check if re-injected.
-        codec::DecodedMessageView peek;
+        codec::DecodedMessageView decoded;
         auto decode_status = codec::DecodeFixMessageView(
-            std::span<const std::byte>(frame), dictionary_, decode_table_, &peek);
+            std::span<const std::byte>(frame), dictionary_, decode_table_, &decoded);
         if (!decode_status.ok()) {
             continue;  // corrupt frame — discard silently
         }
-        if (peek.header.msg_seq_num < session_.Snapshot().next_in_seq) {
+        if (decoded.header.msg_seq_num < session_.Snapshot().next_in_seq) {
             continue;  // already consumed via the normal resend stream
         }
 
-        auto result = OnInbound(std::span<const std::byte>(frame), timestamp_ns);
+        auto result = OnInbound(decoded, timestamp_ns);
         if (!result.ok()) {
+            deferred_gap_frames_.erase(deferred_gap_frames_.begin(),
+                                       deferred_gap_frames_.begin() + static_cast<std::ptrdiff_t>(index));
             return result.status();
         }
         auto& inner = result.value();
+        if (inner.application_messages.size() == 1U) {
+            auto& message = inner.application_messages.front();
+            if (message.valid() && !message.owns_message()) {
+                inner.AdoptParsedApplicationMessage(std::move(decoded.message), std::move(frame));
+            }
+        } else {
+            inner.MaterializeApplicationMessages();
+        }
         for (auto& f : inner.outbound_frames) {
             event->outbound_frames.push_back(std::move(f));
         }
@@ -1838,6 +1919,11 @@ auto AdminProtocol::DrainDeferredGapFrames(std::uint64_t timestamp_ns, ProtocolE
             event->disconnect = true;
             break;
         }
+    }
+    // Bulk-erase all consumed entries in one O(n) pass.
+    if (index > 0) {
+        deferred_gap_frames_.erase(deferred_gap_frames_.begin(),
+                                   deferred_gap_frames_.begin() + static_cast<std::ptrdiff_t>(index));
     }
     return base::Status::Ok();
 }

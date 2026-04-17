@@ -2965,6 +2965,70 @@ TEST_CASE("TestRequest duplicate handling", "[admin-protocol]") {
 
 // ==================== SequenceReset Tests ====================
 
+TEST_CASE("Acceptor reset_seq_num_on_logon resets local state before Logon response", "[admin-protocol][reset-seq]") {
+    auto dictionary = fastfix::tests::LoadFix44DictionaryView();
+    if (!dictionary.ok()) {
+        SKIP("FIX44 artifact not available: " << dictionary.status().message());
+    }
+
+    fastfix::store::MemorySessionStore store;
+    REQUIRE(store.SaveRecoveryState(
+        fastfix::store::SessionRecoveryState{
+            .session_id = 7006U,
+            .next_in_seq = 11U,
+            .next_out_seq = 17U,
+            .last_inbound_ns = 0U,
+            .last_outbound_ns = 0U,
+            .active = false,
+        }).ok());
+
+    fastfix::session::AdminProtocol protocol(
+        fastfix::session::AdminProtocolConfig{
+            .session = fastfix::session::SessionConfig{
+                .session_id = 7006U,
+                .key = fastfix::session::SessionKey{"FIX.4.4", "SELL", "BUY"},
+                .profile_id = dictionary.value().profile().header().profile_id,
+                .heartbeat_interval_seconds = 30U,
+                .is_initiator = false,
+            },
+            .begin_string = "FIX.4.4",
+            .sender_comp_id = "SELL",
+            .target_comp_id = "BUY",
+            .heartbeat_interval_seconds = 30U,
+            .reset_seq_num_on_logon = true,
+        },
+        dictionary.value(),
+        &store);
+
+    REQUIRE(protocol.OnTransportConnected(1U).ok());
+
+    fastfix::message::MessageBuilder logon_builder("A");
+    logon_builder.set_string(kMsgType, "A").set_int(kEncryptMethod, 0).set_int(kHeartBtInt, 30);
+    auto inbound = EncodeInboundFrame(
+        std::move(logon_builder).build(),
+        dictionary.value(),
+        "FIX.4.4",
+        "BUY",
+        "SELL",
+        1U,
+        false);
+    REQUIRE(inbound.ok());
+
+    auto event = protocol.OnInbound(inbound.value(), 10U);
+    REQUIRE(event.ok());
+    REQUIRE(event.value().outbound_frames.size() == 1U);
+
+    auto decoded = fastfix::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
+    REQUIRE(decoded.ok());
+    REQUIRE(decoded.value().header.msg_type == "A");
+    REQUIRE(decoded.value().header.msg_seq_num == 1U);
+    REQUIRE(decoded.value().message.view().get_boolean(kResetSeqNumFlag).value());
+
+    const auto snapshot = protocol.session().Snapshot();
+    REQUIRE(snapshot.next_in_seq == 2U);
+    REQUIRE(snapshot.next_out_seq == 2U);
+}
+
 TEST_CASE("SequenceReset-Reset happy path", "[admin-protocol]") {
     auto dictionary = fastfix::tests::LoadFix44DictionaryView();
     if (!dictionary.ok()) {
@@ -3014,6 +3078,66 @@ TEST_CASE("SequenceReset-Reset happy path", "[admin-protocol]") {
     const auto after = protocol.session().Snapshot();
     REQUIRE(after.next_in_seq == 10U);
     REQUIRE(after.state == fastfix::session::SessionState::kActive);
+}
+
+TEST_CASE("SequenceReset-Reset accepts stale reset frames", "[admin-protocol][reset-seq]") {
+    auto dictionary = fastfix::tests::LoadFix44DictionaryView();
+    if (!dictionary.ok()) {
+        SKIP("FIX44 artifact not available: " << dictionary.status().message());
+    }
+
+    fastfix::store::MemorySessionStore store;
+    fastfix::session::AdminProtocol protocol(
+        fastfix::session::AdminProtocolConfig{
+            .session = fastfix::session::SessionConfig{
+                .session_id = 7017U,
+                .key = fastfix::session::SessionKey{"FIX.4.4", "SELL", "BUY"},
+                .profile_id = dictionary.value().profile().header().profile_id,
+                .heartbeat_interval_seconds = 30U,
+                .is_initiator = false,
+            },
+            .begin_string = "FIX.4.4",
+            .sender_comp_id = "SELL",
+            .target_comp_id = "BUY",
+            .heartbeat_interval_seconds = 30U,
+        },
+        dictionary.value(),
+        &store);
+
+    REQUIRE(protocol.OnTransportConnected(1U).ok());
+    REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
+
+    fastfix::message::MessageBuilder gap_fill_builder("4");
+    gap_fill_builder.set_string(kMsgType, "4").set_boolean(kGapFillFlag, true).set_int(kNewSeqNo, 5);
+    auto gap_fill = EncodeInboundFrame(
+        std::move(gap_fill_builder).build(),
+        dictionary.value(),
+        "FIX.4.4",
+        "BUY",
+        "SELL",
+        2U,
+        false);
+    REQUIRE(gap_fill.ok());
+    REQUIRE(protocol.OnInbound(gap_fill.value(), 10U).ok());
+    REQUIRE(protocol.session().Snapshot().next_in_seq == 5U);
+
+    fastfix::message::MessageBuilder reset_builder("4");
+    reset_builder.set_string(kMsgType, "4").set_int(kNewSeqNo, 8);
+    auto stale_reset = EncodeInboundFrame(
+        std::move(reset_builder).build(),
+        dictionary.value(),
+        "FIX.4.4",
+        "BUY",
+        "SELL",
+        3U,
+        false);
+    REQUIRE(stale_reset.ok());
+
+    auto event = protocol.OnInbound(stale_reset.value(), 20U);
+    REQUIRE(event.ok());
+    REQUIRE(event.value().outbound_frames.empty());
+    REQUIRE(!event.value().disconnect);
+    REQUIRE(protocol.session().Snapshot().next_in_seq == 8U);
 }
 
 TEST_CASE("SequenceReset backward rejected", "[admin-protocol]") {

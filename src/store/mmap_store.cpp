@@ -3,7 +3,9 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <limits>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <sys/mman.h>
@@ -16,7 +18,7 @@ namespace fastfix::store {
 namespace {
 
 constexpr std::size_t kStoreMagicBytes = 8U;
-constexpr std::size_t kStoreRecordReservedBytes = 7U;
+constexpr std::size_t kStoreRecordPaddingBytes = 3U;
 constexpr std::size_t kExpectedStoreFileHeaderSize = 32U;
 constexpr std::size_t kExpectedStoreRecordHeaderSize = 64U;
 constexpr std::array<char, kStoreMagicBytes> kStoreMagic = {'F', 'F', 'S', 'T', 'O', 'R', 'E', '1'};
@@ -52,7 +54,8 @@ struct StoreRecordHeader {
     std::uint64_t last_inbound_ns;
     std::uint64_t last_outbound_ns;
     std::uint8_t active;
-    std::uint8_t reserved[kStoreRecordReservedBytes];
+    std::uint8_t reserved[kStoreRecordPaddingBytes];
+    std::uint32_t body_start_offset;
 };
 #pragma pack(pop)
 
@@ -73,6 +76,9 @@ auto ValidateRecord(const MessageRecord& record) -> base::Status {
     if (record.seq_num == 0) {
         return base::Status::InvalidArgument("message record is missing seq_num");
     }
+    if (record.body_start_offset > record.payload.size()) {
+        return base::Status::InvalidArgument("message record body_start_offset exceeds payload size");
+    }
     return base::Status::Ok();
 }
 
@@ -86,6 +92,9 @@ auto ValidateRecordView(const MessageRecordView& record) -> base::Status {
     if (record.payload.size() > std::numeric_limits<std::uint32_t>::max()) {
         return base::Status::InvalidArgument("message payload exceeds mmap store limits");
     }
+    if (record.body_start_offset > record.payload.size()) {
+        return base::Status::InvalidArgument("message record body_start_offset exceeds payload size");
+    }
     return base::Status::Ok();
 }
 
@@ -93,40 +102,147 @@ auto HasStoreMagic(const StoreFileHeader& header) -> bool {
     return std::memcmp(header.magic, kStoreMagic.data(), kStoreMagic.size()) == 0;
 }
 
+struct MappingHandle {
+    std::byte* data{nullptr};
+    std::size_t size{0U};
+
+    ~MappingHandle() {
+        if (data != nullptr && size != 0U) {
+            ::munmap(data, size);
+        }
+    }
+};
+
+struct ScanState {
+    std::uint64_t committed_size{kStoreFileHeaderSize};
+    bool truncated_tail{false};
+    std::unordered_map<std::uint64_t, std::map<std::uint32_t, std::uint64_t>> outbound_offsets;
+    std::unordered_map<std::uint64_t, SessionRecoveryState> recovery_states;
+};
+
+auto BuildFileHeader(std::uint64_t file_size) -> StoreFileHeader {
+    StoreFileHeader header{};
+    std::memcpy(header.magic, kStoreMagic.data(), kStoreMagic.size());
+    header.version = kStoreVersion;
+    header.header_size = static_cast<std::uint32_t>(kStoreFileHeaderSize);
+    header.file_size = file_size;
+    return header;
+}
+
+auto WriteExact(int fd, const void* data, std::size_t size, std::uint64_t offset) -> bool {
+    const auto* bytes = static_cast<const std::byte*>(data);
+    std::size_t written = 0U;
+    while (written < size) {
+        const auto result = ::pwrite(fd, bytes + written, size - written, static_cast<off_t>(offset + written));
+        if (result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (result == 0) {
+            return false;
+        }
+        written += static_cast<std::size_t>(result);
+    }
+    return true;
+}
+
+auto MapFile(int fd, std::size_t size) -> base::Result<std::shared_ptr<MappingHandle>> {
+    auto mapping = std::shared_ptr<MappingHandle>(new MappingHandle{});
+    mapping->size = size;
+    mapping->data = static_cast<std::byte*>(::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+    if (mapping->data == MAP_FAILED) {
+        return base::Status::IoError(std::string("unable to mmap store file: ") + std::strerror(errno));
+    }
+    return mapping;
+}
+
+auto Header(const MappingHandle& mapping) -> const StoreFileHeader* {
+    return reinterpret_cast<const StoreFileHeader*>(mapping.data);
+}
+
+auto RecordAt(const MappingHandle& mapping, std::uint64_t offset) -> const StoreRecordHeader* {
+    return reinterpret_cast<const StoreRecordHeader*>(mapping.data + offset);
+}
+
+auto PayloadAt(const MappingHandle& mapping, std::uint64_t offset) -> const std::byte* {
+    return mapping.data + offset + kStoreRecordHeaderSize;
+}
+
+auto ScanMapping(const MappingHandle& mapping, std::uint64_t scan_end) -> ScanState {
+    ScanState state;
+    state.committed_size = kStoreFileHeaderSize;
+
+    std::uint64_t offset = kStoreFileHeaderSize;
+    while (offset < scan_end) {
+        if (offset + kStoreRecordHeaderSize > scan_end) {
+            state.truncated_tail = true;
+            break;
+        }
+
+        const auto* record = RecordAt(mapping, offset);
+        if (record->header_size != kStoreRecordHeaderSize) {
+            state.truncated_tail = true;
+            break;
+        }
+        if (record->body_start_offset > record->payload_size) {
+            state.truncated_tail = true;
+            break;
+        }
+
+        const auto record_end = offset + kStoreRecordHeaderSize + record->payload_size;
+        if (record_end > scan_end) {
+            state.truncated_tail = true;
+            break;
+        }
+
+        switch (static_cast<StoreRecordType>(record->record_type)) {
+            case StoreRecordType::kOutbound:
+                state.outbound_offsets[record->session_id][record->seq_num] = offset;
+                break;
+            case StoreRecordType::kRecoveryState:
+                state.recovery_states[record->session_id] = SessionRecoveryState{
+                    .session_id = record->session_id,
+                    .next_in_seq = record->next_in_seq,
+                    .next_out_seq = record->next_out_seq,
+                    .last_inbound_ns = record->last_inbound_ns,
+                    .last_outbound_ns = record->last_outbound_ns,
+                    .active = record->active != 0,
+                };
+                break;
+            case StoreRecordType::kInbound:
+                break;
+            default:
+                state.truncated_tail = true;
+                break;
+        }
+
+        if (state.truncated_tail) {
+            break;
+        }
+
+        offset = record_end;
+        state.committed_size = offset;
+    }
+
+    return state;
+}
+
 }  // namespace
 
 struct MmapSessionStore::Impl {
     int fd{-1};
-    std::byte* mapping{nullptr};
-    std::size_t mapping_size{0};
+    std::shared_ptr<MappingHandle> mapping;
     std::unordered_map<std::uint64_t, std::map<std::uint32_t, std::uint64_t>> outbound_offsets;
     std::unordered_map<std::uint64_t, SessionRecoveryState> recovery_states;
 
     ~Impl() {
-        if (mapping != nullptr && mapping_size != 0) {
-            ::munmap(mapping, mapping_size);
-        }
         if (fd >= 0) {
             ::close(fd);
         }
     }
 };
-
-namespace {
-
-auto Header(const MmapSessionStore::Impl& impl) -> const StoreFileHeader* {
-    return reinterpret_cast<const StoreFileHeader*>(impl.mapping);
-}
-
-auto RecordAt(const MmapSessionStore::Impl& impl, std::uint64_t offset) -> const StoreRecordHeader* {
-    return reinterpret_cast<const StoreRecordHeader*>(impl.mapping + offset);
-}
-
-auto PayloadAt(const MmapSessionStore::Impl& impl, std::uint64_t offset) -> const std::byte* {
-    return impl.mapping + offset + kStoreRecordHeaderSize;
-}
-
-}  // namespace
 
 MmapSessionStore::MmapSessionStore(
     std::filesystem::path path,
@@ -152,15 +268,11 @@ auto MmapSessionStore::Open() -> base::Status {
     }
 
     if (stat_buffer.st_size == 0) {
-        StoreFileHeader header{};
-        std::memcpy(header.magic, kStoreMagic.data(), kStoreMagic.size());
-        header.version = kStoreVersion;
-        header.header_size = static_cast<std::uint32_t>(kStoreFileHeaderSize);
-        header.file_size = kStoreFileHeaderSize;
+        const auto header = BuildFileHeader(kStoreFileHeaderSize);
         if (::ftruncate(impl_->fd, static_cast<off_t>(kStoreFileHeaderSize)) != 0) {
             return base::Status::IoError(IoErrorMessage(path_, "unable to size mmap store"));
         }
-        if (::pwrite(impl_->fd, &header, sizeof(header), 0) != static_cast<ssize_t>(sizeof(header))) {
+        if (!WriteExact(impl_->fd, &header, sizeof(header), 0U)) {
             return base::Status::IoError(IoErrorMessage(path_, "unable to initialize mmap store"));
         }
         if (sync_policy_ == SyncPolicy::kEveryWrite) {
@@ -170,73 +282,51 @@ auto MmapSessionStore::Open() -> base::Status {
         }
     }
 
-    if (impl_->mapping != nullptr && impl_->mapping_size != 0) {
-        ::munmap(impl_->mapping, impl_->mapping_size);
-        impl_->mapping = nullptr;
-        impl_->mapping_size = 0;
-    }
-
     if (::fstat(impl_->fd, &stat_buffer) != 0) {
         return base::Status::IoError(IoErrorMessage(path_, "unable to stat mmap store"));
     }
 
-    impl_->mapping_size = static_cast<std::size_t>(stat_buffer.st_size);
-    impl_->mapping = static_cast<std::byte*>(
-        ::mmap(nullptr, impl_->mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, impl_->fd, 0));
-    if (impl_->mapping == MAP_FAILED) {
-        impl_->mapping = nullptr;
-        impl_->mapping_size = 0;
-        return base::Status::IoError(IoErrorMessage(path_, "unable to mmap store file"));
+    auto mapping = MapFile(impl_->fd, static_cast<std::size_t>(stat_buffer.st_size));
+    if (!mapping.ok()) {
+        return mapping.status();
     }
 
-    const auto* header = Header(*impl_);
+    const auto* header = Header(*mapping.value());
     if (!HasStoreMagic(*header) || header->version != kStoreVersion ||
-        header->header_size != kStoreFileHeaderSize || header->file_size != impl_->mapping_size) {
+        header->header_size != kStoreFileHeaderSize || header->file_size < kStoreFileHeaderSize) {
         return base::Status::FormatError("mmap store has an invalid header");
     }
 
-    impl_->outbound_offsets.clear();
-    impl_->recovery_states.clear();
-
-    std::uint64_t offset = kStoreFileHeaderSize;
-    while (offset < header->file_size) {
-        if (offset + kStoreRecordHeaderSize > header->file_size) {
-            return base::Status::FormatError("mmap store contains a truncated record header");
-        }
-
-        const auto* record = RecordAt(*impl_, offset);
-        if (record->header_size != kStoreRecordHeaderSize) {
-            return base::Status::FormatError("mmap store contains a record with an unexpected header size");
-        }
-
-        const auto record_end = offset + kStoreRecordHeaderSize + record->payload_size;
-        if (record_end > header->file_size) {
-            return base::Status::FormatError("mmap store contains a truncated record payload");
-        }
-
-        switch (static_cast<StoreRecordType>(record->record_type)) {
-            case StoreRecordType::kOutbound:
-                impl_->outbound_offsets[record->session_id][record->seq_num] = offset;
-                break;
-            case StoreRecordType::kRecoveryState:
-                impl_->recovery_states[record->session_id] = SessionRecoveryState{
-                    .session_id = record->session_id,
-                    .next_in_seq = record->next_in_seq,
-                    .next_out_seq = record->next_out_seq,
-                    .last_inbound_ns = record->last_inbound_ns,
-                    .last_outbound_ns = record->last_outbound_ns,
-                    .active = record->active != 0,
-                };
-                break;
-            case StoreRecordType::kInbound:
-                break;
-            default:
-                return base::Status::FormatError("mmap store contains an unknown record type");
-        }
-
-        offset = record_end;
+    auto committed_size = std::min<std::uint64_t>(header->file_size, mapping.value()->size);
+    auto scan = ScanMapping(*mapping.value(), committed_size);
+    auto desired_size = std::max<std::uint64_t>(kStoreFileHeaderSize, scan.committed_size);
+    if (!scan.truncated_tail && header->file_size <= mapping.value()->size) {
+        desired_size = header->file_size;
     }
 
+    const bool needs_repair = scan.truncated_tail || header->file_size != desired_size || mapping.value()->size != desired_size;
+    if (needs_repair) {
+        mapping.value().reset();
+        if (::ftruncate(impl_->fd, static_cast<off_t>(desired_size)) != 0) {
+            return base::Status::IoError(IoErrorMessage(path_, "unable to repair mmap store size"));
+        }
+        const auto repaired_header = BuildFileHeader(desired_size);
+        if (!WriteExact(impl_->fd, &repaired_header, sizeof(repaired_header), 0U)) {
+            return base::Status::IoError(IoErrorMessage(path_, "unable to repair mmap store header"));
+        }
+        if (sync_policy_ == SyncPolicy::kEveryWrite && ::fdatasync(impl_->fd) != 0) {
+            return base::Status::IoError(IoErrorMessage(path_, "unable to fdatasync mmap store"));
+        }
+        mapping = MapFile(impl_->fd, static_cast<std::size_t>(desired_size));
+        if (!mapping.ok()) {
+            return mapping.status();
+        }
+        scan = ScanMapping(*mapping.value(), desired_size);
+    }
+
+    impl_->mapping = std::move(mapping).value();
+    impl_->outbound_offsets = std::move(scan.outbound_offsets);
+    impl_->recovery_states = std::move(scan.recovery_states);
     return base::Status::Ok();
 }
 
@@ -260,7 +350,7 @@ auto MmapSessionStore::AppendOutboundLikeView(std::uint32_t record_type, const M
         return status;
     }
 
-    const auto old_size = Header(*impl_)->file_size;
+    const auto old_size = Header(*impl_->mapping)->file_size;
     const auto record_size = kStoreRecordHeaderSize + record.payload.size();
     const auto new_size = old_size + record_size;
 
@@ -276,26 +366,25 @@ auto MmapSessionStore::AppendOutboundLikeView(std::uint32_t record_type, const M
     header.seq_num = record.seq_num;
     header.payload_size = static_cast<std::uint32_t>(record.payload.size());
     header.timestamp_ns = record.timestamp_ns;
-
-    if (::pwrite(impl_->fd, &header, sizeof(header), static_cast<off_t>(old_size)) !=
-        static_cast<ssize_t>(sizeof(header))) {
-        return base::Status::IoError(IoErrorMessage(path_, "unable to append mmap record header"));
-    }
+    header.body_start_offset = record.body_start_offset;
 
     if (!record.payload.empty()) {
-        if (::pwrite(
+        if (!WriteExact(
                 impl_->fd,
                 record.payload.data(),
                 static_cast<size_t>(record.payload.size()),
-                static_cast<off_t>(old_size + kStoreRecordHeaderSize)) !=
-            static_cast<ssize_t>(record.payload.size())) {
+                old_size + kStoreRecordHeaderSize)) {
             return base::Status::IoError(IoErrorMessage(path_, "unable to append mmap record payload"));
         }
     }
 
-    auto file_header = *Header(*impl_);
+    if (!WriteExact(impl_->fd, &header, sizeof(header), old_size)) {
+        return base::Status::IoError(IoErrorMessage(path_, "unable to append mmap record header"));
+    }
+
+    auto file_header = *Header(*impl_->mapping);
     file_header.file_size = new_size;
-    if (::pwrite(impl_->fd, &file_header, sizeof(file_header), 0) != static_cast<ssize_t>(sizeof(file_header))) {
+    if (!WriteExact(impl_->fd, &file_header, sizeof(file_header), 0U)) {
         return base::Status::IoError(IoErrorMessage(path_, "unable to update mmap store header"));
     }
 
@@ -305,7 +394,7 @@ auto MmapSessionStore::AppendOutboundLikeView(std::uint32_t record_type, const M
         }
     }
 
-    status = GrowMapping(new_size);
+    status = RemapFile(static_cast<std::size_t>(new_size));
     if (!status.ok()) {
         return status;
     }
@@ -327,7 +416,7 @@ auto MmapSessionStore::AppendRecoveryState(const SessionRecoveryState& state) ->
         return status;
     }
 
-    const auto old_size = Header(*impl_)->file_size;
+    const auto old_size = Header(*impl_->mapping)->file_size;
     const auto record_size = kStoreRecordHeaderSize;
     const auto new_size = old_size + record_size;
 
@@ -345,14 +434,13 @@ auto MmapSessionStore::AppendRecoveryState(const SessionRecoveryState& state) ->
     header.last_outbound_ns = state.last_outbound_ns;
     header.active = state.active ? kActiveRecoveryStateValue : 0U;
 
-    if (::pwrite(impl_->fd, &header, sizeof(header), static_cast<off_t>(old_size)) !=
-        static_cast<ssize_t>(sizeof(header))) {
+    if (!WriteExact(impl_->fd, &header, sizeof(header), old_size)) {
         return base::Status::IoError(IoErrorMessage(path_, "unable to append mmap recovery state"));
     }
 
-    auto file_header = *Header(*impl_);
+    auto file_header = *Header(*impl_->mapping);
     file_header.file_size = new_size;
-    if (::pwrite(impl_->fd, &file_header, sizeof(file_header), 0) != static_cast<ssize_t>(sizeof(file_header))) {
+    if (!WriteExact(impl_->fd, &file_header, sizeof(file_header), 0U)) {
         return base::Status::IoError(IoErrorMessage(path_, "unable to update mmap store header"));
     }
 
@@ -362,7 +450,7 @@ auto MmapSessionStore::AppendRecoveryState(const SessionRecoveryState& state) ->
         }
     }
 
-    status = GrowMapping(new_size);
+    status = RemapFile(static_cast<std::size_t>(new_size));
     if (!status.ok()) {
         return status;
     }
@@ -389,7 +477,7 @@ auto MmapSessionStore::SaveInboundView(const MessageRecordView& record) -> base:
 }
 
 auto MmapSessionStore::EnsureMapping() -> base::Status {
-    if (impl_->fd < 0 || impl_->mapping == nullptr) {
+    if (impl_->fd < 0 || !impl_->mapping) {
         return Open();
     }
 
@@ -399,8 +487,8 @@ auto MmapSessionStore::EnsureMapping() -> base::Status {
     }
 
     const auto file_size = static_cast<std::size_t>(stat_buffer.st_size);
-    if (file_size != impl_->mapping_size) {
-        return GrowMapping(file_size);
+    if (file_size != impl_->mapping->size) {
+        return Open();
     }
 
     return base::Status::Ok();
@@ -428,15 +516,16 @@ auto MmapSessionStore::LoadOutboundRange(
     for (auto it = session_it->second.lower_bound(begin_seq);
          it != session_it->second.end() && it->first <= end_seq;
          ++it) {
-        const auto* header = RecordAt(*impl_, it->second);
+        const auto* header = RecordAt(*impl_->mapping, it->second);
         MessageRecord record;
         record.session_id = header->session_id;
         record.seq_num = header->seq_num;
         record.timestamp_ns = header->timestamp_ns;
         record.flags = header->flags;
+        record.body_start_offset = header->body_start_offset;
         record.payload.resize(header->payload_size);
         if (header->payload_size != 0) {
-            std::memcpy(record.payload.data(), PayloadAt(*impl_, it->second), header->payload_size);
+            std::memcpy(record.payload.data(), PayloadAt(*impl_->mapping, it->second), header->payload_size);
         }
         records.push_back(std::move(record));
     }
@@ -463,18 +552,19 @@ auto MmapSessionStore::LoadOutboundRangeViews(
         return records;
     }
 
+    records.borrowed_payload_owner = impl_->mapping;
     records.records.reserve(static_cast<std::size_t>(end_seq - begin_seq + 1U));
     for (auto it = session_it->second.lower_bound(begin_seq);
          it != session_it->second.end() && it->first <= end_seq;
          ++it) {
-        const auto* header = RecordAt(*impl_, it->second);
+        const auto* header = RecordAt(*impl_->mapping, it->second);
         records.records.push_back(MessageRecordView{
             .session_id = header->session_id,
             .seq_num = header->seq_num,
             .timestamp_ns = header->timestamp_ns,
             .flags = header->flags,
-            .payload = std::span<const std::byte>(PayloadAt(*impl_, it->second), header->payload_size),
-            .body_start_offset = 0U,  // TODO: store body_start_offset in StoreRecordHeader when schema v2
+            .payload = std::span<const std::byte>(PayloadAt(*impl_->mapping, it->second), header->payload_size),
+            .body_start_offset = header->body_start_offset,
         });
     }
 
@@ -500,19 +590,27 @@ auto MmapSessionStore::LoadRecoveryState(std::uint64_t session_id) const
     return it->second;
 }
 
-auto MmapSessionStore::GrowMapping(std::size_t new_size) -> base::Status {
-    if (impl_->mapping == nullptr || impl_->mapping_size == 0) {
+auto MmapSessionStore::RemapFile(std::size_t new_size) -> base::Status {
+    if (!impl_->mapping) {
         return Open();
     }
 
-    void* new_addr = ::mremap(impl_->mapping, impl_->mapping_size, new_size, MREMAP_MAYMOVE);
-    if (new_addr == MAP_FAILED) {
-        return base::Status::IoError(IoErrorMessage(path_, "unable to mremap store file"));
+    auto mapping = MapFile(impl_->fd, new_size);
+    if (!mapping.ok()) {
+        return mapping.status();
     }
-
-    impl_->mapping = static_cast<std::byte*>(new_addr);
-    impl_->mapping_size = new_size;
+    impl_->mapping = std::move(mapping).value();
     return base::Status::Ok();
+}
+
+auto MmapSessionStore::CloseResources() -> void {
+    impl_->mapping.reset();
+    if (impl_->fd >= 0) {
+        ::close(impl_->fd);
+        impl_->fd = -1;
+    }
+    impl_->outbound_offsets.clear();
+    impl_->recovery_states.clear();
 }
 
 auto MmapSessionStore::Flush() -> base::Status {
@@ -526,31 +624,18 @@ auto MmapSessionStore::Flush() -> base::Status {
 }
 
 auto MmapSessionStore::Refresh() -> base::Status {
-    if (impl_->mapping != nullptr && impl_->mapping_size != 0U) {
-        ::munmap(impl_->mapping, impl_->mapping_size);
-        impl_->mapping = nullptr;
-        impl_->mapping_size = 0U;
-    }
-    if (impl_->fd >= 0) {
-        ::close(impl_->fd);
-        impl_->fd = -1;
-    }
-    impl_->outbound_offsets.clear();
-    impl_->recovery_states.clear();
+    CloseResources();
     return Open();
 }
 
 auto MmapSessionStore::ResetSession(std::uint64_t session_id) -> base::Status {
-    (void)session_id;
-
-    if (impl_->mapping != nullptr && impl_->mapping_size != 0U) {
-        ::munmap(impl_->mapping, impl_->mapping_size);
-        impl_->mapping = nullptr;
-        impl_->mapping_size = 0U;
+    if (session_id == 0U) {
+        return base::Status::InvalidArgument("session reset requires a valid session id");
     }
-    if (impl_->fd >= 0) {
-        ::close(impl_->fd);
-        impl_->fd = -1;
+
+    auto status = Open();
+    if (!status.ok()) {
+        return status;
     }
 
     if (path_.has_parent_path()) {
@@ -563,14 +648,86 @@ auto MmapSessionStore::ResetSession(std::uint64_t session_id) -> base::Status {
         }
     }
 
-    const int fd = ::open(path_.c_str(), O_RDWR | O_CREAT | O_TRUNC, kDefaultStoreFilePermissions);
-    if (fd < 0) {
-        return base::Status::IoError(IoErrorMessage(path_, "unable to reset mmap store"));
+    std::filesystem::path rebuilt_path = path_;
+    rebuilt_path += ".reset.tmp";
+    std::error_code remove_error;
+    std::filesystem::remove(rebuilt_path, remove_error);
+    if (remove_error) {
+        return base::Status::IoError(
+            "unable to prepare temporary mmap store '" + rebuilt_path.string() + "': " + remove_error.message());
     }
-    ::close(fd);
 
-    impl_->outbound_offsets.clear();
-    impl_->recovery_states.clear();
+    MmapSessionStore rebuilt(rebuilt_path, sync_policy_);
+    status = rebuilt.Open();
+    if (!status.ok()) {
+        return status;
+    }
+
+    const auto mapping = impl_->mapping;
+    const auto scan = ScanMapping(*mapping, Header(*mapping)->file_size);
+    std::uint64_t offset = kStoreFileHeaderSize;
+    while (offset < scan.committed_size) {
+        const auto* record = RecordAt(*mapping, offset);
+        const auto record_end = offset + kStoreRecordHeaderSize + record->payload_size;
+        if (record->session_id != session_id) {
+            switch (static_cast<StoreRecordType>(record->record_type)) {
+                case StoreRecordType::kOutbound: {
+                    status = rebuilt.SaveOutboundView(MessageRecordView{
+                        .session_id = record->session_id,
+                        .seq_num = record->seq_num,
+                        .timestamp_ns = record->timestamp_ns,
+                        .flags = record->flags,
+                        .payload = std::span<const std::byte>(PayloadAt(*mapping, offset), record->payload_size),
+                        .body_start_offset = record->body_start_offset,
+                    });
+                    break;
+                }
+                case StoreRecordType::kInbound: {
+                    status = rebuilt.SaveInboundView(MessageRecordView{
+                        .session_id = record->session_id,
+                        .seq_num = record->seq_num,
+                        .timestamp_ns = record->timestamp_ns,
+                        .flags = record->flags,
+                        .payload = std::span<const std::byte>(PayloadAt(*mapping, offset), record->payload_size),
+                        .body_start_offset = record->body_start_offset,
+                    });
+                    break;
+                }
+                case StoreRecordType::kRecoveryState:
+                    status = rebuilt.SaveRecoveryState(SessionRecoveryState{
+                        .session_id = record->session_id,
+                        .next_in_seq = record->next_in_seq,
+                        .next_out_seq = record->next_out_seq,
+                        .last_inbound_ns = record->last_inbound_ns,
+                        .last_outbound_ns = record->last_outbound_ns,
+                        .active = record->active != 0,
+                    });
+                    break;
+                default:
+                    status = base::Status::FormatError("mmap store contains an unknown record type");
+                    break;
+            }
+            if (!status.ok()) {
+                return status;
+            }
+        }
+        offset = record_end;
+    }
+
+    status = rebuilt.Flush();
+    if (!status.ok()) {
+        return status;
+    }
+
+    CloseResources();
+
+    std::error_code rename_error;
+    std::filesystem::rename(rebuilt_path, path_, rename_error);
+    if (rename_error) {
+        return base::Status::IoError(
+            "unable to replace mmap store '" + path_.string() + "': " + rename_error.message());
+    }
+
     return Open();
 }
 

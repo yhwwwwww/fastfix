@@ -12,7 +12,6 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "fastfix/base/result.h"
@@ -27,6 +26,7 @@
 #include "fastfix/session/admin_protocol.h"
 #include "fastfix/store/session_store.h"
 #include "fastfix/transport/tcp_transport.h"
+#include "fastfix/runtime/live_session_registry.h"
 
 namespace fastfix::runtime {
 
@@ -357,18 +357,10 @@ class LiveSessionWorker {
 
     Engine* engine_{nullptr};
     Options options_{};
+    LiveSessionRegistry session_registry_;
     std::vector<WorkerShardState> worker_shards_;
     std::vector<std::jthread> worker_threads_;
-    mutable std::mutex control_mutex_;
-    std::unordered_map<std::uint64_t, session::SessionSnapshot> session_snapshots_;
-    std::unordered_map<
-        std::uint64_t,
-        std::vector<std::weak_ptr<session::SessionSubscriptionStream>>> session_subscribers_;
-    std::unordered_set<std::uint64_t> active_session_ids_;
-    std::optional<base::Status> terminal_status_;
-    std::atomic<bool> terminal_status_set_{false};
     std::atomic<uint64_t> next_connection_id_{1};
-    std::vector<std::shared_ptr<session::SessionSubscriptionStream>> publish_scratch_;
     std::atomic<std::size_t> active_connection_count_{0};
     std::atomic<std::uint64_t> last_progress_ns_{0};
     std::atomic<std::size_t> completed_sessions_{0};

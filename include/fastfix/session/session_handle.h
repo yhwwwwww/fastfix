@@ -5,6 +5,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 #include "fastfix/base/result.h"
 #include "fastfix/base/status.h"
@@ -185,80 +187,62 @@ class SessionHandle {
         return command_sink_->Subscribe(session_id_, queue_capacity);
     }
 
-    auto Send(const message::Message& message, SessionSendEnvelopeView envelope = {}) const -> base::Status {
+  private:
+    template <typename T>
+    static constexpr bool AcceptsOwnedDecodedSend =
+        std::is_same_v<std::remove_cvref_t<T>, message::Message> ||
+        std::is_same_v<std::remove_cvref_t<T>, message::MessageView> ||
+        std::is_same_v<std::remove_cvref_t<T>, message::MessageRef>;
+
+    template <typename T>
+    static constexpr bool AcceptsBorrowedDecodedSend =
+        std::is_same_v<std::remove_cvref_t<T>, message::MessageView> ||
+        std::is_same_v<std::remove_cvref_t<T>, message::MessageRef>;
+
+    template <typename T>
+    static constexpr bool AcceptsOwnedEncodedSend =
+        std::is_same_v<std::remove_cvref_t<T>, EncodedApplicationMessage> ||
+        std::is_same_v<std::remove_cvref_t<T>, EncodedApplicationMessageView> ||
+        std::is_same_v<std::remove_cvref_t<T>, EncodedApplicationMessageRef>;
+
+    template <typename T>
+    static constexpr bool AcceptsBorrowedEncodedSend =
+        std::is_same_v<std::remove_cvref_t<T>, EncodedApplicationMessageView> ||
+        std::is_same_v<std::remove_cvref_t<T>, EncodedApplicationMessageRef>;
+
+  public:
+
+    // All send methods share a single-producer command path per session handle.
+    // Calls from different producer threads fast-fail with kInvalidArgument.
+    template <typename MessageLike>
+        requires(AcceptsOwnedDecodedSend<MessageLike>)
+    auto Send(MessageLike&& message, SessionSendEnvelopeView envelope = {}) const -> base::Status {
         return EnqueueOwnedMessage(
-            message::MessageRef(message::Message(message.data())),
+            ToOwnedMessageRef(std::forward<MessageLike>(message)),
             SessionSendEnvelopeRef::Own(envelope));
     }
 
-    auto Send(message::MessageView view, SessionSendEnvelopeView envelope = {}) const -> base::Status {
-        return EnqueueOwnedMessage(message::MessageRef::Own(view), SessionSendEnvelopeRef::Own(envelope));
+    // Borrowed send is only valid from runtime inline callback context.
+    template <typename MessageLike>
+        requires(AcceptsBorrowedDecodedSend<MessageLike>)
+    auto SendBorrowed(MessageLike&& message, SessionSendEnvelopeView envelope = {}) const -> base::Status {
+        auto borrowed = ToBorrowedMessageRef(std::forward<MessageLike>(message));
+        return EnqueueBorrowedMessage(borrowed, envelope);
     }
 
-    auto Send(const message::MessageRef& message, SessionSendEnvelopeView envelope = {}) const -> base::Status {
-        if (message.owns_message()) {
-            return EnqueueOwnedMessage(message, SessionSendEnvelopeRef::Own(envelope));
-        }
-        return EnqueueOwnedMessage(message::MessageRef::Own(message.view()), SessionSendEnvelopeRef::Own(envelope));
-    }
-
-    auto SendBorrowed(message::MessageView view, SessionSendEnvelopeView envelope = {}) const -> base::Status {
-        return SendBorrowed(message::MessageRef(view), envelope);
-    }
-
-    auto SendBorrowed(const message::MessageRef& message, SessionSendEnvelopeView envelope = {}) const -> base::Status {
-        return EnqueueBorrowedMessage(message, envelope);
-    }
-
-    auto Send(message::Message&& message, SessionSendEnvelopeView envelope = {}) const -> base::Status {
-        return EnqueueOwnedMessage(message::MessageRef(std::move(message)), SessionSendEnvelopeRef::Own(envelope));
-    }
-
-    auto SendEncoded(
-        const EncodedApplicationMessage& message,
-        SessionSendEnvelopeView envelope = {}) const -> base::Status {
+    template <typename EncodedLike>
+        requires(AcceptsOwnedEncodedSend<EncodedLike>)
+    auto SendEncoded(EncodedLike&& message, SessionSendEnvelopeView envelope = {}) const -> base::Status {
         return EnqueueOwnedEncodedMessage(
-            EncodedApplicationMessageRef(message),
+            ToOwnedEncodedMessageRef(std::forward<EncodedLike>(message)),
             SessionSendEnvelopeRef::Own(envelope));
     }
 
-    auto SendEncoded(
-        EncodedApplicationMessageView view,
-        SessionSendEnvelopeView envelope = {}) const -> base::Status {
-        return EnqueueOwnedEncodedMessage(
-            EncodedApplicationMessageRef::Own(view),
-            SessionSendEnvelopeRef::Own(envelope));
-    }
-
-    auto SendEncoded(
-        const EncodedApplicationMessageRef& message,
-        SessionSendEnvelopeView envelope = {}) const -> base::Status {
-        if (message.owns_message()) {
-            return EnqueueOwnedEncodedMessage(message, SessionSendEnvelopeRef::Own(envelope));
-        }
-        return EnqueueOwnedEncodedMessage(
-            EncodedApplicationMessageRef::Own(message.view()),
-            SessionSendEnvelopeRef::Own(envelope));
-    }
-
-    auto SendEncoded(
-        EncodedApplicationMessage&& message,
-        SessionSendEnvelopeView envelope = {}) const -> base::Status {
-        return EnqueueOwnedEncodedMessage(
-            EncodedApplicationMessageRef(std::move(message)),
-            SessionSendEnvelopeRef::Own(envelope));
-    }
-
-    auto SendEncodedBorrowed(
-        EncodedApplicationMessageView view,
-        SessionSendEnvelopeView envelope = {}) const -> base::Status {
-        return SendEncodedBorrowed(EncodedApplicationMessageRef(view), envelope);
-    }
-
-    auto SendEncodedBorrowed(
-        const EncodedApplicationMessageRef& message,
-        SessionSendEnvelopeView envelope = {}) const -> base::Status {
-        return EnqueueBorrowedEncodedMessage(message, envelope);
+    template <typename EncodedLike>
+        requires(AcceptsBorrowedEncodedSend<EncodedLike>)
+    auto SendEncodedBorrowed(EncodedLike&& message, SessionSendEnvelopeView envelope = {}) const -> base::Status {
+        auto borrowed = ToBorrowedEncodedMessageRef(std::forward<EncodedLike>(message));
+        return EnqueueBorrowedEncodedMessage(borrowed, envelope);
     }
 
   private:
@@ -278,6 +262,33 @@ class SessionHandle {
             return status;
         }
         return command_sink_->EnqueueSendWithEnvelope(session_id_, std::move(message), std::move(envelope));
+    }
+
+    static auto ToOwnedMessageRef(const message::Message& message) -> message::MessageRef {
+        return message::MessageRef(message::Message(message.data()));
+    }
+
+    static auto ToOwnedMessageRef(message::Message&& message) -> message::MessageRef {
+        return message::MessageRef(std::move(message));
+    }
+
+    static auto ToOwnedMessageRef(message::MessageView view) -> message::MessageRef {
+        return message::MessageRef::Own(view);
+    }
+
+    static auto ToOwnedMessageRef(const message::MessageRef& message) -> message::MessageRef {
+        if (message.owns_message()) {
+            return message;
+        }
+        return message::MessageRef::Own(message.view());
+    }
+
+    static auto ToBorrowedMessageRef(message::MessageView view) -> message::MessageRef {
+        return message::MessageRef(view);
+    }
+
+    static auto ToBorrowedMessageRef(const message::MessageRef& message) -> message::MessageRef {
+        return message;
     }
 
     auto EnqueueBorrowedMessage(const message::MessageRef& message, SessionSendEnvelopeView envelope) const -> base::Status {
@@ -306,6 +317,34 @@ class SessionHandle {
             return status;
         }
         return command_sink_->EnqueueSendEncodedWithEnvelope(session_id_, std::move(message), std::move(envelope));
+    }
+
+    static auto ToOwnedEncodedMessageRef(const EncodedApplicationMessage& message) -> EncodedApplicationMessageRef {
+        return EncodedApplicationMessageRef(message);
+    }
+
+    static auto ToOwnedEncodedMessageRef(EncodedApplicationMessage&& message) -> EncodedApplicationMessageRef {
+        return EncodedApplicationMessageRef(std::move(message));
+    }
+
+    static auto ToOwnedEncodedMessageRef(EncodedApplicationMessageView view) -> EncodedApplicationMessageRef {
+        return EncodedApplicationMessageRef::Own(view);
+    }
+
+    static auto ToOwnedEncodedMessageRef(const EncodedApplicationMessageRef& message) -> EncodedApplicationMessageRef {
+        if (message.owns_message()) {
+            return message;
+        }
+        return EncodedApplicationMessageRef::Own(message.view());
+    }
+
+    static auto ToBorrowedEncodedMessageRef(EncodedApplicationMessageView view) -> EncodedApplicationMessageRef {
+        return EncodedApplicationMessageRef(view);
+    }
+
+    static auto ToBorrowedEncodedMessageRef(const EncodedApplicationMessageRef& message)
+        -> EncodedApplicationMessageRef {
+        return message;
     }
 
     auto EnqueueBorrowedEncodedMessage(

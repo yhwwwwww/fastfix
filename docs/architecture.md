@@ -63,7 +63,8 @@ Foundation types used everywhere:
 | `Result<T>` | Either a value or a `Status` error |
 | `SpscQueue<T>` | Lock-free single-producer-single-consumer queue with fixed capacity |
 | `InlineSplitVector<T, N>` | Inline storage for ≤N elements, overflows to heap vector |
-| `TimerWheel` | Hierarchical timer scheduler for heartbeat/timeout management |
+
+> **Note:** `TimerWheel` lives in `include/fastfix/runtime/timer_wheel.h`, not `base/`. It is listed in the [Runtime section](#8-runtime-includefastfixruntime) below.
 
 `Status` error codes:
 
@@ -302,11 +303,12 @@ Wraps `SessionCore` and handles the full admin message set:
 
 ```cpp
 struct ProtocolEvent {
-    std::vector<ProtocolFrame> outbound_frames;    // Frames to send
-    std::vector<MessageRef> application_messages;   // App messages to dispatch
-    bool session_active;                            // Session became active?
-    bool disconnect;                                // Should close transport?
-    bool poss_resend;                               // PossResend(97) flag set?
+    ProtocolFrameCollection outbound_frames;        // Frames to send (inline-first collection)
+    ProtocolMessageList application_messages;        // App messages to dispatch
+    bool session_active;                             // Session became active?
+    bool disconnect;                                 // Should close transport?
+    bool poss_resend;                                // PossResend(97) flag set?
+    bool session_reject;                             // Session-level reject emitted?
 };
 ```
 
@@ -332,15 +334,16 @@ Persistence layer for message recovery and sequence state.
 
 ```
 SessionStore (interface)
-    ├── MemorySessionStore      RAM only, no persistence
-    ├── MmapSessionStore        mmap append-only file
-    └── DurableBatchStore       Batch-flush with rollover and archival
+    ├── MemorySessionStore          RAM only, no persistence
+    ├── MmapSessionStore            mmap append-only file
+    └── DurableBatchSessionStore    Batch-flush with rollover and archival
 ```
 
 **Interface:**
 
 ```cpp
 class SessionStore {
+    // Pure virtual (must implement)
     virtual auto SaveOutbound(const MessageRecord& record) -> Status = 0;
     virtual auto SaveInbound(const MessageRecord& record) -> Status = 0;
     virtual auto LoadOutboundRange(uint64_t session_id, uint32_t begin, uint32_t end)
@@ -348,10 +351,21 @@ class SessionStore {
     virtual auto SaveRecoveryState(const SessionRecoveryState& state) -> Status = 0;
     virtual auto LoadRecoveryState(uint64_t session_id)
         -> Result<SessionRecoveryState> = 0;
+    virtual auto ResetSession(uint64_t session_id) -> Status = 0;
+
+    // Optional overrides with default implementations
+    virtual auto SaveOutboundView(const MessageRecordView& record) -> Status;
+    virtual auto SaveInboundView(const MessageRecordView& record) -> Status;
+    virtual auto LoadOutboundRangeViews(...) -> Status;  // view-based range loading
+    virtual auto SaveInboundViewAndRecoveryState(...) -> Status;
+    virtual auto SaveOutboundViewAndRecoveryState(...) -> Status;
     virtual auto Flush() -> Status;
     virtual auto Rollover() -> Status;
+    virtual auto Refresh() -> Status;
 };
 ```
+
+The `*View` methods accept `MessageRecordView` (zero-copy `span<const byte>` payload) and default to copying into `MessageRecord` + calling the owning variant. Store backends can override them for zero-copy persistence.
 
 **DurableBatchStore internals:**
 
@@ -371,6 +385,7 @@ store_root/
 
 | Mode | Trigger |
 |------|---------|
+| `kDisabled` | No automatic rollover |
 | `kUtcDay` | Automatic at UTC midnight |
 | `kLocalTime` | Automatic at local midnight (configurable UTC offset) |
 | `kExternal` | Manual `Rollover()` call |
@@ -661,15 +676,20 @@ All threads are `std::jthread` — calling `Stop()` or destroying the runtime jo
 
 When the front-door accepts a connection, it routes the connection to a worker via an inbox (mutex-protected push, then pipe-based wakeup). Once the worker adopts the connection, the front-door never touches it again.
 
-Cross-thread session access goes through `SessionHandle`, which enqueues commands into a per-worker SPSC queue and wakes the target worker via its pipe fd:
+Cross-thread session access goes through `SessionHandle`. Query paths (`Snapshot()`, `Subscribe()`) are safe from any thread. Send paths (`Send*()` / `SendEncoded*()`) enqueue onto a per-worker SPSC queue and wake the target worker via its pipe fd. Each queue is single-producer: the first sending thread claims it, and later producer threads receive `kInvalidArgument` instead of silently violating the queue contract:
 
 ```cpp
-// From any thread — thread-safe:
-session_handle.Send(msg);                // SPSC push → wakeup
-session_handle.Snapshot();               // Query-only
-session_handle.Subscribe();              // Event subscription
+// Safe query paths from any thread:
+session_handle.Snapshot();
+session_handle.Subscribe();
 
-// NOT thread-safe:
+// Cross-thread send path:
+// one producer thread per SessionHandle send queue.
+session_handle.Send(msg);
+
+// Owning-worker / inline-callback only.
+// Outside inline callbacks this fast-fails.
+session_handle.SendBorrowed(view);
 message_view.get_string(11);             // Only within callback scope
 ```
 

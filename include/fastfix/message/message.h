@@ -251,14 +251,26 @@ class GroupEntryBuilder {
   private:
     friend class MessageBuilder;
 
-    explicit GroupEntryBuilder(MessageData* data)
-        : data_(data) {
+    struct PathSegment {
+      std::uint32_t count_tag{0};
+      std::size_t entry_index{0U};
+    };
+
+    explicit GroupEntryBuilder(MessageData* root)
+      : root_(root) {
     }
 
-    auto upsert_field(FieldValue value) -> GroupEntryBuilder&;
-    auto ensure_group(std::uint32_t count_tag) -> GroupData&;
+    GroupEntryBuilder(MessageData* root, std::vector<PathSegment> path)
+      : root_(root),
+        path_(std::move(path)) {
+    }
 
-    MessageData* data_{nullptr};
+    auto resolve() -> MessageData*;
+    auto upsert_field(FieldValue value) -> GroupEntryBuilder&;
+    auto ensure_group(std::uint32_t count_tag) -> GroupData*;
+
+    MessageData* root_{nullptr};
+    std::vector<PathSegment> path_;
 };
 
 class Message {

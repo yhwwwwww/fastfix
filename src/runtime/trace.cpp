@@ -2,28 +2,36 @@
 
 #include <algorithm>
 #include <cstring>
-#include <mutex>
 
 namespace fastfix::runtime {
 
-auto TraceRecorder::Configure(TraceMode mode, std::uint32_t capacity) -> void {
-    std::lock_guard lock(mutex_);
+auto TraceRecorder::Configure(TraceMode mode, std::uint32_t capacity, std::uint32_t worker_count) -> void {
     mode_ = mode;
-    ring_.clear();
-    if (mode == TraceMode::kRing && capacity != 0) {
-        ring_.resize(capacity);
+    capacity_ = capacity;
+    buffers_.clear();
+    if (mode == TraceMode::kRing && capacity != 0U) {
+        const auto buffer_count = std::max<std::uint32_t>(1U, worker_count);
+        buffers_.reserve(buffer_count);
+        for (std::uint32_t index = 0; index < buffer_count; ++index) {
+            auto buffer = std::make_unique<TraceBuffer>();
+            buffer->ring.resize(capacity);
+            buffers_.push_back(std::move(buffer));
+        }
     }
-    next_sequence_ = 1;
-    next_index_ = 0;
-    size_ = 0;
+    next_sequence_.store(1U, std::memory_order_relaxed);
 }
 
 auto TraceRecorder::Clear() -> void {
-    std::lock_guard lock(mutex_);
-    std::fill(ring_.begin(), ring_.end(), TraceEvent{});
-    next_sequence_ = 1;
-    next_index_ = 0;
-    size_ = 0;
+    for (const auto& buffer : buffers_) {
+        if (buffer == nullptr) {
+            continue;
+        }
+        std::lock_guard lock(buffer->mutex);
+        std::fill(buffer->ring.begin(), buffer->ring.end(), TraceEvent{});
+        buffer->next_index = 0U;
+        buffer->size = 0U;
+    }
+    next_sequence_.store(1U, std::memory_order_relaxed);
 }
 
 auto TraceRecorder::Record(
@@ -34,14 +42,21 @@ auto TraceRecorder::Record(
     std::uint64_t arg0,
     std::uint64_t arg1,
     std::string_view text) -> void {
-    std::lock_guard lock(mutex_);
     if (!enabled()) {
         return;
     }
 
-    auto& event = ring_[next_index_];
+    auto* buffer = buffers_[ResolveBufferIndex(worker_id)].get();
+    if (buffer == nullptr || buffer->ring.empty()) {
+        return;
+    }
+
+    const auto sequence = next_sequence_.fetch_add(1U, std::memory_order_relaxed);
+    std::lock_guard lock(buffer->mutex);
+
+    auto& event = buffer->ring[buffer->next_index];
     event = TraceEvent{};
-    event.sequence = next_sequence_++;
+    event.sequence = sequence;
     event.timestamp_ns = timestamp_ns;
     event.kind = kind;
     event.session_id = session_id;
@@ -55,25 +70,45 @@ auto TraceRecorder::Record(
     }
     event.text[copy_size] = '\0';
 
-    next_index_ = (next_index_ + 1U) % ring_.size();
-    if (size_ < ring_.size()) {
-        ++size_;
+    buffer->next_index = (buffer->next_index + 1U) % buffer->ring.size();
+    if (buffer->size < buffer->ring.size()) {
+        ++buffer->size;
     }
 }
 
 auto TraceRecorder::Snapshot() const -> std::vector<TraceEvent> {
-    std::lock_guard lock(mutex_);
     std::vector<TraceEvent> snapshot;
-    snapshot.reserve(size_);
-    if (!enabled() || size_ == 0) {
+    if (!enabled()) {
         return snapshot;
     }
 
-    const auto start = size_ == ring_.size() ? next_index_ : 0U;
-    for (std::size_t offset = 0; offset < size_; ++offset) {
-        snapshot.push_back(ring_[(start + offset) % ring_.size()]);
+    for (const auto& buffer : buffers_) {
+        if (buffer == nullptr) {
+            continue;
+        }
+        std::lock_guard lock(buffer->mutex);
+        snapshot.reserve(snapshot.size() + buffer->size);
+        if (buffer->size == 0U) {
+            continue;
+        }
+
+        const auto start = buffer->size == buffer->ring.size() ? buffer->next_index : 0U;
+        for (std::size_t offset = 0; offset < buffer->size; ++offset) {
+            snapshot.push_back(buffer->ring[(start + offset) % buffer->ring.size()]);
+        }
     }
+
+    std::sort(snapshot.begin(), snapshot.end(), [](const TraceEvent& lhs, const TraceEvent& rhs) {
+        return lhs.sequence < rhs.sequence;
+    });
     return snapshot;
+}
+
+auto TraceRecorder::ResolveBufferIndex(std::uint32_t worker_id) const -> std::size_t {
+    if (buffers_.empty()) {
+        return 0U;
+    }
+    return static_cast<std::size_t>(worker_id) % buffers_.size();
 }
 
 }  // namespace fastfix::runtime

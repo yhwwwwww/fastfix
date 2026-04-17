@@ -12,7 +12,6 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "fastfix/base/result.h"
@@ -21,6 +20,7 @@
 #include "fastfix/runtime/application.h"
 #include "fastfix/runtime/config.h"
 #include "fastfix/runtime/engine.h"
+#include "fastfix/runtime/live_session_registry.h"
 #include "fastfix/runtime/shard_poller.h"
 #include "fastfix/session/admin_protocol.h"
 #include "fastfix/store/session_store.h"
@@ -45,7 +45,10 @@ class LiveInitiator {
     explicit LiveInitiator(Engine* engine, Options options);
     ~LiveInitiator();
 
+    // Connects synchronously and may block until the TCP dial succeeds or times out.
     auto OpenSession(std::uint64_t session_id, std::string host, std::uint16_t port) -> base::Status;
+    // Enqueues the session for a later dial on the runtime worker loop without blocking the caller.
+    auto OpenSessionAsync(std::uint64_t session_id, std::string host, std::uint16_t port) -> base::Status;
     auto Run(
         std::size_t max_completed_sessions = 0,
         std::chrono::milliseconds idle_timeout = std::chrono::milliseconds{0}) -> base::Status;
@@ -226,12 +229,9 @@ class LiveInitiator {
     std::vector<WorkerShardState> worker_shards_;
     std::vector<std::jthread> worker_threads_;
     mutable std::mutex control_mutex_;
-    std::unordered_map<std::uint64_t, session::SessionSnapshot> session_snapshots_;
     std::unordered_map<std::uint64_t, std::uint32_t> session_worker_ids_;
-    std::unordered_map<std::uint64_t, std::vector<std::weak_ptr<session::SessionSubscriptionStream>>> session_subscribers_;
-    std::unordered_set<std::uint64_t> active_session_ids_;
-    std::optional<base::Status> terminal_status_;
-    std::uint64_t next_connection_id_{1};
+    LiveSessionRegistry session_registry_;
+    std::atomic<std::uint64_t> next_connection_id_{1};
     std::atomic<std::size_t> active_connection_count_{0};
     std::atomic<std::uint64_t> last_progress_ns_{0};
     std::atomic<std::size_t> completed_sessions_{0};

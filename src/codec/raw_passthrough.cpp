@@ -123,10 +123,22 @@ auto ResolveReplayDefaultApplVerID(
     return {};
 }
 
-}  // namespace
+auto CountStringFieldBytes(std::string_view prefix, std::string_view value) -> std::size_t {
+    return prefix.size() + value.size() + 1U;
+}
 
-auto DecodeRawPassThrough(
+auto CountLiteralFieldBytes(std::string_view literal) -> std::size_t {
+    return literal.size() + 1U;
+}
+
+auto CountUintFieldBytes(std::string_view prefix, std::uint32_t value) -> std::size_t {
+    char digits[10];
+    return prefix.size() + FormatUint32(digits, value) + 1U;
+}
+
+auto DecodeRawPassThroughImpl(
     std::span<const std::byte> data,
+    const std::uint32_t* known_body_start_offset,
     char delimiter,
     bool verify_checksum) -> base::Result<RawPassThroughView> {
     const auto delim = static_cast<std::byte>(static_cast<unsigned char>(
@@ -135,23 +147,19 @@ auto DecodeRawPassThrough(
     RawPassThroughView view;
     view.raw_message = data;
 
-    // Field 0: must be tag 8 (BeginString)
     auto f = ScanField(data, 0, delim);
     if (f.tag != kBeginString) {
         return base::Status::FormatError("FIX frame must begin with tag 8");
     }
     view.begin_string = ValueView(data, f.value_offset, f.value_length);
 
-    // Field 1: must be tag 9 (BodyLength)
     f = ScanField(data, f.next_pos, delim);
     if (f.tag != kBodyLength) {
         return base::Status::FormatError("FIX frame must have tag 9 after tag 8");
     }
     const auto declared_body_length = ParseUint32(ValueView(data, f.value_offset, f.value_length));
-    const auto body_start_offset = f.next_pos;
+    const auto session_prefix_end = f.next_pos;
 
-    // Locate the checksum field by scanning backwards from the end.
-    // FIX checksum is always the last field, formatted as 10=NNN<delim> (7 bytes).
     if (data.size() < 7) {
         return base::Status::FormatError("FIX frame too short for CheckSum");
     }
@@ -175,25 +183,30 @@ auto DecodeRawPassThrough(
         }
     }
 
-    // Validate BodyLength: region between body_start_offset and checksum_field_start.
-    const auto actual_body_length = checksum_field_start - body_start_offset;
+    const auto actual_body_length = checksum_field_start - session_prefix_end;
     if (declared_body_length != actual_body_length) {
         return base::Status::FormatError("BodyLength mismatch");
     }
 
-    // Scan header fields until we hit the first non-header (application) tag.
-    // Header fields always precede body fields in a well-formed FIX message,
-    // so we can stop scanning once we see the first application-level tag.
-    std::size_t last_header_end = f.next_pos;
-    std::size_t pos = f.next_pos;
-    while (pos < checksum_field_start) {
+    const auto scan_end = known_body_start_offset == nullptr
+        ? checksum_field_start
+        : static_cast<std::size_t>(*known_body_start_offset);
+    if (scan_end < session_prefix_end || scan_end > checksum_field_start) {
+        return base::Status::FormatError("stored body_start_offset is outside the FIX body");
+    }
+
+    std::size_t last_header_end = session_prefix_end;
+    std::size_t pos = session_prefix_end;
+    while (pos < scan_end) {
         f = ScanField(data, pos, delim);
         if (f.tag == 0 && f.next_pos == 0) {
             return base::Status::FormatError("malformed FIX field");
         }
 
         if (!IsSessionHeaderTag(f.tag)) {
-            // First non-header field: body starts here; stop scanning.
+            if (known_body_start_offset != nullptr) {
+                return base::Status::FormatError("stored body_start_offset does not align with a FIX body boundary");
+            }
             break;
         }
 
@@ -214,15 +227,35 @@ auto DecodeRawPassThrough(
             case kPossResend: view.poss_resend = ParseBoolean(val); break;
             default: break;
         }
+
         last_header_end = f.next_pos;
         pos = f.next_pos;
     }
 
-    // raw_body is everything between last_header_end and checksum_field_start.
-    // This contains all application-level fields, unparsed.
-    view.raw_body = data.subspan(last_header_end, checksum_field_start - last_header_end);
+    const auto body_start_offset = known_body_start_offset == nullptr
+        ? static_cast<std::uint32_t>(last_header_end)
+        : *known_body_start_offset;
+    view.raw_body = data.subspan(body_start_offset, checksum_field_start - body_start_offset);
+    view.body_start_offset = body_start_offset;
     view.valid = true;
     return view;
+}
+
+}  // namespace
+
+auto DecodeRawPassThrough(
+    std::span<const std::byte> data,
+    char delimiter,
+    bool verify_checksum) -> base::Result<RawPassThroughView> {
+    return DecodeRawPassThroughImpl(data, nullptr, delimiter, verify_checksum);
+}
+
+auto DecodeRawPassThrough(
+    std::span<const std::byte> data,
+    std::uint32_t body_start_offset,
+    char delimiter,
+    bool verify_checksum) -> base::Result<RawPassThroughView> {
+    return DecodeRawPassThroughImpl(data, &body_start_offset, delimiter, verify_checksum);
 }
 
 auto EncodeForwarded(
@@ -435,24 +468,40 @@ auto EncodeReplayInto(
     const auto replay_target_sub_id = ResolveReplayString(options.target_sub_id, stored.target_sub_id);
     const auto replay_on_behalf_of = ResolveReplayString(options.on_behalf_of_comp_id, stored.on_behalf_of_comp_id);
     const auto replay_deliver_to = ResolveReplayString(options.deliver_to_comp_id, stored.deliver_to_comp_id);
-
-    // Estimate buffer size: header + trailer, plus body if not zero-copy
-    const auto estimated_size = 128U + options.sender_comp_id.size() +
-        replay_sender_sub_id.size() + options.target_comp_id.size() +
-        replay_target_sub_id.size() + options.begin_string.size() +
-        replay_default_appl_ver_id.size() + replay_on_behalf_of.size() +
-        replay_deliver_to.size() + options.sending_time.size() +
-        options.orig_sending_time.size() + stored.msg_type.size() +
-        (options.zero_copy_body ? 0U : stored.raw_body.size());
+    const auto begin_string = options.begin_string.empty()
+        ? stored.begin_string
+        : options.begin_string;
+    const auto body_bytes = stored.raw_body.size();
+    const auto body_length = static_cast<std::uint32_t>(
+        CountStringFieldBytes(kMsgTypePrefix, stored.msg_type) +
+        CountUintFieldBytes(kMsgSeqNumPrefix, options.msg_seq_num) +
+        CountStringFieldBytes(kSenderCompIDPrefix, options.sender_comp_id) +
+        (replay_sender_sub_id.empty() ? 0U : CountStringFieldBytes(kSenderSubIDPrefix, replay_sender_sub_id)) +
+        CountStringFieldBytes(kTargetCompIDPrefix, options.target_comp_id) +
+        (replay_target_sub_id.empty() ? 0U : CountStringFieldBytes(kTargetSubIDPrefix, replay_target_sub_id)) +
+        CountStringFieldBytes(kSendingTimePrefix, options.sending_time) +
+        (replay_default_appl_ver_id.empty() ? 0U : CountStringFieldBytes(kDefaultApplVerIDPrefix, replay_default_appl_ver_id)) +
+        CountLiteralFieldBytes(std::string_view("43=Y")) +
+        (options.poss_resend ? CountLiteralFieldBytes(std::string_view("97=Y")) : 0U) +
+        (options.orig_sending_time.empty() ? 0U : CountStringFieldBytes(kOrigSendingTimePrefix, options.orig_sending_time)) +
+        (replay_on_behalf_of.empty() ? 0U : CountStringFieldBytes(kOnBehalfOfCompIDPrefix, replay_on_behalf_of)) +
+        (replay_deliver_to.empty() ? 0U : CountStringFieldBytes(kDeliverToCompIDPrefix, replay_deliver_to)) +
+        body_bytes);
+    const auto encoded_buffer_size =
+        CountStringFieldBytes(kBeginStringPrefix, begin_string) +
+        CountUintFieldBytes(kBodyLengthPrefix, body_length) +
+        static_cast<std::size_t>(body_length - body_bytes) +
+        (options.zero_copy_body ? 0U : body_bytes) +
+        7U;
 
     // Choose storage: inline or overflow
     char* buf;
-    if (estimated_size <= session::kEncodedFrameInlineCapacity) {
+    if (encoded_buffer_size <= session::kEncodedFrameInlineCapacity) {
         buf = reinterpret_cast<char*>(out->inline_storage.data());
         out->overflow_storage.clear();
     } else {
         out->inline_size = 0;
-        out->overflow_storage.resize(estimated_size + 64);
+        out->overflow_storage.resize(encoded_buffer_size);
         buf = reinterpret_cast<char*>(out->overflow_storage.data());
     }
 
@@ -474,20 +523,18 @@ auto EncodeReplayInto(
     };
 
     // 1. 8=<begin_string>SOH
-    const auto begin_string = options.begin_string.empty()
-        ? stored.begin_string : options.begin_string;
     append_sv(kBeginStringPrefix);
     append_sv(begin_string);
     append_char(soh);
 
-    // 2. 9=<placeholder>SOH — write "9=" tracked, then placeholder untracked (will adjust later)
+    // 2. 9=<body_length>SOH
     append_sv(kBodyLengthPrefix);
-    const auto body_length_offset = pos;
-    // Write placeholder without tracking — we'll add the real digits' sum after backfill
-    std::memcpy(buf + pos, "0000000", 7);
-    pos += 7;
+    {
+        char body_length_digits[10];
+        const auto len = FormatUint32(body_length_digits, body_length);
+        append_sv(std::string_view(body_length_digits, len));
+    }
     append_char(soh);
-    const auto body_start = pos;
 
     append_sv(kMsgTypePrefix);
     append_sv(stored.msg_type);
@@ -549,7 +596,7 @@ auto EncodeReplayInto(
 
     // 11. Body handling: zero-copy scatter-gather or inline copy
     std::uint32_t body_checksum = 0;
-    const auto body_data_size = stored.raw_body.size();
+    const auto body_data_size = body_bytes;
     if (body_data_size > 0) {
         body_checksum = ComputeChecksumSIMD(
             reinterpret_cast<const char*>(stored.raw_body.data()),
@@ -569,34 +616,7 @@ auto EncodeReplayInto(
         }
     }
 
-    // 12. Backfill BodyLength using the canonical variable-width decimal form.
-    const auto body_length = options.zero_copy_body
-        ? static_cast<std::uint32_t>(pos - body_start + body_data_size)
-        : static_cast<std::uint32_t>(pos - body_start);
-    {
-        char bl_buf[10];
-        const auto body_length_digits = FormatUint32(bl_buf, body_length);
-        if (body_length_digits > kBodyLengthPlaceholderWidth) {
-            return base::Status::FormatError("BodyLength exceeds placeholder width");
-        }
-        const auto shrink = kBodyLengthPlaceholderWidth - body_length_digits;
-        if (shrink > 0U) {
-            std::memmove(
-                buf + body_length_offset + body_length_digits,
-                buf + body_length_offset + kBodyLengthPlaceholderWidth,
-                pos - (body_length_offset + kBodyLengthPlaceholderWidth));
-            pos -= shrink;
-            if (options.zero_copy_body) {
-                splice_offset -= shrink;
-            }
-        }
-        std::memcpy(buf + body_length_offset, bl_buf, body_length_digits);
-        for (std::size_t index = 0; index < body_length_digits; ++index) {
-            header_checksum += static_cast<unsigned char>(bl_buf[index]);
-        }
-    }
-
-    // 13. Combine: header (incremental) + body (SIMD), no full-buffer rescan
+    // 12. Combine: header (incremental) + body (SIMD), no full-buffer rescan
     std::uint32_t checksum = (header_checksum + body_checksum) % 256U;
 
     std::memcpy(buf + pos, kCheckSumPrefix.data(), kCheckSumPrefix.size());
@@ -607,7 +627,7 @@ auto EncodeReplayInto(
     buf[pos++] = soh;
 
     // Finalize
-    if (estimated_size <= session::kEncodedFrameInlineCapacity) {
+    if (encoded_buffer_size <= session::kEncodedFrameInlineCapacity) {
         out->inline_size = pos;
     } else {
         out->overflow_storage.resize(pos);

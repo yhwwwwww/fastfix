@@ -525,7 +525,10 @@ auto RunInteropScenario(const InteropScenario& scenario) -> base::Result<Interop
 
     ScenarioRuntimeContext context;
     context.metrics.Reset(scenario.engine_config.worker_count);
-    context.trace.Configure(scenario.engine_config.trace_mode, scenario.engine_config.trace_capacity);
+    context.trace.Configure(
+        scenario.engine_config.trace_mode,
+        scenario.engine_config.trace_capacity,
+        scenario.engine_config.worker_count);
 
     const ShardedRuntime routing(scenario.engine_config.worker_count);
     for (const auto& counterparty : scenario.engine_config.counterparties) {

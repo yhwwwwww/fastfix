@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -18,6 +19,24 @@ auto Payload(std::string_view text) -> std::vector<std::byte> {
         bytes.push_back(static_cast<std::byte>(static_cast<unsigned char>(ch)));
     }
     return bytes;
+}
+
+auto BytesToString(std::span<const std::byte> bytes) -> std::string {
+    return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+auto WriteUint64AtOffset(const std::filesystem::path& path, std::uint64_t offset, std::uint64_t value) -> void {
+    const int fd = ::open(path.c_str(), O_RDWR);
+    REQUIRE(fd >= 0);
+    REQUIRE(::pwrite(fd, &value, sizeof(value), static_cast<off_t>(offset)) == static_cast<ssize_t>(sizeof(value)));
+    ::close(fd);
+}
+
+auto AppendBytes(const std::filesystem::path& path, std::string_view bytes) -> void {
+    const int fd = ::open(path.c_str(), O_RDWR | O_APPEND);
+    REQUIRE(fd >= 0);
+    REQUIRE(::write(fd, bytes.data(), bytes.size()) == static_cast<ssize_t>(bytes.size()));
+    ::close(fd);
 }
 
 auto CountArchivedLogs(const std::filesystem::path& root) -> std::size_t {
@@ -63,6 +82,7 @@ TEST_CASE("store-recovery", "[store-recovery]") {
         .timestamp_ns = 1000U,
         .flags = 0U,
         .payload = Payload("8=FIX.4.4|35=D|"),
+        .body_start_offset = 10U,
     };
     REQUIRE(memory_store.SaveOutbound(outbound).ok());
     REQUIRE(memory_store.SaveRecoveryState(
@@ -79,6 +99,7 @@ TEST_CASE("store-recovery", "[store-recovery]") {
     REQUIRE(loaded_memory.ok());
     REQUIRE(loaded_memory.value().size() == 1U);
     REQUIRE(loaded_memory.value().front().payload.size() == outbound.payload.size());
+    REQUIRE(loaded_memory.value().front().body_start_offset == outbound.body_start_offset);
 
     auto loaded_memory_views = memory_store.LoadOutboundRangeViews(77U, 1U, 1U);
     REQUIRE(loaded_memory_views.ok());
@@ -86,6 +107,7 @@ TEST_CASE("store-recovery", "[store-recovery]") {
     REQUIRE(loaded_memory_views.value().owned_storage.empty());
     REQUIRE(loaded_memory_views.value().records.front().seq_num == 1U);
     REQUIRE(loaded_memory_views.value().records.front().payload.size() == outbound.payload.size());
+    REQUIRE(loaded_memory_views.value().records.front().body_start_offset == outbound.body_start_offset);
 
     auto memory_state = memory_store.LoadRecoveryState(77U);
     REQUIRE(memory_state.ok());
@@ -118,6 +140,7 @@ TEST_CASE("store-recovery", "[store-recovery]") {
         REQUIRE(loaded.value().size() == 1U);
         REQUIRE(loaded.value().front().seq_num == 1U);
         REQUIRE(loaded.value().front().payload.size() == outbound.payload.size());
+        REQUIRE(loaded.value().front().body_start_offset == outbound.body_start_offset);
 
         auto loaded_views = mmap_store.LoadOutboundRangeViews(77U, 1U, 1U);
         REQUIRE(loaded_views.ok());
@@ -125,6 +148,7 @@ TEST_CASE("store-recovery", "[store-recovery]") {
         REQUIRE(loaded_views.value().owned_storage.empty());
         REQUIRE(loaded_views.value().records.front().seq_num == 1U);
         REQUIRE(loaded_views.value().records.front().payload.size() == outbound.payload.size());
+        REQUIRE(loaded_views.value().records.front().body_start_offset == outbound.body_start_offset);
 
         auto recovery = mmap_store.LoadRecoveryState(77U);
         REQUIRE(recovery.ok());
@@ -223,6 +247,8 @@ TEST_CASE("store-recovery", "[store-recovery]") {
         REQUIRE(!recent_views.value().payload_storage.empty());
         REQUIRE(recent_views.value().records[0].seq_num == 3U);
         REQUIRE(recent_views.value().records[1].seq_num == 4U);
+        REQUIRE(recent_views.value().records[0].body_start_offset == 0U);
+        REQUIRE(recent_views.value().records[1].body_start_offset == 0U);
 
         auto pruned = durable_store.LoadOutboundRange(88U, 1U, 2U);
         REQUIRE(pruned.ok());
@@ -401,6 +427,227 @@ TEST_CASE("store-recovery", "[store-recovery]") {
     std::filesystem::remove_all(external_root);
     std::filesystem::remove_all(crash_root);
     std::filesystem::remove_all(corrupt_root);
+}
+
+TEST_CASE("mmap store reset only removes target session", "[store-recovery]") {
+    const auto path = std::filesystem::temp_directory_path() / "fastfix-mmap-store-reset-test.dat";
+    std::filesystem::remove(path);
+
+    fastfix::store::MmapSessionStore store(path);
+    REQUIRE(store.Open().ok());
+    REQUIRE(store.SaveOutbound(
+        fastfix::store::MessageRecord{
+            .session_id = 9001U,
+            .seq_num = 1U,
+            .timestamp_ns = 10U,
+            .flags = 0U,
+            .payload = Payload("8=FIX.4.4|35=D|11=A|"),
+            .body_start_offset = 10U,
+        }).ok());
+    REQUIRE(store.SaveOutbound(
+        fastfix::store::MessageRecord{
+            .session_id = 9002U,
+            .seq_num = 1U,
+            .timestamp_ns = 20U,
+            .flags = 0U,
+            .payload = Payload("8=FIX.4.4|35=D|11=B|"),
+            .body_start_offset = 10U,
+        }).ok());
+    REQUIRE(store.SaveRecoveryState(
+        fastfix::store::SessionRecoveryState{.session_id = 9001U, .next_in_seq = 3U, .next_out_seq = 4U, .active = true}).ok());
+    REQUIRE(store.SaveRecoveryState(
+        fastfix::store::SessionRecoveryState{.session_id = 9002U, .next_in_seq = 5U, .next_out_seq = 6U, .active = true}).ok());
+
+    REQUIRE(store.ResetSession(9001U).ok());
+
+    auto cleared = store.LoadOutboundRange(9001U, 1U, 1U);
+    REQUIRE(cleared.ok());
+    REQUIRE(cleared.value().empty());
+    auto preserved = store.LoadOutboundRange(9002U, 1U, 1U);
+    REQUIRE(preserved.ok());
+    REQUIRE(preserved.value().size() == 1U);
+    REQUIRE(preserved.value().front().body_start_offset == 10U);
+    REQUIRE(store.LoadRecoveryState(9001U).status().code() == fastfix::base::ErrorCode::kNotFound);
+    auto preserved_recovery = store.LoadRecoveryState(9002U);
+    REQUIRE(preserved_recovery.ok());
+    REQUIRE(preserved_recovery.value().next_out_seq == 6U);
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("durable store reset only removes target session", "[store-recovery]") {
+    const auto root = std::filesystem::temp_directory_path() / "fastfix-durable-store-reset-test";
+    std::filesystem::remove_all(root);
+
+    fastfix::store::DurableBatchSessionStore store(
+        root,
+        fastfix::store::DurableBatchStoreOptions{
+            .flush_threshold = 1U,
+            .rollover_mode = fastfix::store::DurableStoreRolloverMode::kExternal,
+            .max_archived_segments = 2U,
+        });
+    REQUIRE(store.Open().ok());
+    REQUIRE(store.SaveOutbound(
+        fastfix::store::MessageRecord{
+            .session_id = 9101U,
+            .seq_num = 1U,
+            .timestamp_ns = 11U,
+            .flags = 0U,
+            .payload = Payload("8=FIX.4.4|35=D|11=X|"),
+            .body_start_offset = 10U,
+        }).ok());
+    REQUIRE(store.SaveOutbound(
+        fastfix::store::MessageRecord{
+            .session_id = 9102U,
+            .seq_num = 1U,
+            .timestamp_ns = 12U,
+            .flags = 0U,
+            .payload = Payload("8=FIX.4.4|35=D|11=Y|"),
+            .body_start_offset = 10U,
+        }).ok());
+    REQUIRE(store.SaveRecoveryState(
+        fastfix::store::SessionRecoveryState{.session_id = 9101U, .next_in_seq = 2U, .next_out_seq = 3U, .active = true}).ok());
+    REQUIRE(store.SaveRecoveryState(
+        fastfix::store::SessionRecoveryState{.session_id = 9102U, .next_in_seq = 4U, .next_out_seq = 5U, .active = true}).ok());
+
+    REQUIRE(store.ResetSession(9101U).ok());
+
+    auto cleared = store.LoadOutboundRange(9101U, 1U, 1U);
+    REQUIRE(cleared.ok());
+    REQUIRE(cleared.value().empty());
+    auto preserved = store.LoadOutboundRange(9102U, 1U, 1U);
+    REQUIRE(preserved.ok());
+    REQUIRE(preserved.value().size() == 1U);
+    REQUIRE(preserved.value().front().body_start_offset == 10U);
+    REQUIRE(store.LoadRecoveryState(9101U).status().code() == fastfix::base::ErrorCode::kNotFound);
+    auto preserved_recovery = store.LoadRecoveryState(9102U);
+    REQUIRE(preserved_recovery.ok());
+    REQUIRE(preserved_recovery.value().next_out_seq == 5U);
+
+    std::filesystem::remove_all(root);
+}
+
+TEST_CASE("mmap store repairs committed size after incomplete tail", "[store-recovery]") {
+    const auto path = std::filesystem::temp_directory_path() / "fastfix-mmap-store-tail-test.dat";
+    std::filesystem::remove(path);
+
+    {
+        fastfix::store::MmapSessionStore store(path);
+        REQUIRE(store.Open().ok());
+        REQUIRE(store.SaveOutbound(
+            fastfix::store::MessageRecord{
+                .session_id = 9201U,
+                .seq_num = 1U,
+                .timestamp_ns = 100U,
+                .flags = 0U,
+                .payload = Payload("8=FIX.4.4|35=D|11=TAIL|"),
+                .body_start_offset = 10U,
+            }).ok());
+    }
+
+    const auto original_size = std::filesystem::file_size(path);
+    std::filesystem::resize_file(path, original_size + 32U);
+    WriteUint64AtOffset(path, 16U, original_size + 32U);
+
+    {
+        fastfix::store::MmapSessionStore store(path);
+        REQUIRE(store.Open().ok());
+        REQUIRE(std::filesystem::file_size(path) == original_size);
+        auto loaded = store.LoadOutboundRange(9201U, 1U, 1U);
+        REQUIRE(loaded.ok());
+        REQUIRE(loaded.value().size() == 1U);
+        REQUIRE(loaded.value().front().body_start_offset == 10U);
+    }
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("mmap store borrowed views survive remap growth", "[store-recovery]") {
+    const auto path = std::filesystem::temp_directory_path() / "fastfix-mmap-store-view-test.dat";
+    std::filesystem::remove(path);
+
+    fastfix::store::MmapSessionStore store(path);
+    REQUIRE(store.Open().ok());
+    const auto first_payload = std::string(256U, 'A');
+    REQUIRE(store.SaveOutbound(
+        fastfix::store::MessageRecord{
+            .session_id = 9301U,
+            .seq_num = 1U,
+            .timestamp_ns = 1U,
+            .flags = 0U,
+            .payload = Payload(first_payload),
+            .body_start_offset = 8U,
+        }).ok());
+
+    auto loaded = store.LoadOutboundRangeViews(9301U, 1U, 1U);
+    REQUIRE(loaded.ok());
+    auto range = std::move(loaded).value();
+    REQUIRE(range.records.size() == 1U);
+
+    for (std::uint32_t seq = 2U; seq <= 24U; ++seq) {
+        REQUIRE(store.SaveOutbound(
+            fastfix::store::MessageRecord{
+                .session_id = 9301U,
+                .seq_num = seq,
+                .timestamp_ns = seq,
+                .flags = 0U,
+                .payload = Payload(std::string(4096U, static_cast<char>('A' + (seq % 26U)))),
+                .body_start_offset = 8U,
+            }).ok());
+    }
+
+    REQUIRE(BytesToString(range.records.front().payload) == first_payload);
+    REQUIRE(range.records.front().body_start_offset == 8U);
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("durable store truncates uncommitted tail on reopen", "[store-recovery]") {
+    const auto root = std::filesystem::temp_directory_path() / "fastfix-durable-store-tail-test";
+    std::filesystem::remove_all(root);
+
+    {
+        fastfix::store::DurableBatchSessionStore store(
+            root,
+            fastfix::store::DurableBatchStoreOptions{
+                .flush_threshold = 1U,
+                .rollover_mode = fastfix::store::DurableStoreRolloverMode::kExternal,
+                .max_archived_segments = 1U,
+            });
+        REQUIRE(store.Open().ok());
+        REQUIRE(store.SaveOutbound(
+            fastfix::store::MessageRecord{
+                .session_id = 9401U,
+                .seq_num = 1U,
+                .timestamp_ns = 1U,
+                .flags = 0U,
+                .payload = Payload("8=FIX.4.4|35=D|11=GOOD|"),
+                .body_start_offset = 10U,
+            }).ok());
+    }
+
+    const auto active_log = root / "active.log";
+    const auto committed_size = std::filesystem::file_size(active_log);
+    AppendBytes(active_log, "TAIL");
+    REQUIRE(std::filesystem::file_size(active_log) == committed_size + 4U);
+
+    {
+        fastfix::store::DurableBatchSessionStore store(
+            root,
+            fastfix::store::DurableBatchStoreOptions{
+                .flush_threshold = 1U,
+                .rollover_mode = fastfix::store::DurableStoreRolloverMode::kExternal,
+                .max_archived_segments = 1U,
+            });
+        REQUIRE(store.Open().ok());
+        REQUIRE(std::filesystem::file_size(active_log) == committed_size);
+        auto loaded = store.LoadOutboundRange(9401U, 1U, 1U);
+        REQUIRE(loaded.ok());
+        REQUIRE(loaded.value().size() == 1U);
+        REQUIRE(loaded.value().front().body_start_offset == 10U);
+    }
+
+    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("durable store kLocalTime rollover", "[store-recovery]") {

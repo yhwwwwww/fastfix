@@ -13,6 +13,7 @@
 
 #include "fastfix/codec/fix_tags.h"
 #include "fastfix/base/spsc_queue.h"
+#include "fastfix/runtime/live_runtime_support.h"
 #include "fastfix/runtime/thread_affinity.h"
 #include "fastfix/store/durable_batch_store.h"
 #include "fastfix/store/memory_store.h"
@@ -60,25 +61,6 @@ auto ReconnectJitterLimit(std::uint32_t backoff_ms) -> std::uint32_t {
     return backoff_ms / kReconnectJitterDivisor;
 }
 
-thread_local const void* g_inline_borrow_send_sink = nullptr;
-
-class BorrowedSendScope {
-    public:
-        explicit BorrowedSendScope(const void* sink)
-                : previous_(g_inline_borrow_send_sink) {
-                g_inline_borrow_send_sink = sink;
-        }
-
-        BorrowedSendScope(const BorrowedSendScope&) = delete;
-        auto operator=(const BorrowedSendScope&) -> BorrowedSendScope& = delete;
-
-        ~BorrowedSendScope() {
-                g_inline_borrow_send_sink = previous_;
-        }
-
-    private:
-        const void* previous_{nullptr};
-};
 auto IsAdminMessage(std::string_view msg_type) -> bool {
     return msg_type == "0" || msg_type == "1" || msg_type == "2" || msg_type == "3" ||
            msg_type == "4" || msg_type == "5" || msg_type == "A";
@@ -164,24 +146,6 @@ struct OutboundCommand {
     std::string text;
 };
 
-class SubscriberStream final : public session::SessionSubscriptionStream {
-  public:
-    explicit SubscriberStream(std::size_t queue_capacity)
-        : queue_(queue_capacity) {
-    }
-
-    auto TryPop() -> base::Result<std::optional<session::SessionNotification>> override {
-        return queue_.TryPop();
-    }
-
-    auto TryPush(const session::SessionNotification& notification) -> bool {
-        return queue_.TryPush(notification);
-    }
-
-  private:
-    base::SpscQueue<session::SessionNotification> queue_;
-};
-
 }  // namespace
 
 class LiveInitiator::CommandSink final : public session::SessionCommandSink {
@@ -200,6 +164,10 @@ class LiveInitiator::CommandSink final : public session::SessionCommandSink {
         std::uint64_t session_id,
         message::MessageRef message,
         session::SessionSendEnvelopeRef envelope) -> base::Status override {
+        auto status = ValidateSingleProducer();
+        if (!status.ok()) {
+            return status;
+        }
         if (!queue_.TryPush(OutboundCommand{
                 .kind = OutboundCommandKind::kSendApplication,
                 .session_id = session_id,
@@ -226,6 +194,10 @@ class LiveInitiator::CommandSink final : public session::SessionCommandSink {
         if (g_inline_borrow_send_sink != this) {
             return false;
         }
+        auto status = ValidateSingleProducer();
+        if (!status.ok()) {
+            return status;
+        }
         if (!queue_.TryPush(OutboundCommand{
                 .kind = OutboundCommandKind::kSendApplication,
                 .session_id = session_id,
@@ -250,6 +222,10 @@ class LiveInitiator::CommandSink final : public session::SessionCommandSink {
         std::uint64_t session_id,
         session::EncodedApplicationMessageRef message,
         session::SessionSendEnvelopeRef envelope) -> base::Status override {
+        auto status = ValidateSingleProducer();
+        if (!status.ok()) {
+            return status;
+        }
         if (!queue_.TryPush(OutboundCommand{
                 .kind = OutboundCommandKind::kSendEncodedApplication,
                 .session_id = session_id,
@@ -277,6 +253,10 @@ class LiveInitiator::CommandSink final : public session::SessionCommandSink {
         if (g_inline_borrow_send_sink != this) {
             return false;
         }
+        auto status = ValidateSingleProducer();
+        if (!status.ok()) {
+            return status;
+        }
         if (!queue_.TryPush(OutboundCommand{
                 .kind = OutboundCommandKind::kSendEncodedApplication,
                 .session_id = session_id,
@@ -300,6 +280,10 @@ class LiveInitiator::CommandSink final : public session::SessionCommandSink {
     }
 
     auto EnqueueLogout(std::uint64_t session_id, std::string text) -> base::Status {
+        auto status = ValidateSingleProducer();
+        if (!status.ok()) {
+            return status;
+        }
         if (!queue_.TryPush(OutboundCommand{
                 .kind = OutboundCommandKind::kBeginLogout,
                 .session_id = session_id,
@@ -318,8 +302,13 @@ class LiveInitiator::CommandSink final : public session::SessionCommandSink {
     }
 
   private:
+    auto ValidateSingleProducer() -> base::Status {
+        return producer_guard_.Validate();
+    }
+
     LiveInitiator* owner_{nullptr};
-        std::uint32_t worker_id_{0};
+    std::uint32_t worker_id_{0};
+    SingleProducerGuard producer_guard_{};
     base::SpscQueue<OutboundCommand> queue_;
 };
 
@@ -393,30 +382,23 @@ auto LiveInitiator::ResetWorkerShards(std::uint32_t worker_count) -> base::Statu
 }
 
 auto LiveInitiator::HasActiveSession(std::uint64_t session_id) const -> bool {
-    std::lock_guard lock(control_mutex_);
-    return active_session_ids_.contains(session_id);
+    return session_registry_.HasActiveSession(session_id);
 }
 
 auto LiveInitiator::RegisterActiveSession(std::uint64_t session_id) -> bool {
-    std::lock_guard lock(control_mutex_);
-    return active_session_ids_.emplace(session_id).second;
+    return session_registry_.RegisterActiveSession(session_id);
 }
 
 auto LiveInitiator::UnregisterActiveSession(std::uint64_t session_id) -> void {
-    std::lock_guard lock(control_mutex_);
-    active_session_ids_.erase(session_id);
+    session_registry_.UnregisterActiveSession(session_id);
 }
 
 auto LiveInitiator::SetTerminalStatus(base::Status status) -> void {
-    std::lock_guard lock(control_mutex_);
-    if (!terminal_status_.has_value()) {
-        terminal_status_ = std::move(status);
-    }
+    session_registry_.SetTerminalStatus(std::move(status));
 }
 
 auto LiveInitiator::LoadTerminalStatus() const -> std::optional<base::Status> {
-    std::lock_guard lock(control_mutex_);
-    return terminal_status_;
+    return session_registry_.LoadTerminalStatus();
 }
 
 auto LiveInitiator::AdoptPendingConnections(WorkerShardState& shard) -> void {
@@ -614,8 +596,8 @@ auto LiveInitiator::OpenSession(std::uint64_t session_id, std::string host, std:
         {
             std::lock_guard lock(control_mutex_);
             session_worker_ids_[session_state.counterparty.session.session_id] = session_state.worker_id;
-            terminal_status_.reset();
         }
+        session_registry_.ClearTerminalStatus();
         UpdateSessionSnapshot(session_state);
 
         shard->pending_reconnects.push_back(PendingReconnect{
@@ -653,7 +635,7 @@ auto LiveInitiator::OpenSession(std::uint64_t session_id, std::string host, std:
     }
 
     ConnectionState state{
-        .connection_id = next_connection_id_++,
+        .connection_id = next_connection_id_.fetch_add(1U, std::memory_order_relaxed),
         .connection = std::move(connection).value(),
         .session = std::make_unique<ActiveSession>(std::move(session_state)),
         .last_progress_ns = timestamp_ns,
@@ -672,8 +654,8 @@ auto LiveInitiator::OpenSession(std::uint64_t session_id, std::string host, std:
     {
         std::lock_guard lock(control_mutex_);
         session_worker_ids_[state.session->counterparty.session.session_id] = state.session->worker_id;
-        terminal_status_.reset();
     }
+    session_registry_.ClearTerminalStatus();
     UpdateSessionSnapshot(*state.session);
     active_connection_count_.fetch_add(1U);
 
@@ -698,6 +680,102 @@ auto LiveInitiator::OpenSession(std::uint64_t session_id, std::string host, std:
         return status;
     }
 
+    return base::Status::Ok();
+}
+
+auto LiveInitiator::OpenSessionAsync(std::uint64_t session_id, std::string host, std::uint16_t port) -> base::Status {
+    if (engine_ == nullptr || engine_->config() == nullptr) {
+        return base::Status::InvalidArgument("live initiator requires a booted engine");
+    }
+    if (host.empty() || port == 0U) {
+        return base::Status::InvalidArgument("live initiator requires a remote host and port");
+    }
+    if (HasActiveSession(session_id)) {
+        return base::Status::AlreadyExists("initiator session already has an active transport connection");
+    }
+    if (!worker_threads_.empty()) {
+        return base::Status::InvalidArgument("initiator does not support opening new sessions while multi-worker run is active");
+    }
+
+    const auto* counterparty = engine_->FindCounterpartyConfig(session_id);
+    if (counterparty == nullptr) {
+        return base::Status::NotFound("initiator session was not found in engine config");
+    }
+    if (!counterparty->session.is_initiator) {
+        return base::Status::InvalidArgument("live initiator requires an initiator-mode counterparty");
+    }
+
+    if (worker_shards_.empty()) {
+        auto status = ResetWorkerShards(engine_->config()->worker_count);
+        if (!status.ok()) {
+            return status;
+        }
+    }
+
+    auto dictionary = engine_->LoadDictionaryView(counterparty->session.profile_id);
+    if (!dictionary.ok()) {
+        return dictionary.status();
+    }
+
+    auto active = MakeActiveSession(*counterparty, std::move(dictionary).value(), std::move(host), port);
+    if (!active.ok()) {
+        return active.status();
+    }
+
+    auto session_state = std::move(active).value();
+    session_state.worker_id = ResolveWorkerId(session_state.worker_id);
+
+    auto* shard = FindWorkerShard(session_state.worker_id);
+    if (shard == nullptr) {
+        return base::Status::NotFound("initiator worker shard was not found");
+    }
+
+    std::shared_ptr<session::SessionCommandSink> command_sink;
+    if (shard->command_sink != nullptr) {
+        command_sink = shard->command_sink;
+    }
+    session_state.handle = session::SessionHandle(
+        session_state.counterparty.session.session_id,
+        session_state.worker_id,
+        std::move(command_sink));
+
+    const auto timestamp_ns = NowNs();
+    const auto wall_now_ns = WallClockNowNs();
+    const auto next_attempt_ns = IsWithinLogonWindow(session_state.counterparty.session_schedule, wall_now_ns)
+        ? timestamp_ns
+        : ComputeScheduledAttemptNs(session_state.counterparty, timestamp_ns, wall_now_ns, 0U);
+
+    if (!RegisterActiveSession(session_state.counterparty.session.session_id)) {
+        return base::Status::AlreadyExists("initiator session already has an active transport connection");
+    }
+    {
+        std::lock_guard lock(control_mutex_);
+        session_worker_ids_[session_state.counterparty.session.session_id] = session_state.worker_id;
+    }
+    session_registry_.ClearTerminalStatus();
+    UpdateSessionSnapshot(session_state);
+
+    shard->pending_reconnects.push_back(PendingReconnect{
+        .session_id = session_state.counterparty.session.session_id,
+        .host = session_state.host,
+        .port = session_state.port,
+        .retry_count = 0,
+        .current_backoff_ms = session_state.counterparty.reconnect_initial_ms,
+        .next_attempt_ns = next_attempt_ns,
+        .session_registered = true,
+        .session = std::make_unique<ActiveSession>(std::move(session_state)),
+    });
+    pending_reconnect_count_.fetch_add(1U);
+    last_progress_ns_.store(timestamp_ns);
+    stop_requested_.store(false);
+    RecordTrace(
+        TraceEventKind::kSessionEvent,
+        shard->pending_reconnects.back().session_id,
+        shard->pending_reconnects.back().session->worker_id,
+        timestamp_ns,
+        0U,
+        shard->pending_reconnects.back().port,
+        next_attempt_ns == timestamp_ns ? "initiator async connect queued" : "initiator waiting for logon window");
     return base::Status::Ok();
 }
 
@@ -816,12 +894,9 @@ auto LiveInitiator::Stop() -> void {
     pending_reconnect_count_.store(0U);
     {
         std::lock_guard lock(control_mutex_);
-        active_session_ids_.clear();
-        terminal_status_.reset();
-        session_snapshots_.clear();
         session_worker_ids_.clear();
-        session_subscribers_.clear();
     }
+    session_registry_.Clear();
 }
 
 auto LiveInitiator::RequestLogout(std::uint64_t session_id, std::string text) -> base::Status {
@@ -1250,11 +1325,11 @@ auto LiveInitiator::ProcessPendingReconnects(WorkerShardState& shard, std::uint6
         {
             std::lock_guard lock(control_mutex_);
             session_worker_ids_[it->session_id] = it->session->worker_id;
-            terminal_status_.reset();
         }
+        session_registry_.ClearTerminalStatus();
 
         ConnectionState state{
-            .connection_id = next_connection_id_++,
+            .connection_id = next_connection_id_.fetch_add(1U, std::memory_order_relaxed),
             .connection = std::move(connection_result).value(),
             .session = std::move(it->session),
             .last_progress_ns = timestamp_ns,
@@ -1700,80 +1775,24 @@ auto LiveInitiator::SendFramesBatch(
 }
 
 auto LiveInitiator::LoadSessionSnapshot(std::uint64_t session_id) const -> base::Result<session::SessionSnapshot> {
-    std::lock_guard lock(control_mutex_);
-    const auto it = session_snapshots_.find(session_id);
-    if (it == session_snapshots_.end()) {
-        return base::Status::NotFound("session snapshot was not found");
-    }
-    return it->second;
+    return session_registry_.LoadSnapshot(session_id);
 }
 
 auto LiveInitiator::RegisterSessionSubscriber(std::uint64_t session_id, std::size_t queue_capacity)
     -> base::Result<session::SessionSubscription> {
-    auto stream = std::make_shared<SubscriberStream>(queue_capacity);
-
-    std::lock_guard lock(control_mutex_);
-    if (!session_snapshots_.contains(session_id)) {
-        return base::Status::NotFound("session subscription target was not found");
-    }
-    session_subscribers_[session_id].push_back(stream);
-    return session::SessionSubscription(std::move(stream));
+    return session_registry_.RegisterSubscriber(session_id, queue_capacity);
 }
 
 auto LiveInitiator::HasSessionSubscribers(std::uint64_t session_id) -> bool {
-    std::lock_guard lock(control_mutex_);
-    const auto it = session_subscribers_.find(session_id);
-    if (it == session_subscribers_.end()) {
-        return false;
-    }
-
-    auto& weak_subscribers = it->second;
-    for (auto weak_it = weak_subscribers.begin(); weak_it != weak_subscribers.end();) {
-        if (weak_it->expired()) {
-            weak_it = weak_subscribers.erase(weak_it);
-            continue;
-        }
-        return true;
-    }
-
-    session_subscribers_.erase(it);
-    return false;
+    return session_registry_.HasSubscribers(session_id);
 }
 
 auto LiveInitiator::UpdateSessionSnapshot(const ActiveSession& session) -> void {
-    std::lock_guard lock(control_mutex_);
-    session_snapshots_[session.counterparty.session.session_id] = session.protocol->session().Snapshot();
+    session_registry_.UpdateSnapshot(session.protocol->session().Snapshot());
 }
 
 auto LiveInitiator::PublishNotification(const session::SessionNotification& notification) -> void {
-    std::vector<std::shared_ptr<session::SessionSubscriptionStream>> subscribers;
-    {
-        std::lock_guard lock(control_mutex_);
-        session_snapshots_[notification.snapshot.session_id] = notification.snapshot;
-
-        auto it = session_subscribers_.find(notification.snapshot.session_id);
-        if (it == session_subscribers_.end()) {
-            return;
-        }
-
-        auto& weak_subscribers = it->second;
-        for (auto weak_it = weak_subscribers.begin(); weak_it != weak_subscribers.end();) {
-            auto subscriber = weak_it->lock();
-            if (subscriber == nullptr) {
-                weak_it = weak_subscribers.erase(weak_it);
-                continue;
-            }
-            subscribers.push_back(std::move(subscriber));
-            ++weak_it;
-        }
-    }
-
-    for (const auto& subscriber : subscribers) {
-        auto* queue = dynamic_cast<SubscriberStream*>(subscriber.get());
-        if (queue != nullptr) {
-            static_cast<void>(queue->TryPush(notification));
-        }
-    }
+    session_registry_.PublishNotification(notification);
 }
 
 auto LiveInitiator::PollManagedApplicationWorker(std::uint32_t worker_id) -> base::Status {

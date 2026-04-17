@@ -1,6 +1,5 @@
 #include "fastfix/message/message.h"
 
-#include <algorithm>
 #include <charconv>
 
 #include <cstring>
@@ -278,8 +277,8 @@ auto MessageBuilder::encode(
 }
 
 auto GroupEntryBuilder::upsert_field(FieldValue value) -> GroupEntryBuilder& {
-    if (data_ != nullptr) {
-        UpsertField(data_->fields, std::move(value));
+    if (auto* data = resolve(); data != nullptr) {
+        UpsertField(data->fields, std::move(value));
     }
     return *this;
 }
@@ -305,39 +304,66 @@ auto GroupEntryBuilder::set_boolean(std::uint32_t tag, bool value) -> GroupEntry
 }
 
 auto GroupEntryBuilder::reserve_fields(std::size_t count) -> GroupEntryBuilder& {
-    if (data_ != nullptr) {
-        data_->fields.reserve(count);
+    if (auto* data = resolve(); data != nullptr) {
+        data->fields.reserve(count);
     }
     return *this;
 }
 
 auto GroupEntryBuilder::reserve_groups(std::size_t count) -> GroupEntryBuilder& {
-    if (data_ != nullptr) {
-        data_->groups.reserve(count);
+    if (auto* data = resolve(); data != nullptr) {
+        data->groups.reserve(count);
     }
     return *this;
 }
 
 auto GroupEntryBuilder::reserve_group_entries(std::uint32_t count_tag, std::size_t count) -> GroupEntryBuilder& {
-    if (data_ != nullptr) {
-        ensure_group(count_tag).entries.reserve(count);
+    if (auto* group = ensure_group(count_tag); group != nullptr) {
+        group->entries.reserve(count);
     }
     return *this;
 }
 
-auto GroupEntryBuilder::ensure_group(std::uint32_t count_tag) -> GroupData& {
-    if (auto* group = FindGroup(data_->groups, count_tag); group != nullptr) {
-        return *group;
+auto GroupEntryBuilder::resolve() -> MessageData* {
+    auto* data = root_;
+    if (data == nullptr) {
+        return nullptr;
     }
 
-    data_->groups.push_back(GroupData{.count_tag = count_tag});
-    return data_->groups.back();
+    for (const auto& segment : path_) {
+        auto* group = FindGroup(data->groups, segment.count_tag);
+        if (group == nullptr || segment.entry_index >= group->entries.size()) {
+            return nullptr;
+        }
+        data = &group->entries[segment.entry_index];
+    }
+
+    return data;
+}
+
+auto GroupEntryBuilder::ensure_group(std::uint32_t count_tag) -> GroupData* {
+    auto* data = resolve();
+    if (data == nullptr) {
+        return nullptr;
+    }
+    if (auto* group = FindGroup(data->groups, count_tag); group != nullptr) {
+        return group;
+    }
+
+    data->groups.push_back(GroupData{.count_tag = count_tag});
+    return &data->groups.back();
 }
 
 auto GroupEntryBuilder::add_group_entry(std::uint32_t count_tag) -> GroupEntryBuilder {
-    auto& group = ensure_group(count_tag);
-    group.entries.push_back(MessageData{});
-    return GroupEntryBuilder(&group.entries.back());
+    auto* group = ensure_group(count_tag);
+    if (group == nullptr) {
+        return {};
+    }
+
+    group->entries.push_back(MessageData{});
+    auto child_path = path_;
+    child_path.push_back(PathSegment{.count_tag = count_tag, .entry_index = group->entries.size() - 1U});
+    return GroupEntryBuilder(root_, std::move(child_path));
 }
 
 MessageBuilder::MessageBuilder(std::string msg_type) {
@@ -396,7 +422,10 @@ auto MessageBuilder::ensure_group(std::uint32_t count_tag) -> GroupData& {
 auto MessageBuilder::add_group_entry(std::uint32_t count_tag) -> GroupEntryBuilder {
     auto& group = ensure_group(count_tag);
     group.entries.push_back(MessageData{});
-    return GroupEntryBuilder(&group.entries.back());
+    return GroupEntryBuilder(
+        &data_,
+        std::vector<GroupEntryBuilder::PathSegment>{
+            GroupEntryBuilder::PathSegment{.count_tag = count_tag, .entry_index = group.entries.size() - 1U}});
 }
 
 auto MessageBuilder::build() && -> Message {

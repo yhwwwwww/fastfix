@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <shared_mutex>
@@ -103,7 +102,9 @@ class MetricsRegistry {
 
     [[nodiscard]] auto Snapshot() const -> RuntimeMetricsSnapshot;
     [[nodiscard]] auto FindSession(std::uint64_t session_id) const -> const SessionMetrics*;
+    // Workers are allocated during Reset()/Boot() and then only read concurrently.
     [[nodiscard]] auto FindWorker(std::uint32_t worker_id) const -> const WorkerMetrics*;
+    // Mutable worker pointers are stable after Reset(); callers only mutate the atomics they own.
     [[nodiscard]] auto FindWorker(std::uint32_t worker_id) -> WorkerMetrics*;
 
   private:

@@ -563,6 +563,7 @@ auto OnAppMessage(const fastfix::runtime::RuntimeEvent& event)
 | `worker_cpu_affinity` | uint32[] | — | Pin worker threads to CPU cores |
 | `queue_app_mode` | enum | `kCoScheduled` | `kCoScheduled` (drain on worker thread) or `kThreaded` (dedicated app thread per worker) |
 | `app_cpu_affinity` | uint32[] | — | Pin app threads to CPU cores (when `kThreaded`) |
+| `io_backend` | enum | `kEpoll` | `kEpoll` or `kIoUring` (Linux I/O backend) |
 | `accept_unknown_sessions` | bool | false | Allow dynamic session factory for unknown inbound CompIDs |
 | `listeners` | list | — | TCP listener configurations (acceptor only) |
 | `counterparties` | list | — | Pre-configured session counterparties |
@@ -601,6 +602,30 @@ auto OnAppMessage(const fastfix::runtime::RuntimeEvent& event)
 | `durable_archive_limit` | uint32 | 0 | Max archived store segments (0 = unlimited) |
 | `durable_local_utc_offset_seconds` | int32 | 0 | UTC offset for local-time rollover |
 | `durable_use_system_timezone` | bool | true | Use system timezone for rollover |
+| `reset_seq_num_on_logon` | bool | false | Reset sequence numbers on logon |
+| `reset_seq_num_on_logout` | bool | false | Reset sequence numbers on logout |
+| `reset_seq_num_on_disconnect` | bool | false | Reset sequence numbers on disconnect |
+| `refresh_on_logon` | bool | false | Reload persisted recovery state before logon |
+| `send_next_expected_msg_seq_num` | bool | false | Include tag 789 on Logon |
+| `session_schedule` | struct | — | Session time window (start/end time/day, logon/logout windows) |
+| `day_cut` | struct | — | Day-cut mode and timing for sequence reset |
+
+### Tool Runtime Config (`.ffcfg`)
+
+The built-in binaries (`fastfix-acceptor`, `fastfix-interop-runner`, and tests) also accept an internal `.ffcfg` format. It is a convenience layer over `EngineConfig`, not a stable public library API.
+
+```text
+engine.worker_count=1
+engine.enable_metrics=true
+engine.trace_mode=disabled
+profile=build/sample-basic.art
+listener|main|127.0.0.1|9921|0
+counterparty|fix44-demo|4201|1001|FIX.4.4|SELL|BUY|memory||memory|inline|30|false
+```
+
+`profile=` may be repeated. `dictionary=` may also be repeated, and each `dictionary=` line accepts a comma-separated base-plus-overlay `.ffd` set that is loaded as one merged dictionary group.
+
+For ready-to-run examples, see `tests/data/interop/loopback-runtime.ffcfg` and `tests/data/interop/runtime-multiversion.ffcfg`. `dispatch_mode` selects inline vs queue-decoupled delivery per counterparty. `queue_app_mode` is an engine-level knob and only matters when at least one counterparty uses `dispatch_mode=queue`. The full record order and advanced columns are documented in `docs/development.md`.
 
 ---
 
@@ -626,15 +651,20 @@ When `worker_count=1`, the single worker runs on the caller's thread — no extr
 
 Each session belongs to exactly one worker thread. That worker alone handles all protocol state: decode, sequence numbers, timers, store persistence, encode, and write. **No locks on the hot path.**
 
-Cross-thread session access goes through `SessionHandle`:
+Cross-thread session access still goes through `SessionHandle`, but the command path behind `Send*()` / `SendEncoded*()` is one SPSC queue per worker. `Snapshot()` and `Subscribe()` are safe query/stream APIs from any thread. Send paths are single-producer: the runtime binds each handle's send queue to the first producer thread that uses it, and later producers fast-fail with `kInvalidArgument` instead of silently corrupting the SPSC queue.
 
 ```cpp
-// From any thread — thread-safe:
-session_handle.Send(msg);           // Enqueue message → wakeup target worker
-session_handle.Snapshot();          // Query-only
-session_handle.Subscribe();         // Event subscription
+// Safe query paths from any thread:
+session_handle.Snapshot();
+session_handle.Subscribe();
 
-// NOT thread-safe — only from owning worker / callback scope:
+// Cross-thread send path:
+// one producer thread per SessionHandle send queue.
+session_handle.Send(msg);
+
+// Owning-worker / inline-callback only.
+// Outside inline callbacks this returns kInvalidArgument.
+session_handle.SendBorrowed(view);
 message_view.get_string(11);
 ```
 
@@ -746,7 +776,7 @@ For exact measurement boundaries, per-metric start/end points, and flow diagrams
 
 ## Project Status
 
-FastFix is under active development. The core engine, session management, codec, and persistence layers are implemented and tested (152 test cases, 2619 assertions). The hot-path encode pipeline continues to be optimized toward the design targets.
+FastFix is under active development. The core engine, session management, codec, and persistence layers are implemented and tested (206 test cases, 2760+ assertions). The hot-path encode pipeline continues to be optimized toward the design targets.
 
 ## License
 

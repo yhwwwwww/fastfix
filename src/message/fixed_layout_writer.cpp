@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -174,14 +175,22 @@ auto FixedGroupEntryBuilder::set_char(std::uint32_t tag, char value) -> FixedGro
 }
 
 auto FixedGroupEntryBuilder::set_float(std::uint32_t tag, double value) -> FixedGroupEntryBuilder& {
+    if (buffer_ == nullptr || !std::isfinite(value)) {
+        return *this;
+    }
+
+    // On conversion failure we omit the field entirely rather than leaving a partial tag=value prefix.
+    const auto field_start = buffer_->size();
     AppendTagToBuffer(*buffer_, tag);
     buffer_->push_back('=');
     std::array<char, 32> buf{};
     const auto [ptr, ec] = std::to_chars(buf.data(), buf.data() + buf.size(), value,
                                           std::chars_format::general, 12);
-    if (ec == std::errc()) {
-        buffer_->append(buf.data(), static_cast<std::size_t>(ptr - buf.data()));
+    if (ec != std::errc()) {
+        buffer_->resize(field_start);
+        return *this;
     }
+    buffer_->append(buf.data(), static_cast<std::size_t>(ptr - buf.data()));
     buffer_->push_back(codec::kFixSoh);
     return *this;
 }
