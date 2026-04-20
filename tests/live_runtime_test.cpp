@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "nimblefix/codec/fix_tags.h"
+#include "nimblefix/message/message_builder.h"
 #include "nimblefix/runtime/application.h"
 #include "nimblefix/runtime/engine.h"
 #include "nimblefix/runtime/io_poller.h"
@@ -67,7 +68,7 @@ public:
     }
 
     ++inline_application_events_;
-    return event.handle.SendBorrowed(event.message);
+    return event.handle.SendInlineBorrowed(event.message_view());
   }
 
   [[nodiscard]] auto worker_count() const -> std::uint32_t { return queue_.worker_count(); }
@@ -252,7 +253,7 @@ public:
       return nimble::base::Status::InvalidArgument("queue-decoupled application observed an unexpected session");
     }
 
-    auto status = event.handle.Send(event.message);
+    auto status = event.handle.SendCopy(event.message_view());
     if (!status.ok()) {
       return status;
     }
@@ -280,7 +281,7 @@ public:
       return nimble::base::Status::Ok();
     }
 
-    auto status = event.handle.Send(event.message);
+    auto status = event.handle.SendCopy(event.message_view());
     if (!status.ok()) {
       return status;
     }

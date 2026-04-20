@@ -6,6 +6,7 @@
 #include <thread>
 
 #include "nimblefix/codec/fix_tags.h"
+#include "nimblefix/message/message_builder.h"
 #include "nimblefix/session/admin_protocol.h"
 #include "nimblefix/store/memory_store.h"
 #include "nimblefix/transport/tcp_transport.h"

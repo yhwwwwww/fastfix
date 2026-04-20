@@ -5,12 +5,11 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <type_traits>
 #include <utility>
 
 #include "nimblefix/base/result.h"
 #include "nimblefix/base/status.h"
-#include "nimblefix/message/message.h"
+#include "nimblefix/message/message_ref.h"
 #include "nimblefix/session/encoded_application_message.h"
 #include "nimblefix/session/session_key.h"
 #include "nimblefix/session/session_send_envelope.h"
@@ -76,63 +75,65 @@ class SessionCommandSink
 public:
   virtual ~SessionCommandSink() = default;
 
-  virtual auto EnqueueSend(std::uint64_t session_id, message::MessageRef message) -> base::Status = 0;
-  virtual auto EnqueueSendWithEnvelope(std::uint64_t session_id,
-                                       message::MessageRef message,
-                                       SessionSendEnvelopeRef envelope) -> base::Status
+  virtual auto EnqueueOwnedMessage(std::uint64_t session_id, message::MessageRef message) -> base::Status = 0;
+  virtual auto EnqueueOwnedMessageWithEnvelope(std::uint64_t session_id,
+                                               message::MessageRef message,
+                                               SessionSendEnvelopeRef envelope) -> base::Status
   {
     if (!envelope.empty()) {
       return base::Status::InvalidArgument("session envelope send is unsupported by this runtime command sink");
     }
-    return EnqueueSend(session_id, std::move(message));
+    return EnqueueOwnedMessage(session_id, std::move(message));
   }
-  virtual auto EnqueueSendBorrowed(std::uint64_t session_id, const message::MessageRef& message) -> base::Result<bool>
-  {
-    (void)session_id;
-    (void)message;
-    return false;
-  }
-  virtual auto EnqueueSendBorrowedWithEnvelope(std::uint64_t session_id,
-                                               const message::MessageRef& message,
-                                               SessionSendEnvelopeView envelope) -> base::Result<bool>
-  {
-    if (!envelope.empty()) {
-      return base::Status::InvalidArgument("session envelope send is unsupported by this runtime command sink");
-    }
-    return EnqueueSendBorrowed(session_id, message);
-  }
-  virtual auto EnqueueSendEncoded(std::uint64_t session_id, EncodedApplicationMessageRef message) -> base::Status
-  {
-    (void)session_id;
-    (void)message;
-    return base::Status::InvalidArgument("encoded send is unsupported by this runtime command sink");
-  }
-  virtual auto EnqueueSendEncodedWithEnvelope(std::uint64_t session_id,
-                                              EncodedApplicationMessageRef message,
-                                              SessionSendEnvelopeRef envelope) -> base::Status
-  {
-    if (!envelope.empty()) {
-      return base::Status::InvalidArgument("session envelope encoded send is unsupported by this runtime "
-                                           "command sink");
-    }
-    return EnqueueSendEncoded(session_id, std::move(message));
-  }
-  virtual auto EnqueueSendEncodedBorrowed(std::uint64_t session_id, const EncodedApplicationMessageRef& message)
+  virtual auto TrySendInlineBorrowedMessage(std::uint64_t session_id, const message::MessageRef& message)
     -> base::Result<bool>
   {
     (void)session_id;
     (void)message;
     return false;
   }
-  virtual auto EnqueueSendEncodedBorrowedWithEnvelope(std::uint64_t session_id,
-                                                      const EncodedApplicationMessageRef& message,
-                                                      SessionSendEnvelopeView envelope) -> base::Result<bool>
+  virtual auto TrySendInlineBorrowedMessageWithEnvelope(std::uint64_t session_id,
+                                                        const message::MessageRef& message,
+                                                        SessionSendEnvelopeView envelope) -> base::Result<bool>
+  {
+    if (!envelope.empty()) {
+      return base::Status::InvalidArgument("session envelope send is unsupported by this runtime command sink");
+    }
+    return TrySendInlineBorrowedMessage(session_id, message);
+  }
+  virtual auto EnqueueOwnedEncodedMessage(std::uint64_t session_id, EncodedApplicationMessageRef message)
+    -> base::Status
+  {
+    (void)session_id;
+    (void)message;
+    return base::Status::InvalidArgument("encoded send is unsupported by this runtime command sink");
+  }
+  virtual auto EnqueueOwnedEncodedMessageWithEnvelope(std::uint64_t session_id,
+                                                      EncodedApplicationMessageRef message,
+                                                      SessionSendEnvelopeRef envelope) -> base::Status
   {
     if (!envelope.empty()) {
       return base::Status::InvalidArgument("session envelope encoded send is unsupported by this runtime "
                                            "command sink");
     }
-    return EnqueueSendEncodedBorrowed(session_id, message);
+    return EnqueueOwnedEncodedMessage(session_id, std::move(message));
+  }
+  virtual auto TrySendInlineBorrowedEncodedMessage(std::uint64_t session_id,
+                                                   const EncodedApplicationMessageRef& message) -> base::Result<bool>
+  {
+    (void)session_id;
+    (void)message;
+    return false;
+  }
+  virtual auto TrySendInlineBorrowedEncodedMessageWithEnvelope(std::uint64_t session_id,
+                                                               const EncodedApplicationMessageRef& message,
+                                                               SessionSendEnvelopeView envelope) -> base::Result<bool>
+  {
+    if (!envelope.empty()) {
+      return base::Status::InvalidArgument("session envelope encoded send is unsupported by this runtime "
+                                           "command sink");
+    }
+    return TrySendInlineBorrowedEncodedMessage(session_id, message);
   }
   virtual auto LoadSnapshot(std::uint64_t session_id) const -> base::Result<SessionSnapshot> = 0;
   virtual auto Subscribe(std::uint64_t session_id, std::size_t queue_capacity) -> base::Result<SessionSubscription> = 0;
@@ -186,61 +187,42 @@ public:
     return command_sink_->Subscribe(session_id_, queue_capacity);
   }
 
-private:
-  template<typename T>
-  static constexpr bool AcceptsOwnedDecodedSend = std::is_same_v<std::remove_cvref_t<T>, message::Message> ||
-                                                  std::is_same_v<std::remove_cvref_t<T>, message::MessageView> ||
-                                                  std::is_same_v<std::remove_cvref_t<T>, message::MessageRef>;
-
-  template<typename T>
-  static constexpr bool AcceptsBorrowedDecodedSend = std::is_same_v<std::remove_cvref_t<T>, message::MessageView> ||
-                                                     std::is_same_v<std::remove_cvref_t<T>, message::MessageRef>;
-
-  template<typename T>
-  static constexpr bool AcceptsOwnedEncodedSend =
-    std::is_same_v<std::remove_cvref_t<T>, EncodedApplicationMessage> ||
-    std::is_same_v<std::remove_cvref_t<T>, EncodedApplicationMessageView> ||
-    std::is_same_v<std::remove_cvref_t<T>, EncodedApplicationMessageRef>;
-
-  template<typename T>
-  static constexpr bool AcceptsBorrowedEncodedSend =
-    std::is_same_v<std::remove_cvref_t<T>, EncodedApplicationMessageView> ||
-    std::is_same_v<std::remove_cvref_t<T>, EncodedApplicationMessageRef>;
-
 public:
   // All send methods share a single-producer command path per session handle.
   // Calls from different producer threads fast-fail with kInvalidArgument.
-  template<typename MessageLike>
-    requires(AcceptsOwnedDecodedSend<MessageLike>)
-  auto Send(MessageLike&& message, SessionSendEnvelopeView envelope = {}) const -> base::Status
+  auto SendCopy(message::MessageView message, SessionSendEnvelopeView envelope = {}) const -> base::Status
   {
-    return EnqueueOwnedMessage(ToOwnedMessageRef(std::forward<MessageLike>(message)),
-                               SessionSendEnvelopeRef::Own(envelope));
+    return SubmitOwnedMessage(message::MessageRef::Copy(message), SessionSendEnvelopeRef::Own(envelope));
   }
 
-  // Borrowed send is only valid from runtime inline callback context.
-  template<typename MessageLike>
-    requires(AcceptsBorrowedDecodedSend<MessageLike>)
-  auto SendBorrowed(MessageLike&& message, SessionSendEnvelopeView envelope = {}) const -> base::Status
+  auto SendTake(message::Message&& message, SessionSendEnvelopeView envelope = {}) const -> base::Status
   {
-    auto borrowed = ToBorrowedMessageRef(std::forward<MessageLike>(message));
-    return EnqueueBorrowedMessage(borrowed, envelope);
+    return SubmitOwnedMessage(message::MessageRef::Take(std::move(message)), SessionSendEnvelopeRef::Own(envelope));
   }
 
-  template<typename EncodedLike>
-    requires(AcceptsOwnedEncodedSend<EncodedLike>)
-  auto SendEncoded(EncodedLike&& message, SessionSendEnvelopeView envelope = {}) const -> base::Status
+  // Inline-borrowed send is only valid from runtime inline callback context.
+  auto SendInlineBorrowed(message::MessageView message, SessionSendEnvelopeView envelope = {}) const -> base::Status
   {
-    return EnqueueOwnedEncodedMessage(ToOwnedEncodedMessageRef(std::forward<EncodedLike>(message)),
-                                      SessionSendEnvelopeRef::Own(envelope));
+    return SubmitInlineBorrowedMessage(message::MessageRef::Borrow(message), envelope);
   }
 
-  template<typename EncodedLike>
-    requires(AcceptsBorrowedEncodedSend<EncodedLike>)
-  auto SendEncodedBorrowed(EncodedLike&& message, SessionSendEnvelopeView envelope = {}) const -> base::Status
+  auto SendEncodedCopy(EncodedApplicationMessageView message, SessionSendEnvelopeView envelope = {}) const
+    -> base::Status
   {
-    auto borrowed = ToBorrowedEncodedMessageRef(std::forward<EncodedLike>(message));
-    return EnqueueBorrowedEncodedMessage(borrowed, envelope);
+    return SubmitOwnedEncodedMessage(EncodedApplicationMessageRef::Copy(message),
+                                     SessionSendEnvelopeRef::Own(envelope));
+  }
+
+  auto SendEncodedTake(EncodedApplicationMessage&& message, SessionSendEnvelopeView envelope = {}) const -> base::Status
+  {
+    return SubmitOwnedEncodedMessage(EncodedApplicationMessageRef::Take(std::move(message)),
+                                     SessionSendEnvelopeRef::Own(envelope));
+  }
+
+  auto SendEncodedInlineBorrowed(EncodedApplicationMessageView message, SessionSendEnvelopeView envelope = {}) const
+    -> base::Status
+  {
+    return SubmitInlineBorrowedEncodedMessage(EncodedApplicationMessageRef::Borrow(message), envelope);
   }
 
 private:
@@ -255,126 +237,65 @@ private:
     return base::Status::Ok();
   }
 
-  auto EnqueueOwnedMessage(message::MessageRef message, SessionSendEnvelopeRef envelope) const -> base::Status
+  auto SubmitOwnedMessage(message::MessageRef message, SessionSendEnvelopeRef envelope) const -> base::Status
   {
     auto status = EnsureSendable();
     if (!status.ok()) {
       return status;
     }
-    return command_sink_->EnqueueSendWithEnvelope(session_id_, std::move(message), std::move(envelope));
+    return command_sink_->EnqueueOwnedMessageWithEnvelope(session_id_, std::move(message), std::move(envelope));
   }
 
-  static auto ToOwnedMessageRef(const message::Message& message) -> message::MessageRef
-  {
-    return message::MessageRef(message::Message(message.data()));
-  }
-
-  static auto ToOwnedMessageRef(message::Message&& message) -> message::MessageRef
-  {
-    return message::MessageRef(std::move(message));
-  }
-
-  static auto ToOwnedMessageRef(message::MessageView view) -> message::MessageRef
-  {
-    return message::MessageRef::Own(view);
-  }
-
-  static auto ToOwnedMessageRef(const message::MessageRef& message) -> message::MessageRef
-  {
-    if (message.owns_message()) {
-      return message;
-    }
-    return message::MessageRef::Own(message.view());
-  }
-
-  static auto ToBorrowedMessageRef(message::MessageView view) -> message::MessageRef
-  {
-    return message::MessageRef(view);
-  }
-
-  static auto ToBorrowedMessageRef(const message::MessageRef& message) -> message::MessageRef { return message; }
-
-  auto EnqueueBorrowedMessage(const message::MessageRef& message, SessionSendEnvelopeView envelope) const
+  auto SubmitInlineBorrowedMessage(const message::MessageRef& message, SessionSendEnvelopeView envelope) const
     -> base::Status
   {
     auto status = EnsureSendable();
     if (!status.ok()) {
       return status;
     }
-    if (message.owns_message()) {
-      return command_sink_->EnqueueSendWithEnvelope(session_id_, message, SessionSendEnvelopeRef::Own(envelope));
+    if (message.owns_storage()) {
+      return command_sink_->EnqueueOwnedMessageWithEnvelope(
+        session_id_, message, SessionSendEnvelopeRef::Own(envelope));
     }
-    auto queued = command_sink_->EnqueueSendBorrowedWithEnvelope(session_id_, message, envelope);
+    auto queued = command_sink_->TrySendInlineBorrowedMessageWithEnvelope(session_id_, message, envelope);
     if (!queued.ok()) {
       return queued.status();
     }
     if (queued.value()) {
       return base::Status::Ok();
     }
-    return base::Status::InvalidArgument("borrowed send requires runtime inline callback context");
+    return base::Status::InvalidArgument("inline borrowed send requires runtime inline callback context");
   }
 
-  auto EnqueueOwnedEncodedMessage(EncodedApplicationMessageRef message, SessionSendEnvelopeRef envelope) const
+  auto SubmitOwnedEncodedMessage(EncodedApplicationMessageRef message, SessionSendEnvelopeRef envelope) const
     -> base::Status
   {
     auto status = EnsureSendable();
     if (!status.ok()) {
       return status;
     }
-    return command_sink_->EnqueueSendEncodedWithEnvelope(session_id_, std::move(message), std::move(envelope));
+    return command_sink_->EnqueueOwnedEncodedMessageWithEnvelope(session_id_, std::move(message), std::move(envelope));
   }
 
-  static auto ToOwnedEncodedMessageRef(const EncodedApplicationMessage& message) -> EncodedApplicationMessageRef
-  {
-    return EncodedApplicationMessageRef(message);
-  }
-
-  static auto ToOwnedEncodedMessageRef(EncodedApplicationMessage&& message) -> EncodedApplicationMessageRef
-  {
-    return EncodedApplicationMessageRef(std::move(message));
-  }
-
-  static auto ToOwnedEncodedMessageRef(EncodedApplicationMessageView view) -> EncodedApplicationMessageRef
-  {
-    return EncodedApplicationMessageRef::Own(view);
-  }
-
-  static auto ToOwnedEncodedMessageRef(const EncodedApplicationMessageRef& message) -> EncodedApplicationMessageRef
-  {
-    if (message.owns_message()) {
-      return message;
-    }
-    return EncodedApplicationMessageRef::Own(message.view());
-  }
-
-  static auto ToBorrowedEncodedMessageRef(EncodedApplicationMessageView view) -> EncodedApplicationMessageRef
-  {
-    return EncodedApplicationMessageRef(view);
-  }
-
-  static auto ToBorrowedEncodedMessageRef(const EncodedApplicationMessageRef& message) -> EncodedApplicationMessageRef
-  {
-    return message;
-  }
-
-  auto EnqueueBorrowedEncodedMessage(const EncodedApplicationMessageRef& message,
-                                     SessionSendEnvelopeView envelope) const -> base::Status
+  auto SubmitInlineBorrowedEncodedMessage(const EncodedApplicationMessageRef& message,
+                                          SessionSendEnvelopeView envelope) const -> base::Status
   {
     auto status = EnsureSendable();
     if (!status.ok()) {
       return status;
     }
-    if (message.owns_message()) {
-      return command_sink_->EnqueueSendEncodedWithEnvelope(session_id_, message, SessionSendEnvelopeRef::Own(envelope));
+    if (message.owns_storage()) {
+      return command_sink_->EnqueueOwnedEncodedMessageWithEnvelope(
+        session_id_, message, SessionSendEnvelopeRef::Own(envelope));
     }
-    auto queued = command_sink_->EnqueueSendEncodedBorrowedWithEnvelope(session_id_, message, envelope);
+    auto queued = command_sink_->TrySendInlineBorrowedEncodedMessageWithEnvelope(session_id_, message, envelope);
     if (!queued.ok()) {
       return queued.status();
     }
     if (queued.value()) {
       return base::Status::Ok();
     }
-    return base::Status::InvalidArgument("borrowed encoded send requires runtime inline callback context");
+    return base::Status::InvalidArgument("inline borrowed encoded send requires runtime inline callback context");
   }
 
   std::uint64_t session_id_{ 0 };

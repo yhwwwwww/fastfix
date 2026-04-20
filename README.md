@@ -308,7 +308,7 @@ class MyApp : public nimble::runtime::ApplicationCallbacks {
                 .set_float(44, 150.25)   // Price
                 .set_int(38, 100)        // OrderQty
                 .build();
-            event.handle.Send(std::move(msg));
+            event.handle.SendTake(std::move(msg));
         }
         return nimble::base::Status::Ok();
     }
@@ -536,7 +536,7 @@ auto OnAppMessage(const nimble::runtime::RuntimeEvent& event)
         .set_char(150, '0')                // ExecType=New
         .set_int(14, 0)                    // CumQty
         .build();
-    event.handle.Send(std::move(response));
+    event.handle.SendTake(std::move(response));
 
     return nimble::base::Status::Ok();
 }
@@ -651,7 +651,7 @@ When `worker_count=1`, the single worker runs on the caller's thread — no extr
 
 Each session belongs to exactly one worker thread. That worker alone handles all protocol state: decode, sequence numbers, timers, store persistence, encode, and write. **No locks on the hot path.**
 
-Cross-thread session access still goes through `SessionHandle`, but the command path behind `Send*()` / `SendEncoded*()` is one SPSC queue per worker. `Snapshot()` and `Subscribe()` are safe query/stream APIs from any thread. Send paths are single-producer: the runtime binds each handle's send queue to the first producer thread that uses it, and later producers fast-fail with `kInvalidArgument` instead of silently corrupting the SPSC queue.
+Cross-thread session access still goes through `SessionHandle`, but the command path behind `SendCopy()` / `SendTake()` / `SendEncodedCopy()` / `SendEncodedTake()` is one SPSC queue per worker. `Snapshot()` and `Subscribe()` are safe query/stream APIs from any thread. Send paths are single-producer: the runtime binds each handle's send queue to the first producer thread that uses it, and later producers fast-fail with `kInvalidArgument` instead of silently corrupting the SPSC queue.
 
 ```cpp
 // Safe query paths from any thread:
@@ -660,11 +660,11 @@ session_handle.Subscribe();
 
 // Cross-thread send path:
 // one producer thread per SessionHandle send queue.
-session_handle.Send(msg);
+session_handle.SendTake(std::move(msg));
 
 // Owning-worker / inline-callback only.
 // Outside inline callbacks this returns kInvalidArgument.
-session_handle.SendBorrowed(view);
+session_handle.SendInlineBorrowed(view);
 message_view.get_string(11);
 ```
 

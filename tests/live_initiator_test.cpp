@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "nimblefix/codec/fix_tags.h"
+#include "nimblefix/message/message_builder.h"
 #include "nimblefix/runtime/application.h"
 #include "nimblefix/runtime/engine.h"
 #include "nimblefix/runtime/live_initiator.h"
@@ -325,7 +326,7 @@ public:
         sent_application_.exchange(true)) {
       return nimble::base::Status::Ok();
     }
-    return event.handle.Send(BuildInitiatorMessage());
+    return event.handle.SendTake(BuildInitiatorMessage());
   }
 
   auto OnAdminMessage(const nimble::runtime::RuntimeEvent& event) -> nimble::base::Status override
@@ -447,7 +448,7 @@ public:
       }
     }
 
-    return event.handle.Send(BuildInitiatorMessage());
+    return event.handle.SendTake(BuildInitiatorMessage());
   }
 
   auto OnAdminMessage(const nimble::runtime::RuntimeEvent& event) -> nimble::base::Status override
@@ -671,7 +672,7 @@ public:
 
     if (event.kind == nimble::runtime::RuntimeEventKind::kSession &&
         event.session_event == nimble::runtime::SessionEventKind::kActive && !state_->sent_application.exchange(true)) {
-      return event.handle.Send(BuildInitiatorMessage());
+      return event.handle.SendTake(BuildInitiatorMessage());
     }
 
     if (event.kind != nimble::runtime::RuntimeEventKind::kApplicationMessage) {
@@ -1635,7 +1636,7 @@ public:
     if (event.session_event == nimble::runtime::SessionEventKind::kActive && close_count_.load() >= 1U &&
         !sent_application_.exchange(true)) {
       active_count_.fetch_add(1U);
-      return event.handle.Send(BuildInitiatorMessage());
+      return event.handle.SendTake(BuildInitiatorMessage());
     }
     return nimble::base::Status::Ok();
   }

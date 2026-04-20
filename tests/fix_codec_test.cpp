@@ -7,6 +7,8 @@
 #include "nimblefix/codec/fix_codec.h"
 #include "nimblefix/codec/fix_tags.h"
 #include "nimblefix/codec/simd_scan.h"
+#include "nimblefix/message/message_builder.h"
+#include "nimblefix/message/message_ref.h"
 
 #include "test_support.h"
 
@@ -143,10 +145,10 @@ TEST_CASE("fix-codec", "[fix-codec]")
     auto decoded_for_ref = nimble::codec::DecodeFixMessageView(encoded.value(), dictionary.value());
     REQUIRE(decoded_for_ref.ok());
     parsed_owned_ref =
-      nimble::message::MessageRef::OwnParsed(std::move(decoded_for_ref.value().message), decoded_for_ref.value().raw);
+      nimble::message::MessageRef::CopyParsed(std::move(decoded_for_ref.value().message), decoded_for_ref.value().raw);
   }
   REQUIRE(parsed_owned_ref.valid());
-  REQUIRE(parsed_owned_ref.owns_message());
+  REQUIRE(parsed_owned_ref.owns_storage());
   const auto parsed_owned_group = parsed_owned_ref.view().group(kNoPartyIDs);
   REQUIRE(parsed_owned_group.has_value());
   REQUIRE(parsed_owned_group->size() == 1U);

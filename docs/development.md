@@ -572,7 +572,7 @@ counterparty|name|session_id|profile_id|begin_string|sender|target|store_mode|st
 
 `dispatch_mode` is per-counterparty (`inline` or `queue`). `engine.queue_app_mode` is engine-wide (`co-scheduled` or `threaded`) and only affects counterparties that use queue dispatch. When every counterparty uses `inline`, `engine.queue_app_mode` has no effect.
 
-`SessionHandle::Snapshot()` / `Subscribe()` may be called from any thread. `SessionHandle::Send*()` / `SendEncoded*()` use a single-producer SPSC command queue per worker, so one producer thread must own a given handle's send path; a second producer thread will now get `kInvalidArgument`. `SendBorrowed*()` is narrower still: it is only valid inside inline runtime callbacks where the borrowed message/view lifetime is tied to the callback scope.
+`SessionHandle::Snapshot()` / `Subscribe()` may be called from any thread. `SessionHandle::SendCopy()` / `SendTake()` / `SendEncodedCopy()` / `SendEncodedTake()` use a single-producer SPSC command queue per worker, so one producer thread must own a given handle's send path; a second producer thread will now get `kInvalidArgument`. `SendInlineBorrowed()` / `SendEncodedInlineBorrowed()` are narrower still: they are only valid inside inline runtime callbacks where the borrowed message/view lifetime is tied to the callback scope.
 
 Ready-to-run examples live in:
 

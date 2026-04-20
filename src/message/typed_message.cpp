@@ -1,4 +1,4 @@
-#include "nimblefix/message/typed_message.h"
+#include "nimblefix/message/typed_message_view.h"
 
 #include <bit>
 

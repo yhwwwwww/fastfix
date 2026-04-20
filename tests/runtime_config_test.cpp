@@ -5,7 +5,7 @@
 #include <fstream>
 
 #include "nimblefix/codec/fix_codec.h"
-#include "nimblefix/message/message.h"
+#include "nimblefix/message/message_builder.h"
 #include "nimblefix/profile/artifact_builder.h"
 #include "nimblefix/profile/dictgen_input.h"
 #include "nimblefix/runtime/config.h"

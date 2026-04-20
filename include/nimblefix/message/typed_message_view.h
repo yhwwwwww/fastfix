@@ -7,7 +7,7 @@
 
 #include "nimblefix/base/result.h"
 #include "nimblefix/base/status.h"
-#include "nimblefix/message/message.h"
+#include "nimblefix/message/message_view.h"
 #include "nimblefix/profile/normalized_dictionary.h"
 
 namespace nimble::message {

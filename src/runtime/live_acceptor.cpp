@@ -197,14 +197,14 @@ public:
   {
   }
 
-  auto EnqueueSend(std::uint64_t session_id, message::MessageRef message) -> base::Status override
+  auto EnqueueOwnedMessage(std::uint64_t session_id, message::MessageRef message) -> base::Status override
   {
-    return EnqueueSendWithEnvelope(session_id, std::move(message), {});
+    return EnqueueOwnedMessageWithEnvelope(session_id, std::move(message), {});
   }
 
-  auto EnqueueSendWithEnvelope(std::uint64_t session_id,
-                               message::MessageRef message,
-                               session::SessionSendEnvelopeRef envelope) -> base::Status override
+  auto EnqueueOwnedMessageWithEnvelope(std::uint64_t session_id,
+                                       message::MessageRef message,
+                                       session::SessionSendEnvelopeRef envelope) -> base::Status override
   {
     if (!queue_.TryPush(OutboundCommand{
           .kind = OutboundCommandKind::kSendApplication,
@@ -219,14 +219,16 @@ public:
     return base::Status::Ok();
   }
 
-  auto EnqueueSendBorrowed(std::uint64_t session_id, const message::MessageRef& message) -> base::Result<bool> override
+  auto TrySendInlineBorrowedMessage(std::uint64_t session_id, const message::MessageRef& message)
+    -> base::Result<bool> override
   {
-    return EnqueueSendBorrowedWithEnvelope(session_id, message, {});
+    return TrySendInlineBorrowedMessageWithEnvelope(session_id, message, {});
   }
 
-  auto EnqueueSendBorrowedWithEnvelope(std::uint64_t session_id,
-                                       const message::MessageRef& message,
-                                       session::SessionSendEnvelopeView envelope) -> base::Result<bool> override
+  auto TrySendInlineBorrowedMessageWithEnvelope(std::uint64_t session_id,
+                                                const message::MessageRef& message,
+                                                session::SessionSendEnvelopeView envelope)
+    -> base::Result<bool> override
   {
     if (g_inline_borrow_send_sink != this) {
       return false;
@@ -244,15 +246,15 @@ public:
     return true;
   }
 
-  auto EnqueueSendEncoded(std::uint64_t session_id, session::EncodedApplicationMessageRef message)
+  auto EnqueueOwnedEncodedMessage(std::uint64_t session_id, session::EncodedApplicationMessageRef message)
     -> base::Status override
   {
-    return EnqueueSendEncodedWithEnvelope(session_id, std::move(message), {});
+    return EnqueueOwnedEncodedMessageWithEnvelope(session_id, std::move(message), {});
   }
 
-  auto EnqueueSendEncodedWithEnvelope(std::uint64_t session_id,
-                                      session::EncodedApplicationMessageRef message,
-                                      session::SessionSendEnvelopeRef envelope) -> base::Status override
+  auto EnqueueOwnedEncodedMessageWithEnvelope(std::uint64_t session_id,
+                                              session::EncodedApplicationMessageRef message,
+                                              session::SessionSendEnvelopeRef envelope) -> base::Status override
   {
     if (!queue_.TryPush(OutboundCommand{
           .kind = OutboundCommandKind::kSendEncodedApplication,
@@ -267,15 +269,17 @@ public:
     return base::Status::Ok();
   }
 
-  auto EnqueueSendEncodedBorrowed(std::uint64_t session_id, const session::EncodedApplicationMessageRef& message)
+  auto TrySendInlineBorrowedEncodedMessage(std::uint64_t session_id,
+                                           const session::EncodedApplicationMessageRef& message)
     -> base::Result<bool> override
   {
-    return EnqueueSendEncodedBorrowedWithEnvelope(session_id, message, {});
+    return TrySendInlineBorrowedEncodedMessageWithEnvelope(session_id, message, {});
   }
 
-  auto EnqueueSendEncodedBorrowedWithEnvelope(std::uint64_t session_id,
-                                              const session::EncodedApplicationMessageRef& message,
-                                              session::SessionSendEnvelopeView envelope) -> base::Result<bool> override
+  auto TrySendInlineBorrowedEncodedMessageWithEnvelope(std::uint64_t session_id,
+                                                       const session::EncodedApplicationMessageRef& message,
+                                                       session::SessionSendEnvelopeView envelope)
+    -> base::Result<bool> override
   {
     if (g_inline_borrow_send_sink != this) {
       return false;
@@ -1843,7 +1847,7 @@ LiveAcceptor::DispatchAdminMessage(const ActiveSession& session,
   const bool inline_mode = session.counterparty.dispatch_mode == AppDispatchMode::kInline;
   message::MessageRef owned_message;
   if (!inline_mode) {
-    owned_message = message::MessageRef::Own(message);
+    owned_message = message::MessageRef::Copy(message);
   }
 
   auto event = RuntimeEvent{
@@ -1851,7 +1855,7 @@ LiveAcceptor::DispatchAdminMessage(const ActiveSession& session,
     .session_event = SessionEventKind::kBound,
     .handle = session.handle,
     .session_key = session.counterparty.session.key,
-    .message = inline_mode ? message::MessageRef(message) : owned_message,
+    .message = inline_mode ? message::MessageRef::Borrow(message) : owned_message,
     .text = {},
     .timestamp_ns = timestamp_ns,
   };
@@ -1865,7 +1869,7 @@ LiveAcceptor::DispatchAdminMessage(const ActiveSession& session,
   }
   if (HasSessionSubscribers(session.counterparty.session.session_id)) {
     if (!owned_message.valid()) {
-      owned_message = message::MessageRef::Own(message);
+      owned_message = message::MessageRef::Copy(message);
     }
     PublishNotification(session::SessionNotification{
       .kind = session::SessionNotificationKind::kAdminMessage,
@@ -1889,14 +1893,14 @@ LiveAcceptor::DispatchAppMessage(ConnectionState& connection, message::MessageVi
   const bool inline_mode = connection.session->counterparty.dispatch_mode == AppDispatchMode::kInline;
   message::MessageRef owned_message;
   if (!inline_mode) {
-    owned_message = message::MessageRef::Own(message);
+    owned_message = message::MessageRef::Copy(message);
   }
   auto event = RuntimeEvent{
     .kind = RuntimeEventKind::kApplicationMessage,
     .session_event = SessionEventKind::kBound,
     .handle = connection.session->handle,
     .session_key = connection.session->counterparty.session.key,
-    .message = inline_mode ? message::MessageRef(message) : owned_message,
+    .message = inline_mode ? message::MessageRef::Borrow(message) : owned_message,
     .text = {},
     .timestamp_ns = timestamp_ns,
     .poss_resend = message.get_boolean(codec::tags::kPossResend).value_or(false),
@@ -1911,7 +1915,7 @@ LiveAcceptor::DispatchAppMessage(ConnectionState& connection, message::MessageVi
   }
   if (HasSessionSubscribers(connection.session->counterparty.session.session_id)) {
     if (!owned_message.valid()) {
-      owned_message = message::MessageRef::Own(message);
+      owned_message = message::MessageRef::Copy(message);
     }
     PublishNotification(session::SessionNotification{
       .kind = session::SessionNotificationKind::kApplicationMessage,

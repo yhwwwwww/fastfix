@@ -10,7 +10,7 @@
 #include <vector>
 
 #include "nimblefix/base/result.h"
-#include "nimblefix/message/message.h"
+#include "nimblefix/message/message_view.h"
 #include "nimblefix/profile/normalized_dictionary.h"
 
 namespace nimble::codec {

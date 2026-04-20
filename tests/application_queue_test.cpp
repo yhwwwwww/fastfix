@@ -4,6 +4,7 @@
 #include <thread>
 
 #include "nimblefix/codec/fix_tags.h"
+#include "nimblefix/message/message_builder.h"
 #include "nimblefix/runtime/application.h"
 #include "nimblefix/runtime/live_runtime_support.h"
 
@@ -14,7 +15,8 @@ namespace {
 class OwnedOnlyCommandSink final : public nimble::session::SessionCommandSink
 {
 public:
-  auto EnqueueSend(std::uint64_t session_id, nimble::message::MessageRef message) -> nimble::base::Status override
+  auto EnqueueOwnedMessage(std::uint64_t session_id, nimble::message::MessageRef message)
+    -> nimble::base::Status override
   {
     last_session_id_ = session_id;
     last_message_ = std::move(message);
@@ -47,14 +49,16 @@ private:
 class EncodedCommandSink final : public nimble::session::SessionCommandSink
 {
 public:
-  auto EnqueueSend(std::uint64_t session_id, nimble::message::MessageRef message) -> nimble::base::Status override
+  auto EnqueueOwnedMessage(std::uint64_t session_id, nimble::message::MessageRef message)
+    -> nimble::base::Status override
   {
-    return EnqueueSendWithEnvelope(session_id, std::move(message), {});
+    return EnqueueOwnedMessageWithEnvelope(session_id, std::move(message), {});
   }
 
-  auto EnqueueSendWithEnvelope(std::uint64_t session_id,
-                               nimble::message::MessageRef message,
-                               nimble::session::SessionSendEnvelopeRef envelope) -> nimble::base::Status override
+  auto EnqueueOwnedMessageWithEnvelope(std::uint64_t session_id,
+                                       nimble::message::MessageRef message,
+                                       nimble::session::SessionSendEnvelopeRef envelope)
+    -> nimble::base::Status override
   {
     last_session_id_ = session_id;
     last_message_ = std::move(message);
@@ -63,15 +67,16 @@ public:
     return nimble::base::Status::Ok();
   }
 
-  auto EnqueueSendEncoded(std::uint64_t session_id, nimble::session::EncodedApplicationMessageRef message)
+  auto EnqueueOwnedEncodedMessage(std::uint64_t session_id, nimble::session::EncodedApplicationMessageRef message)
     -> nimble::base::Status override
   {
-    return EnqueueSendEncodedWithEnvelope(session_id, std::move(message), {});
+    return EnqueueOwnedEncodedMessageWithEnvelope(session_id, std::move(message), {});
   }
 
-  auto EnqueueSendEncodedWithEnvelope(std::uint64_t session_id,
-                                      nimble::session::EncodedApplicationMessageRef message,
-                                      nimble::session::SessionSendEnvelopeRef envelope) -> nimble::base::Status override
+  auto EnqueueOwnedEncodedMessageWithEnvelope(std::uint64_t session_id,
+                                              nimble::session::EncodedApplicationMessageRef message,
+                                              nimble::session::SessionSendEnvelopeRef envelope)
+    -> nimble::base::Status override
   {
     last_session_id_ = session_id;
     last_encoded_message_ = std::move(message);
@@ -126,14 +131,16 @@ private:
 class SingleProducerCommandSink final : public nimble::session::SessionCommandSink
 {
 public:
-  auto EnqueueSend(std::uint64_t session_id, nimble::message::MessageRef message) -> nimble::base::Status override
+  auto EnqueueOwnedMessage(std::uint64_t session_id, nimble::message::MessageRef message)
+    -> nimble::base::Status override
   {
-    return EnqueueSendWithEnvelope(session_id, std::move(message), {});
+    return EnqueueOwnedMessageWithEnvelope(session_id, std::move(message), {});
   }
 
-  auto EnqueueSendWithEnvelope(std::uint64_t session_id,
-                               nimble::message::MessageRef message,
-                               nimble::session::SessionSendEnvelopeRef envelope) -> nimble::base::Status override
+  auto EnqueueOwnedMessageWithEnvelope(std::uint64_t session_id,
+                                       nimble::message::MessageRef message,
+                                       nimble::session::SessionSendEnvelopeRef envelope)
+    -> nimble::base::Status override
   {
     (void)session_id;
     (void)message;
@@ -311,11 +318,11 @@ TEST_CASE("application-queue", "[application-queue]")
     builder.set_string(nimble::codec::tags::kTargetCompID, "SELL");
     auto message = std::move(builder).build();
 
-    const auto borrowed = handle.SendBorrowed(message.view());
+    const auto borrowed = handle.SendInlineBorrowed(message.view());
     REQUIRE(borrowed.code() == nimble::base::ErrorCode::kInvalidArgument);
     REQUIRE(sink->enqueued() == 0U);
 
-    REQUIRE(handle.Send(message.view()).ok());
+    REQUIRE(handle.SendCopy(message.view()).ok());
     REQUIRE(sink->enqueued() == 1U);
   }
 
@@ -329,7 +336,7 @@ TEST_CASE("application-queue", "[application-queue]")
     plain_builder.set_string(nimble::codec::tags::kClOrdID, "ORD-PLAIN");
     auto plain_message = std::move(plain_builder).build();
 
-    REQUIRE(handle.Send(plain_message.view(), { .sender_sub_id = "DESK-1", .target_sub_id = "ROUTE-1" }).ok());
+    REQUIRE(handle.SendCopy(plain_message.view(), { .sender_sub_id = "DESK-1", .target_sub_id = "ROUTE-1" }).ok());
     REQUIRE(sink->plain_enqueued() == 1U);
     REQUIRE(sink->last_plain_envelope().sender_sub_id == "DESK-1");
     REQUIRE(sink->last_plain_envelope().target_sub_id == "ROUTE-1");
@@ -339,7 +346,7 @@ TEST_CASE("application-queue", "[application-queue]")
     nimble::session::EncodedApplicationMessage encoded(
       "D", std::span<const std::byte>(encoded_body.data(), encoded_body.size()));
 
-    REQUIRE(handle.SendEncoded(encoded, { .sender_sub_id = "DESK-9", .target_sub_id = "ROUTE-7" }).ok());
+    REQUIRE(handle.SendEncodedTake(std::move(encoded), { .sender_sub_id = "DESK-9", .target_sub_id = "ROUTE-7" }).ok());
     REQUIRE(sink->plain_enqueued() == 1U);
     REQUIRE(sink->encoded_enqueued() == 1U);
     REQUIRE(sink->last_encoded_view().msg_type == "D");
@@ -347,7 +354,7 @@ TEST_CASE("application-queue", "[application-queue]")
     REQUIRE(sink->last_encoded_envelope().sender_sub_id == "DESK-9");
     REQUIRE(sink->last_encoded_envelope().target_sub_id == "ROUTE-7");
 
-    const auto borrowed = handle.SendEncodedBorrowed(
+    const auto borrowed = handle.SendEncodedInlineBorrowed(
       nimble::session::EncodedApplicationMessageView{
         .msg_type = "D",
         .body = std::span<const std::byte>(encoded_body.data(), encoded_body.size()),
@@ -367,11 +374,11 @@ TEST_CASE("application-queue", "[application-queue]")
     builder.set_string(nimble::codec::tags::kClOrdID, "ORD-SP");
     const auto message = std::move(builder).build();
 
-    REQUIRE(handle.Send(message.view()).ok());
-    REQUIRE(handle.Send(message.view()).ok());
+    REQUIRE(handle.SendCopy(message.view()).ok());
+    REQUIRE(handle.SendCopy(message.view()).ok());
 
     nimble::base::Status cross_thread_status = nimble::base::Status::Ok();
-    std::jthread other_thread([&]() { cross_thread_status = handle.Send(message.view()); });
+    std::jthread other_thread([&]() { cross_thread_status = handle.SendCopy(message.view()); });
     other_thread.join();
 
     REQUIRE(cross_thread_status.code() == nimble::base::ErrorCode::kInvalidArgument);

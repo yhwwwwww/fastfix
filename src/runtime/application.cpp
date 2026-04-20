@@ -93,7 +93,7 @@ ApplicationCallbacks::OnAppMessage(const RuntimeEvent& event) -> base::Status
 auto
 EchoApplication::OnAppMessage(const RuntimeEvent& event) -> base::Status
 {
-  return event.handle.SendBorrowed(event.message);
+  return event.handle.SendInlineBorrowed(event.message_view());
 }
 
 struct QueueApplication::Impl

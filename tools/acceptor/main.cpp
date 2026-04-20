@@ -203,7 +203,7 @@ public:
     if (queue_sessions_.contains(event.handle.session_id())) {
       return queue_.OnAppMessage(event);
     }
-    return event.handle.Send(event.message);
+    return event.handle.SendInlineBorrowed(event.message_view());
   }
 
   auto queue_application() -> nimble::runtime::QueueApplication& override { return queue_; }
@@ -221,7 +221,7 @@ public:
     if (event.kind != nimble::runtime::RuntimeEventKind::kApplicationMessage) {
       return nimble::base::Status::Ok();
     }
-    return event.handle.Send(event.message);
+    return event.handle.SendInlineBorrowed(event.message_view());
   }
 };
 

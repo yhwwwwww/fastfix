@@ -11,6 +11,7 @@
 
 #include "nimblefix/codec/fix_codec.h"
 #include "nimblefix/codec/fix_tags.h"
+#include "nimblefix/message/message_builder.h"
 #include "nimblefix/session/admin_protocol.h"
 #include "nimblefix/session/session_core.h"
 #include "nimblefix/store/memory_store.h"

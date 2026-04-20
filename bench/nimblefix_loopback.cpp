@@ -58,7 +58,8 @@
 #include <unistd.h>
 
 #include "nimblefix/codec/fix_codec.h"
-#include "nimblefix/message/message.h"
+#include "nimblefix/message/message_builder.h"
+#include "nimblefix/message/message_view.h"
 #include "nimblefix/profile/normalized_dictionary.h"
 #include "nimblefix/profile/profile_loader.h"
 #include "nimblefix/session/admin_protocol.h"

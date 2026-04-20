@@ -89,22 +89,22 @@ class EncodedApplicationMessageRef
 public:
   EncodedApplicationMessageRef() = default;
 
-  explicit EncodedApplicationMessageRef(EncodedApplicationMessage message)
-    : owned_(std::make_shared<EncodedApplicationMessage>(std::move(message)))
+  static auto Take(EncodedApplicationMessage&& message) -> EncodedApplicationMessageRef
   {
+    return EncodedApplicationMessageRef(std::make_shared<EncodedApplicationMessage>(std::move(message)));
   }
 
-  explicit EncodedApplicationMessageRef(EncodedApplicationMessageView view)
-    : view_(view)
+  static auto Borrow(EncodedApplicationMessageView view) -> EncodedApplicationMessageRef
   {
+    return EncodedApplicationMessageRef(view);
   }
 
-  static auto Own(EncodedApplicationMessageView view) -> EncodedApplicationMessageRef
+  static auto Copy(EncodedApplicationMessageView view) -> EncodedApplicationMessageRef
   {
     if (!view.valid()) {
-      return EncodedApplicationMessageRef(view);
+      return Borrow(view);
     }
-    return EncodedApplicationMessageRef(EncodedApplicationMessage(view.msg_type, view.body));
+    return Take(EncodedApplicationMessage(view.msg_type, view.body));
   }
 
   [[nodiscard]] auto valid() const -> bool
@@ -115,7 +115,9 @@ public:
     return view_.valid();
   }
 
-  [[nodiscard]] auto owns_message() const -> bool { return owned_ != nullptr; }
+  [[nodiscard]] auto owns_storage() const -> bool { return owned_ != nullptr; }
+
+  [[nodiscard]] auto borrows_view() const -> bool { return owned_ == nullptr && view_.valid(); }
 
   [[nodiscard]] auto view() const -> EncodedApplicationMessageView
   {
@@ -126,6 +128,16 @@ public:
   }
 
 private:
+  explicit EncodedApplicationMessageRef(std::shared_ptr<const EncodedApplicationMessage> owned)
+    : owned_(std::move(owned))
+  {
+  }
+
+  explicit EncodedApplicationMessageRef(EncodedApplicationMessageView view)
+    : view_(view)
+  {
+  }
+
   std::shared_ptr<const EncodedApplicationMessage> owned_{};
   EncodedApplicationMessageView view_{};
 };

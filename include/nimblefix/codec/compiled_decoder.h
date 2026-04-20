@@ -3,12 +3,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <span>
 #include <string_view>
 #include <vector>
 
 #include "nimblefix/codec/fix_tags.h"
-#include "nimblefix/message/message.h"
+#include "nimblefix/message/message_structs.h"
 #include "nimblefix/profile/normalized_dictionary.h"
 
 namespace nimble::codec {

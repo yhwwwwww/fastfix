@@ -17,7 +17,7 @@
 #include "nimblefix/base/result.h"
 #include "nimblefix/base/spsc_queue.h"
 #include "nimblefix/base/status.h"
-#include "nimblefix/message/message.h"
+#include "nimblefix/message/message_ref.h"
 #include "nimblefix/profile/normalized_dictionary.h"
 #include "nimblefix/runtime/application.h"
 #include "nimblefix/runtime/config.h"
@@ -76,7 +76,7 @@ protected:
     {
     }
 
-    auto EnqueueSend(std::uint64_t session_id, message::MessageRef message) -> base::Status override
+    auto EnqueueOwnedMessage(std::uint64_t session_id, message::MessageRef message) -> base::Status override
     {
       if (!queue_.TryPush(OutboundCommand{
             .kind = OutboundCommandKind::kSendApplication,
@@ -90,7 +90,7 @@ protected:
       return base::Status::Ok();
     }
 
-    auto EnqueueSendBorrowed(std::uint64_t session_id, const message::MessageRef& message)
+    auto TrySendInlineBorrowedMessage(std::uint64_t session_id, const message::MessageRef& message)
       -> base::Result<bool> override;
 
     auto LoadSnapshot(std::uint64_t session_id) const -> base::Result<session::SessionSnapshot> override

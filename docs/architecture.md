@@ -678,7 +678,7 @@ All threads are `std::jthread` — calling `Stop()` or destroying the runtime jo
 
 When the front-door accepts a connection, it routes the connection to a worker via an inbox (mutex-protected push, then pipe-based wakeup). Once the worker adopts the connection, the front-door never touches it again.
 
-Cross-thread session access goes through `SessionHandle`. Query paths (`Snapshot()`, `Subscribe()`) are safe from any thread. Send paths (`Send*()` / `SendEncoded*()`) enqueue onto a per-worker SPSC queue and wake the target worker via its pipe fd. Each queue is single-producer: the first sending thread claims it, and later producer threads receive `kInvalidArgument` instead of silently violating the queue contract:
+Cross-thread session access goes through `SessionHandle`. Query paths (`Snapshot()`, `Subscribe()`) are safe from any thread. Send paths (`SendCopy()` / `SendTake()` / `SendEncodedCopy()` / `SendEncodedTake()`) enqueue onto a per-worker SPSC queue and wake the target worker via its pipe fd. Each queue is single-producer: the first sending thread claims it, and later producer threads receive `kInvalidArgument` instead of silently violating the queue contract:
 
 ```cpp
 // Safe query paths from any thread:
@@ -687,11 +687,11 @@ session_handle.Subscribe();
 
 // Cross-thread send path:
 // one producer thread per SessionHandle send queue.
-session_handle.Send(msg);
+session_handle.SendTake(std::move(msg));
 
 // Owning-worker / inline-callback only.
 // Outside inline callbacks this fast-fails.
-session_handle.SendBorrowed(view);
+session_handle.SendInlineBorrowed(view);
 message_view.get_string(11);             // Only within callback scope
 ```
 

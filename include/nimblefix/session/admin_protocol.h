@@ -15,7 +15,7 @@
 #include "nimblefix/base/result.h"
 #include "nimblefix/codec/compiled_decoder.h"
 #include "nimblefix/codec/fix_codec.h"
-#include "nimblefix/message/message.h"
+#include "nimblefix/message/message_ref.h"
 #include "nimblefix/profile/normalized_dictionary.h"
 #include "nimblefix/session/encoded_frame.h"
 #include "nimblefix/session/session_core.h"
@@ -389,12 +389,12 @@ struct ProtocolEvent
   auto MaterializeApplicationMessages() -> void
   {
     for (auto& message : application_messages) {
-      if (!message.valid() || message.owns_message()) {
+      if (!message.valid() || message.owns_storage()) {
         continue;
       }
-      message = message::MessageRef::Own(message.view());
+      message = message::MessageRef::Copy(message.view());
     }
-    if (!application_messages.empty() && application_messages.front().owns_message()) {
+    if (!application_messages.empty() && application_messages.front().owns_storage()) {
       owned_application_message_.reset();
     }
   }
@@ -412,7 +412,7 @@ struct ProtocolEvent
       return;
     }
     auto& message = application_messages.front();
-    if (!message.valid() || message.owns_message()) {
+    if (!message.valid() || message.owns_storage()) {
       return;
     }
 
@@ -421,7 +421,7 @@ struct ProtocolEvent
     parsed.RebindRaw(
       std::span<const std::byte>(owned_application_message_->raw.data(), owned_application_message_->raw.size()));
     owned_application_message_->parsed = std::move(parsed);
-    message = message::MessageRef(owned_application_message_->parsed.view());
+    message = message::MessageRef::Borrow(owned_application_message_->parsed.view());
   }
 
 private:
@@ -439,10 +439,10 @@ private:
     }
 
     auto& message = application_messages.front();
-    if (!message.valid() || message.owns_message()) {
+    if (!message.valid() || message.owns_storage()) {
       return;
     }
-    message = message::MessageRef(owned_application_message_->parsed.view());
+    message = message::MessageRef::Borrow(owned_application_message_->parsed.view());
   }
 
   std::optional<OwnedApplicationMessage> owned_application_message_;

@@ -1,4 +1,6 @@
-#include "nimblefix/message/message.h"
+#include "nimblefix/message/message_builder.h"
+
+#include "nimblefix/message/message_ref.h"
 
 #include <charconv>
 
@@ -651,43 +653,45 @@ MaterializeMessage(MessageView view) -> Message
   return Message(CopyViewToOwned(view));
 }
 
-MessageRef::MessageRef(Message message)
-  : owned_(std::make_shared<Message>(std::move(message)))
-{
-}
-
-MessageRef::MessageRef(MessageView view)
-  : view_(view)
-{
-}
-
 MessageRef::~MessageRef() = default;
 
 auto
-MessageRef::Own(MessageView view) -> MessageRef
+MessageRef::Take(Message&& message) -> MessageRef
+{
+  return MessageRef(std::make_shared<Message>(std::move(message)));
+}
+
+auto
+MessageRef::Borrow(MessageView view) -> MessageRef
+{
+  return MessageRef(view);
+}
+
+auto
+MessageRef::Copy(MessageView view) -> MessageRef
 {
   if (!view.valid()) {
-    return MessageRef(view);
+    return Borrow(view);
   }
 
   if (view.parsed_ != nullptr && view.parsed_entry_ == &view.parsed_->root) {
     ParsedMessageData copied = *view.parsed_;
-    return OwnParsed(ParsedMessage(std::move(copied)), view.parsed_->raw);
+    return CopyParsed(ParsedMessage(std::move(copied)), view.parsed_->raw);
   }
 
-  return MessageRef(MaterializeMessage(view));
+  return Take(MaterializeMessage(view));
 }
 
 auto
-MessageRef::OwnParsed(ParsedMessage parsed, std::span<const std::byte> raw) -> MessageRef
+MessageRef::CopyParsed(ParsedMessage parsed, std::span<const std::byte> raw) -> MessageRef
 {
   std::vector<std::byte> owned_raw;
   owned_raw.assign(raw.begin(), raw.end());
-  return OwnParsed(std::move(parsed), std::move(owned_raw));
+  return TakeParsed(std::move(parsed), std::move(owned_raw));
 }
 
 auto
-MessageRef::OwnParsed(ParsedMessage parsed, std::vector<std::byte> raw) -> MessageRef
+MessageRef::TakeParsed(ParsedMessage parsed, std::vector<std::byte>&& raw) -> MessageRef
 {
   auto storage = std::make_shared<ParsedStorage>();
   storage->raw = std::move(raw);
@@ -707,7 +711,7 @@ auto
 MessageRef::operator=(MessageRef&& other) noexcept -> MessageRef& = default;
 
 auto
-MessageRef::ToOwned() const -> Message
+MessageRef::CopyToOwned() const -> Message
 {
   if (owned_ != nullptr) {
     return Message(owned_->data());

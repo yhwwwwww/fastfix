@@ -77,8 +77,8 @@ MakeProtocolConfig(const CounterpartyConfig& counterparty) -> session::AdminProt
 // --------------------------------------------------------------------------
 
 auto
-LiveSessionWorker::CommandSink::EnqueueSendBorrowed(std::uint64_t session_id, const message::MessageRef& message)
-  -> base::Result<bool>
+LiveSessionWorker::CommandSink::TrySendInlineBorrowedMessage(std::uint64_t session_id,
+                                                             const message::MessageRef& message) -> base::Result<bool>
 {
   if (g_inline_borrow_send_sink != this) {
     return false;
@@ -356,14 +356,14 @@ LiveSessionWorker::DispatchAdminMessage(const ActiveSession& session,
   const bool inline_mode = session.counterparty.dispatch_mode == AppDispatchMode::kInline;
   message::MessageRef owned_message;
   if (!inline_mode) {
-    owned_message = message::MessageRef::Own(message);
+    owned_message = message::MessageRef::Copy(message);
   }
   auto event = RuntimeEvent{
     .kind = RuntimeEventKind::kAdminMessage,
     .session_event = SessionEventKind::kBound,
     .handle = session.handle,
     .session_key = session.counterparty.session.key,
-    .message = inline_mode ? message::MessageRef(message) : owned_message,
+    .message = inline_mode ? message::MessageRef::Borrow(message) : owned_message,
     .text = {},
     .timestamp_ns = timestamp_ns,
   };
@@ -377,7 +377,7 @@ LiveSessionWorker::DispatchAdminMessage(const ActiveSession& session,
   }
   if (HasSessionSubscribers(session.counterparty.session.session_id)) {
     if (!owned_message.valid()) {
-      owned_message = message::MessageRef::Own(message);
+      owned_message = message::MessageRef::Copy(message);
     }
     PublishNotification(session::SessionNotification{
       .kind = session::SessionNotificationKind::kAdminMessage,
@@ -402,14 +402,14 @@ LiveSessionWorker::DispatchAppMessage(ConnectionState& connection,
   const bool inline_mode = connection.session->counterparty.dispatch_mode == AppDispatchMode::kInline;
   message::MessageRef owned_message;
   if (!inline_mode) {
-    owned_message = message::MessageRef::Own(message);
+    owned_message = message::MessageRef::Copy(message);
   }
   auto event = RuntimeEvent{
     .kind = RuntimeEventKind::kApplicationMessage,
     .session_event = SessionEventKind::kBound,
     .handle = connection.session->handle,
     .session_key = connection.session->counterparty.session.key,
-    .message = inline_mode ? message::MessageRef(message) : owned_message,
+    .message = inline_mode ? message::MessageRef::Borrow(message) : owned_message,
     .text = {},
     .timestamp_ns = timestamp_ns,
     .poss_resend = message.get_boolean(codec::tags::kPossResend).value_or(false),
@@ -424,7 +424,7 @@ LiveSessionWorker::DispatchAppMessage(ConnectionState& connection,
   }
   if (HasSessionSubscribers(connection.session->counterparty.session.session_id)) {
     if (!owned_message.valid()) {
-      owned_message = message::MessageRef::Own(message);
+      owned_message = message::MessageRef::Copy(message);
     }
     PublishNotification(session::SessionNotification{
       .kind = session::SessionNotificationKind::kApplicationMessage,

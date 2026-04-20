@@ -4,7 +4,8 @@
 
 #include "nimblefix/codec/fix_codec.h"
 #include "nimblefix/codec/fix_tags.h"
-#include "nimblefix/message/typed_message.h"
+#include "nimblefix/message/message_builder.h"
+#include "nimblefix/message/typed_message_view.h"
 #include "nimblefix/profile/artifact_builder.h"
 #include "nimblefix/profile/dictgen_input.h"
 #include "nimblefix/profile/normalized_dictionary.h"

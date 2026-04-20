@@ -11,7 +11,7 @@
 
 #include "nimblefix/base/result.h"
 #include "nimblefix/base/status.h"
-#include "nimblefix/message/message.h"
+#include "nimblefix/message/message_ref.h"
 #include "nimblefix/session/session_handle.h"
 #include "nimblefix/session/session_key.h"
 

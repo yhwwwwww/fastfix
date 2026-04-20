@@ -10,7 +10,8 @@
 #include "nimblefix/codec/fix_tags.h"
 #include "nimblefix/codec/raw_passthrough.h"
 #include "nimblefix/codec/simd_scan.h"
-#include "nimblefix/message/typed_message.h"
+#include "nimblefix/message/message_builder.h"
+#include "nimblefix/message/typed_message_view.h"
 
 namespace nimble::session {
 
@@ -1209,7 +1210,7 @@ AdminProtocol::OnInbound(std::span<const std::byte> frame, std::uint64_t timesta
   }
   if (event.value().application_messages.size() == 1U) {
     auto& message = event.value().application_messages.front();
-    if (message.valid() && !message.owns_message()) {
+    if (message.valid() && !message.owns_storage()) {
       event.value().AdoptParsedApplicationMessage(std::move(inbound_decode_scratch_.message),
                                                   inbound_decode_scratch_.raw);
     }
@@ -1237,7 +1238,7 @@ AdminProtocol::OnInbound(std::vector<std::byte>&& frame, std::uint64_t timestamp
   }
   if (event.value().application_messages.size() == 1U) {
     auto& message = event.value().application_messages.front();
-    if (message.valid() && !message.owns_message()) {
+    if (message.valid() && !message.owns_storage()) {
       event.value().AdoptParsedApplicationMessage(std::move(inbound_decode_scratch_.message), std::move(frame));
     }
   } else {
@@ -1643,7 +1644,7 @@ AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uint64_t
 
   if (msg_type == "3") {
     event.session_reject = true;
-    event.application_messages.push_back(message::MessageRef(decoded.message.view()));
+    event.application_messages.push_back(message::MessageRef::Borrow(decoded.message.view()));
     return event;
   }
 
@@ -1659,7 +1660,7 @@ AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uint64_t
     return RejectInbound(decoded, ref_tag_id, reject_reason, std::move(reject_text), timestamp_ns, false);
   }
 
-  event.application_messages.push_back(message::MessageRef(decoded.message.view()));
+  event.application_messages.push_back(message::MessageRef::Borrow(decoded.message.view()));
   if (HasBoolean(view, kPossResend)) {
     event.poss_resend = true;
   }
@@ -1923,7 +1924,7 @@ AdminProtocol::DrainDeferredGapFrames(std::uint64_t timestamp_ns, ProtocolEvent*
     auto& inner = result.value();
     if (inner.application_messages.size() == 1U) {
       auto& message = inner.application_messages.front();
-      if (message.valid() && !message.owns_message()) {
+      if (message.valid() && !message.owns_storage()) {
         inner.AdoptParsedApplicationMessage(std::move(decoded.message), std::move(frame));
       }
     } else {
