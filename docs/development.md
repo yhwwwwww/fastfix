@@ -94,19 +94,21 @@ Initialize them with `git submodule update --init --recursive` before the first 
 ## Source Layout
 
 ```
-include/nimblefix/
-├── base/       Status, Result, SpscQueue, InlineSplitVector
-├── codec/      DecodeFixMessageView, EncodeFixMessage, SIMD scan, FrameEncodeTemplate
-├── message/    Message, MessageView, MessageBuilder, TypedMessageView, FixedLayoutWriter, GroupView
-├── profile/    LoadedProfile, NormalizedDictionaryView, ProfileLoader
-├── session/    SessionCore, AdminProtocol, ResendRecovery
-├── store/      MemorySessionStore, MmapSessionStore, DurableBatchSessionStore
-├── transport/  TcpConnection, TcpAcceptor
-└── runtime/    Engine, LiveInitiator, LiveAcceptor, ShardedRuntime, ProfileRegistry,
-                TimerWheel, Metrics, Trace, ShardPoller
+include/
+├── public/nimblefix/
+│   ├── base/       Exported Status / Result surface
+│   ├── codec/      Exported codec entry points
+│   ├── message/    Exported message APIs
+│   ├── profile/    Exported profile loading/query APIs
+│   ├── session/    Exported session APIs
+│   ├── store/      Exported store interfaces and implementations
+│   ├── transport/  Exported transport surface
+│   └── runtime/    Exported engine/runtime APIs
+└── internal/nimblefix/
+    └── ...         Repository-private headers for implementation, tests, and tools
 ```
 
-The canonical public headers live under `include/nimblefix/`. Each module has a corresponding source directory under `src/` and tests under `tests/`.
+The canonical exported headers live under `include/public/nimblefix/`. Repository-private headers live under `include/internal/nimblefix/`. Each module still has a corresponding source directory under `src/` and tests under `tests/`.
 
 ---
 
@@ -678,4 +680,4 @@ Set `ValidationPolicy` on session config:
 - **Memory**: Zero-copy views on the hot path. Owned `Message` only when mutation is needed.
 - **Threading**: Single-writer per session. Cross-thread via `SpscQueue`. Mutexes only for cold-path operations.
 - **Naming**: `snake_case` for functions and variables, `PascalCase` for types, `kPascalCase` for enum values.
-- **Headers**: Public headers live under `include/nimblefix/`. Internal helpers stay in `src/`.
+- **Headers**: Exported headers live under `include/public/nimblefix/`. Repository-private headers live under `include/internal/nimblefix/` and are allowed only for NimbleFIX itself, tests, and internal tools.

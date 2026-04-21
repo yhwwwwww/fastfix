@@ -24,6 +24,8 @@ include(CheckIncludeFileCXX)
 find_package(Threads REQUIRED)
 
 set(NIMBLEFIX_PROJECT_ROOT "${PROJECT_SOURCE_DIR}")
+set(NIMBLEFIX_PUBLIC_INCLUDE_DIR "${PROJECT_SOURCE_DIR}/include/public")
+set(NIMBLEFIX_INTERNAL_INCLUDE_DIR "${PROJECT_SOURCE_DIR}/include/internal")
 set(NIMBLEFIX_VENDOR_HINT "Run 'git submodule update --init --recursive'.")
 set(NIMBLEFIX_CATCH2_ROOT "${PROJECT_SOURCE_DIR}/deps/src/Catch2")
 set(NIMBLEFIX_CATCH2_OVERRIDE_DIR "${PROJECT_SOURCE_DIR}/deps/include")
@@ -101,7 +103,9 @@ file(GLOB NIMBLEFIX_LIBRARY_SOURCES CONFIGURE_DEPENDS
 add_library(nimblefix STATIC ${NIMBLEFIX_LIBRARY_SOURCES})
 target_include_directories(nimblefix
     PUBLIC
-        "${PROJECT_SOURCE_DIR}/include"
+        "${NIMBLEFIX_PUBLIC_INCLUDE_DIR}"
+    PRIVATE
+        "${NIMBLEFIX_INTERNAL_INCLUDE_DIR}"
 )
 target_compile_definitions(nimblefix
     PUBLIC
@@ -118,7 +122,29 @@ endif()
 function(nimblefix_add_binary target_name)
     add_executable(${target_name} ${ARGN})
     target_link_libraries(${target_name} PRIVATE nimblefix)
+    target_include_directories(${target_name}
+        PRIVATE
+            "${NIMBLEFIX_PUBLIC_INCLUDE_DIR}"
+            "${NIMBLEFIX_INTERNAL_INCLUDE_DIR}"
+    )
 endfunction()
+
+function(nimblefix_add_internal_headers target_name)
+    target_include_directories(${target_name}
+        PRIVATE
+            "${NIMBLEFIX_PUBLIC_INCLUDE_DIR}"
+            "${NIMBLEFIX_INTERNAL_INCLUDE_DIR}"
+    )
+endfunction()
+
+install(TARGETS nimblefix
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+)
+install(DIRECTORY "${NIMBLEFIX_PUBLIC_INCLUDE_DIR}/"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+)
 
 file(GLOB NIMBLEFIX_DICTGEN_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/tools/dictgen/*.cpp"
@@ -130,6 +156,7 @@ file(GLOB NIMBLEFIX_XML2FFD_SOURCES CONFIGURE_DEPENDS
 )
 add_executable(nimblefix-xml2ffd ${NIMBLEFIX_XML2FFD_SOURCES})
 target_link_libraries(nimblefix-xml2ffd PRIVATE nimblefix nimblefix-thirdparty-pugixml)
+nimblefix_add_internal_headers(nimblefix-xml2ffd)
 
 if(NIMBLEFIX_BUILD_TOOLS)
     file(GLOB NIMBLEFIX_INTEROP_RUNNER_SOURCES CONFIGURE_DEPENDS
@@ -168,6 +195,7 @@ if(NIMBLEFIX_BUILD_FUZZERS)
         "${PROJECT_SOURCE_DIR}/tools/fuzz-codec/main.cpp"
     )
     target_link_libraries(nimblefix-fuzz-codec PRIVATE nimblefix)
+    nimblefix_add_internal_headers(nimblefix-fuzz-codec)
 endif()
 
 if(NIMBLEFIX_BUILD_LIBFUZZER)
@@ -175,6 +203,7 @@ if(NIMBLEFIX_BUILD_LIBFUZZER)
         "${PROJECT_SOURCE_DIR}/tools/fuzz-codec/fuzz_entry.cpp"
     )
     target_link_libraries(nimblefix-fuzz-codec-libfuzzer PRIVATE nimblefix)
+    nimblefix_add_internal_headers(nimblefix-fuzz-codec-libfuzzer)
     target_compile_options(nimblefix-fuzz-codec-libfuzzer PRIVATE -fsanitize=fuzzer)
     target_link_options(nimblefix-fuzz-codec-libfuzzer PRIVATE -fsanitize=fuzzer)
 endif()
@@ -248,6 +277,7 @@ if(NIMBLEFIX_BUILD_BENCHMARKS)
     )
     target_link_libraries(nimblefix-bench PRIVATE nimblefix)
     target_include_directories(nimblefix-bench PRIVATE "${NIMBLEFIX_GENERATED_DIR}")
+    nimblefix_add_internal_headers(nimblefix-bench)
     add_dependencies(nimblefix-bench nimblefix-fix44-assets)
 
     if(WIN32)
@@ -319,6 +349,7 @@ if(NIMBLEFIX_BUILD_BENCHMARKS)
         PRIVATE
             "${PROJECT_SOURCE_DIR}/bench"
     )
+    nimblefix_add_internal_headers(nimblefix-quickfix-cpp-bench)
     target_link_libraries(nimblefix-quickfix-cpp-bench PRIVATE nimblefix-vendor-quickfix Threads::Threads)
 
     # Two-process loopback benchmark: NimbleFIX
@@ -327,6 +358,7 @@ if(NIMBLEFIX_BUILD_BENCHMARKS)
     )
     target_link_libraries(nimblefix-loopback PRIVATE nimblefix)
     target_include_directories(nimblefix-loopback PRIVATE "${NIMBLEFIX_GENERATED_DIR}")
+    nimblefix_add_internal_headers(nimblefix-loopback)
     add_dependencies(nimblefix-loopback nimblefix-fix44-assets)
 
     # Raw TCP RTT benchmark (no FIX protocol)
@@ -365,6 +397,7 @@ if(NIMBLEFIX_BUILD_TESTS)
             nimblefix-thirdparty-catch2-main
             nimblefix-thirdparty-pugixml
     )
+    nimblefix_add_internal_headers(nimblefix-tests)
     add_dependencies(nimblefix-tests nimblefix-generated-assets)
     add_test(NAME nimblefix-tests COMMAND nimblefix-tests)
 endif()

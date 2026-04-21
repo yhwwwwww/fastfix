@@ -1,23 +1,34 @@
 #include "nimblefix/runtime/live_initiator.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "nimblefix/base/spsc_queue.h"
 #include "nimblefix/codec/fix_tags.h"
+#include "nimblefix/runtime/engine.h"
+#include "nimblefix/runtime/live_session_registry.h"
 #include "nimblefix/runtime/live_runtime_support.h"
+#include "nimblefix/runtime/shard_poller.h"
 #include "nimblefix/runtime/thread_affinity.h"
+#include "nimblefix/session/admin_protocol.h"
 #include "nimblefix/store/durable_batch_store.h"
 #include "nimblefix/store/memory_store.h"
 #include "nimblefix/store/mmap_store.h"
+#include "nimblefix/store/session_store.h"
+#include "nimblefix/transport/tcp_transport.h"
 
 namespace nimble::runtime {
 
@@ -171,6 +182,78 @@ struct OutboundCommand
 };
 
 } // namespace
+
+struct LiveInitiator::ActiveSession
+{
+  CounterpartyConfig counterparty;
+  std::uint32_t worker_id{ 0 };
+  session::SessionHandle handle;
+  std::unique_ptr<profile::NormalizedDictionaryView> dictionary;
+  std::unique_ptr<store::SessionStore> store;
+  std::optional<session::AdminProtocol> protocol;
+  std::string host;
+  std::uint16_t port{ 0 };
+};
+
+struct LiveInitiator::ConnectionState
+{
+  std::uint64_t connection_id{ 0 };
+  transport::TcpConnection connection;
+  std::unique_ptr<ActiveSession> session;
+  std::uint64_t last_progress_ns{ 0 };
+  std::optional<RuntimeEvent> pending_app_event;
+  bool close_requested{ false };
+  bool count_completion{ false };
+  std::string close_reason;
+};
+
+struct LiveInitiator::PendingReconnect
+{
+  std::uint64_t session_id{ 0 };
+  std::string host;
+  std::uint16_t port{ 0 };
+  std::uint32_t retry_count{ 0 };
+  std::uint32_t current_backoff_ms{ 0 };
+  std::uint64_t next_attempt_ns{ 0 };
+  bool session_registered{ false };
+  std::unique_ptr<ActiveSession> session;
+};
+
+struct LiveInitiator::WorkerInbox
+{
+  std::mutex mutex;
+  std::vector<ConnectionState> pending_connections;
+};
+
+struct LiveInitiator::WorkerShardState
+{
+  std::uint32_t worker_id{ 0 };
+  std::vector<ConnectionState> connections;
+  ShardPoller poller{};
+  std::unordered_map<std::uint64_t, std::size_t> connection_indices;
+  std::unordered_map<std::uint64_t, std::size_t> session_connection_indices;
+  std::shared_ptr<CommandSink> command_sink;
+  std::unique_ptr<WorkerInbox> inbox;
+  std::vector<PendingReconnect> pending_reconnects;
+  ShardPoller::IoReadyState io_ready_state;
+};
+
+struct LiveInitiator::Impl
+{
+  Engine* engine{ nullptr };
+  Options options{};
+  std::vector<WorkerShardState> worker_shards;
+  std::vector<std::jthread> worker_threads;
+  mutable std::mutex control_mutex;
+  std::unordered_map<std::uint64_t, std::uint32_t> session_worker_ids;
+  LiveSessionRegistry session_registry;
+  std::atomic<std::uint64_t> next_connection_id{ 1 };
+  std::atomic<std::size_t> active_connection_count{ 0 };
+  std::atomic<std::uint64_t> last_progress_ns{ 0 };
+  std::atomic<std::size_t> completed_sessions{ 0 };
+  std::atomic<std::size_t> pending_reconnect_count{ 0 };
+  std::atomic<bool> stop_requested{ false };
+};
 
 class LiveInitiator::CommandSink final : public session::SessionCommandSink
 {
@@ -349,18 +432,51 @@ LiveInitiator::LiveInitiator(Engine* engine)
 }
 
 LiveInitiator::LiveInitiator(Engine* engine, Options options)
-  : engine_(engine)
-  , options_(std::move(options))
+  : impl_(std::make_unique<Impl>())
 {
+  impl_->engine = engine;
+  impl_->options = std::move(options);
 }
 
 LiveInitiator::~LiveInitiator()
 {
   Stop();
-  if (engine_ != nullptr) {
-    static_cast<void>(engine_->ReleaseManagedQueueRunner(this));
+  if (impl_->engine != nullptr) {
+    static_cast<void>(impl_->engine->ReleaseManagedQueueRunner(this));
   }
 }
+
+auto
+LiveInitiator::active_connection_count() const -> std::size_t
+{
+  return impl_->active_connection_count.load(std::memory_order_relaxed);
+}
+
+auto
+LiveInitiator::completed_session_count() const -> std::size_t
+{
+  return impl_->completed_sessions.load(std::memory_order_relaxed);
+}
+
+auto
+LiveInitiator::pending_reconnect_count() const -> std::size_t
+{
+  return impl_->pending_reconnect_count.load(std::memory_order_relaxed);
+}
+
+#define engine_ impl_->engine
+#define options_ impl_->options
+#define worker_shards_ impl_->worker_shards
+#define worker_threads_ impl_->worker_threads
+#define control_mutex_ impl_->control_mutex
+#define session_worker_ids_ impl_->session_worker_ids
+#define session_registry_ impl_->session_registry
+#define next_connection_id_ impl_->next_connection_id
+#define active_connection_count_ impl_->active_connection_count
+#define last_progress_ns_ impl_->last_progress_ns
+#define completed_sessions_ impl_->completed_sessions
+#define pending_reconnect_count_ impl_->pending_reconnect_count
+#define stop_requested_ impl_->stop_requested
 
 auto
 LiveInitiator::EnsureManagedQueueRunnerStarted() -> base::Status
@@ -635,15 +751,15 @@ LiveInitiator::OpenSession(std::uint64_t session_id, std::string host, std::uint
     return dictionary.status();
   }
 
-  auto active = MakeActiveSession(*counterparty, std::move(dictionary).value(), std::move(host), port);
-  if (!active.ok()) {
-    return active.status();
+  auto session_state = MakeActiveSession(*counterparty, std::move(dictionary).value(), std::move(host), port);
+  if (!session_state.ok()) {
+    return session_state.status();
   }
 
-  auto session_state = std::move(active).value();
-  session_state.worker_id = ResolveWorkerId(session_state.worker_id);
+  auto active_session = std::move(session_state).value();
+  active_session->worker_id = ResolveWorkerId(active_session->worker_id);
 
-  auto* shard = FindWorkerShard(session_state.worker_id);
+  auto* shard = FindWorkerShard(active_session->worker_id);
   if (shard == nullptr) {
     return base::Status::NotFound("initiator worker shard was not found");
   }
@@ -652,31 +768,31 @@ LiveInitiator::OpenSession(std::uint64_t session_id, std::string host, std::uint
   if (shard->command_sink != nullptr) {
     command_sink = shard->command_sink;
   }
-  session_state.handle = session::SessionHandle(
-    session_state.counterparty.session.session_id, session_state.worker_id, std::move(command_sink));
+  active_session->handle = session::SessionHandle(
+    active_session->counterparty.session.session_id, active_session->worker_id, std::move(command_sink));
 
   const auto timestamp_ns = NowNs();
   const auto wall_now_ns = WallClockNowNs();
-  if (!IsWithinLogonWindow(session_state.counterparty.session_schedule, wall_now_ns)) {
-    if (!RegisterActiveSession(session_state.counterparty.session.session_id)) {
+  if (!IsWithinLogonWindow(active_session->counterparty.session_schedule, wall_now_ns)) {
+    if (!RegisterActiveSession(active_session->counterparty.session.session_id)) {
       return base::Status::AlreadyExists("initiator session already has an active transport connection");
     }
     {
       std::lock_guard lock(control_mutex_);
-      session_worker_ids_[session_state.counterparty.session.session_id] = session_state.worker_id;
+      session_worker_ids_[active_session->counterparty.session.session_id] = active_session->worker_id;
     }
     session_registry_.ClearTerminalStatus();
-    UpdateSessionSnapshot(session_state);
+    UpdateSessionSnapshot(*active_session);
 
     shard->pending_reconnects.push_back(PendingReconnect{
-      .session_id = session_state.counterparty.session.session_id,
-      .host = session_state.host,
-      .port = session_state.port,
+      .session_id = active_session->counterparty.session.session_id,
+      .host = active_session->host,
+      .port = active_session->port,
       .retry_count = 0,
-      .current_backoff_ms = session_state.counterparty.reconnect_initial_ms,
-      .next_attempt_ns = ComputeScheduledAttemptNs(session_state.counterparty, timestamp_ns, wall_now_ns, 0U),
+      .current_backoff_ms = active_session->counterparty.reconnect_initial_ms,
+      .next_attempt_ns = ComputeScheduledAttemptNs(active_session->counterparty, timestamp_ns, wall_now_ns, 0U),
       .session_registered = true,
-      .session = std::make_unique<ActiveSession>(std::move(session_state)),
+      .session = std::move(active_session),
     });
     pending_reconnect_count_.fetch_add(1U);
     last_progress_ns_.store(timestamp_ns);
@@ -691,12 +807,12 @@ LiveInitiator::OpenSession(std::uint64_t session_id, std::string host, std::uint
     return base::Status::Ok();
   }
 
-  auto connection = transport::TcpConnection::Connect(session_state.host, session_state.port, options_.io_timeout);
+  auto connection = transport::TcpConnection::Connect(active_session->host, active_session->port, options_.io_timeout);
   if (!connection.ok()) {
     return connection.status();
   }
 
-  auto start = session_state.protocol->OnTransportConnected(timestamp_ns);
+  auto start = active_session->protocol->OnTransportConnected(timestamp_ns);
   if (!start.ok()) {
     return start.status();
   }
@@ -704,7 +820,7 @@ LiveInitiator::OpenSession(std::uint64_t session_id, std::string host, std::uint
   ConnectionState state{
     .connection_id = next_connection_id_.fetch_add(1U, std::memory_order_relaxed),
     .connection = std::move(connection).value(),
-    .session = std::make_unique<ActiveSession>(std::move(session_state)),
+    .session = std::move(active_session),
     .last_progress_ns = timestamp_ns,
   };
 
@@ -787,15 +903,15 @@ LiveInitiator::OpenSessionAsync(std::uint64_t session_id, std::string host, std:
     return dictionary.status();
   }
 
-  auto active = MakeActiveSession(*counterparty, std::move(dictionary).value(), std::move(host), port);
-  if (!active.ok()) {
-    return active.status();
+  auto session_state = MakeActiveSession(*counterparty, std::move(dictionary).value(), std::move(host), port);
+  if (!session_state.ok()) {
+    return session_state.status();
   }
 
-  auto session_state = std::move(active).value();
-  session_state.worker_id = ResolveWorkerId(session_state.worker_id);
+  auto active_session = std::move(session_state).value();
+  active_session->worker_id = ResolveWorkerId(active_session->worker_id);
 
-  auto* shard = FindWorkerShard(session_state.worker_id);
+  auto* shard = FindWorkerShard(active_session->worker_id);
   if (shard == nullptr) {
     return base::Status::NotFound("initiator worker shard was not found");
   }
@@ -804,34 +920,34 @@ LiveInitiator::OpenSessionAsync(std::uint64_t session_id, std::string host, std:
   if (shard->command_sink != nullptr) {
     command_sink = shard->command_sink;
   }
-  session_state.handle = session::SessionHandle(
-    session_state.counterparty.session.session_id, session_state.worker_id, std::move(command_sink));
+  active_session->handle = session::SessionHandle(
+    active_session->counterparty.session.session_id, active_session->worker_id, std::move(command_sink));
 
   const auto timestamp_ns = NowNs();
   const auto wall_now_ns = WallClockNowNs();
-  const auto next_attempt_ns = IsWithinLogonWindow(session_state.counterparty.session_schedule, wall_now_ns)
+  const auto next_attempt_ns = IsWithinLogonWindow(active_session->counterparty.session_schedule, wall_now_ns)
                                  ? timestamp_ns
-                                 : ComputeScheduledAttemptNs(session_state.counterparty, timestamp_ns, wall_now_ns, 0U);
+                                 : ComputeScheduledAttemptNs(active_session->counterparty, timestamp_ns, wall_now_ns, 0U);
 
-  if (!RegisterActiveSession(session_state.counterparty.session.session_id)) {
+  if (!RegisterActiveSession(active_session->counterparty.session.session_id)) {
     return base::Status::AlreadyExists("initiator session already has an active transport connection");
   }
   {
     std::lock_guard lock(control_mutex_);
-    session_worker_ids_[session_state.counterparty.session.session_id] = session_state.worker_id;
+    session_worker_ids_[active_session->counterparty.session.session_id] = active_session->worker_id;
   }
   session_registry_.ClearTerminalStatus();
-  UpdateSessionSnapshot(session_state);
+  UpdateSessionSnapshot(*active_session);
 
   shard->pending_reconnects.push_back(PendingReconnect{
-    .session_id = session_state.counterparty.session.session_id,
-    .host = session_state.host,
-    .port = session_state.port,
+    .session_id = active_session->counterparty.session.session_id,
+    .host = active_session->host,
+    .port = active_session->port,
     .retry_count = 0,
-    .current_backoff_ms = session_state.counterparty.reconnect_initial_ms,
+    .current_backoff_ms = active_session->counterparty.reconnect_initial_ms,
     .next_attempt_ns = next_attempt_ns,
     .session_registered = true,
-    .session = std::make_unique<ActiveSession>(std::move(session_state)),
+    .session = std::move(active_session),
   });
   pending_reconnect_count_.fetch_add(1U);
   last_progress_ns_.store(timestamp_ns);
@@ -1793,7 +1909,7 @@ LiveInitiator::SendFrame(ConnectionState& connection, const session::EncodedFram
 
 auto
 LiveInitiator::SendFrames(ConnectionState& connection,
-                          const session::ProtocolFrameList& frames,
+                          const session::ProtocolFrameCollection& frames,
                           std::uint64_t timestamp_ns) -> base::Status
 {
   for (const auto& frame : frames) {
@@ -1807,7 +1923,7 @@ LiveInitiator::SendFrames(ConnectionState& connection,
 
 auto
 LiveInitiator::SendFramesBatch(ConnectionState& connection,
-                               const session::ProtocolFrameList& frames,
+                               const session::ProtocolFrameCollection& frames,
                                std::uint64_t timestamp_ns) -> base::Status
 {
   if (frames.size() <= 1U) {
@@ -2141,7 +2257,7 @@ auto
 LiveInitiator::MakeActiveSession(const CounterpartyConfig& counterparty,
                                  profile::NormalizedDictionaryView dictionary,
                                  std::string host,
-                                 std::uint16_t port) const -> base::Result<ActiveSession>
+                                 std::uint16_t port) const -> base::Result<std::unique_ptr<ActiveSession>>
 {
   auto store = MakeStore(counterparty);
   if (!store.ok()) {
@@ -2156,18 +2272,15 @@ LiveInitiator::MakeActiveSession(const CounterpartyConfig& counterparty,
     }
   }
 
-  ActiveSession session_state{
-    .counterparty = counterparty,
-    .worker_id = worker_id,
-    .handle = {},
-    .dictionary = std::make_unique<profile::NormalizedDictionaryView>(std::move(dictionary)),
-    .store = std::move(store).value(),
-    .protocol = std::nullopt,
-    .host = std::move(host),
-    .port = port,
-  };
-  session_state.protocol.emplace(
-    MakeProtocolConfig(counterparty), *session_state.dictionary, session_state.store.get());
+  auto session_state = std::make_unique<ActiveSession>();
+  session_state->counterparty = counterparty;
+  session_state->worker_id = worker_id;
+  session_state->dictionary = std::make_unique<profile::NormalizedDictionaryView>(std::move(dictionary));
+  session_state->store = std::move(store).value();
+  session_state->host = std::move(host);
+  session_state->port = port;
+  session_state->protocol.emplace(
+    MakeProtocolConfig(counterparty), *session_state->dictionary, session_state->store.get());
   return session_state;
 }
 
@@ -2228,5 +2341,19 @@ LiveInitiator::RecordTrace(TraceEventKind kind,
 {
   engine_->mutable_trace()->Record(kind, session_id, worker_id, timestamp_ns, arg0, arg1, text);
 }
+
+#undef engine_
+#undef options_
+#undef worker_shards_
+#undef worker_threads_
+#undef control_mutex_
+#undef session_worker_ids_
+#undef session_registry_
+#undef next_connection_id_
+#undef active_connection_count_
+#undef last_progress_ns_
+#undef completed_sessions_
+#undef pending_reconnect_count_
+#undef stop_requested_
 
 } // namespace nimble::runtime

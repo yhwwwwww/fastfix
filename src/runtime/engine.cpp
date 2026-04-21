@@ -1,6 +1,17 @@
 #include "nimblefix/runtime/engine.h"
 
+#include <atomic>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+
+#include "nimblefix/codec/fix_codec.h"
 #include "nimblefix/profile/profile_loader.h"
+#include "nimblefix/runtime/metrics.h"
+#include "nimblefix/runtime/profile_registry.h"
+#include "nimblefix/runtime/sharded_runtime.h"
+#include "nimblefix/runtime/trace.h"
 
 namespace nimble::runtime {
 
@@ -56,6 +67,96 @@ ValidateManagedQueueRunnerOptions(const EngineConfig* config,
 }
 
 } // namespace
+
+struct Engine::Impl
+{
+  struct ManagedQueueRunnerSlot
+  {
+    ManagedQueueApplicationRunnerMode mode{ ManagedQueueApplicationRunnerMode::kCoScheduled };
+    QueueApplication* application{ nullptr };
+    std::vector<std::unique_ptr<QueueApplicationEventHandler>> handlers;
+    QueueApplicationPollerOptions poller_options{};
+    std::unique_ptr<QueueApplicationRunner> runner;
+    bool active{ false };
+  };
+
+  std::optional<EngineConfig> config_;
+  std::optional<ShardedRuntime> runtime_;
+  std::unordered_map<std::uint64_t, CounterpartyConfig> counterparties_;
+  std::optional<SessionFactory> session_factory_;
+  mutable std::mutex managed_queue_runner_mutex_;
+  std::unordered_map<const void*, ManagedQueueRunnerSlot> managed_queue_runners_;
+  ProfileRegistry profiles_;
+  MetricsRegistry metrics_;
+  TraceRecorder trace_;
+  std::atomic<std::uint64_t> next_dynamic_session_id_{ kFirstDynamicSessionId };
+};
+
+#define config_ impl_->config_
+#define runtime_ impl_->runtime_
+#define counterparties_ impl_->counterparties_
+#define session_factory_ impl_->session_factory_
+#define managed_queue_runner_mutex_ impl_->managed_queue_runner_mutex_
+#define managed_queue_runners_ impl_->managed_queue_runners_
+#define profiles_ impl_->profiles_
+#define metrics_ impl_->metrics_
+#define trace_ impl_->trace_
+#define next_dynamic_session_id_ impl_->next_dynamic_session_id_
+
+Engine::Engine()
+  : impl_(std::make_unique<Impl>())
+{
+}
+
+Engine::~Engine() = default;
+
+auto
+Engine::profiles() const -> const ProfileRegistry&
+{
+  return profiles_;
+}
+
+auto
+Engine::runtime() const -> const ShardedRuntime*
+{
+  return runtime_.has_value() ? &*runtime_ : nullptr;
+}
+
+auto
+Engine::mutable_runtime() -> ShardedRuntime*
+{
+  return runtime_.has_value() ? &*runtime_ : nullptr;
+}
+
+auto
+Engine::metrics() const -> const MetricsRegistry&
+{
+  return metrics_;
+}
+
+auto
+Engine::mutable_metrics() -> MetricsRegistry*
+{
+  return &metrics_;
+}
+
+auto
+Engine::trace() const -> const TraceRecorder&
+{
+  return trace_;
+}
+
+auto
+Engine::mutable_trace() -> TraceRecorder*
+{
+  return &trace_;
+}
+
+auto
+Engine::config() const -> const EngineConfig*
+{
+  return config_.has_value() ? &*config_ : nullptr;
+}
 
 auto
 Engine::LoadProfiles(const EngineConfig& config) -> base::Status
@@ -195,7 +296,7 @@ Engine::EnsureManagedQueueRunnerStarted(const void* owner,
     return status;
   }
 
-  ManagedQueueRunnerSlot slot{
+  Impl::ManagedQueueRunnerSlot slot{
     .mode = options->value().mode,
     .application = queue_application.value(),
     .handlers = {},
@@ -494,5 +595,16 @@ WhitelistSessionFactory::operator()(const session::SessionKey& key) const -> bas
 
   return base::Status::NotFound("session not in whitelist");
 }
+
+#undef config_
+#undef runtime_
+#undef counterparties_
+#undef session_factory_
+#undef managed_queue_runner_mutex_
+#undef managed_queue_runners_
+#undef profiles_
+#undef metrics_
+#undef trace_
+#undef next_dynamic_session_id_
 
 } // namespace nimble::runtime

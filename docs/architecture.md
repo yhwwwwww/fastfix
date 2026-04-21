@@ -38,7 +38,8 @@ The repository is split between the reusable engine surface, executable entrypoi
 
 | Path | Role |
 |------|------|
-| `include/nimblefix/` + `src/` | Public headers and implementation |
+| `include/public/nimblefix/` + `src/` | Exported headers and implementation |
+| `include/internal/nimblefix/` | Repository-private headers used by NimbleFIX itself, tests, and internal tools |
 | `tools/acceptor/` | Live acceptor binary that wires config into `Engine` + `LiveAcceptor` |
 | `tools/initiator/` | Live initiator binary that wires config into `Engine` + `LiveInitiator` |
 | `bench/` | Benchmark drivers plus the side-by-side QuickFIX comparison harness |
@@ -49,13 +50,13 @@ The repository is split between the reusable engine surface, executable entrypoi
 
 At runtime, the tools do very little policy themselves. They parse CLI or config-file input, populate runtime config structs, and hand control to `Engine`, `LiveAcceptor`, or `LiveInitiator`. That keeps the hot-path logic inside the library rather than duplicated across binaries.
 
-Public headers live under `include/nimblefix/`, while implementation code lives under `src/`.
+Exported headers live under `include/public/nimblefix/`, while repository-private headers live under `include/internal/nimblefix/` and implementation code lives under `src/`.
 
 ---
 
 ## Layer-by-Layer
 
-### 1. Base (`include/nimblefix/base/`)
+### 1. Base (public include: `nimblefix/base/`)
 
 Foundation types used everywhere:
 
@@ -66,7 +67,7 @@ Foundation types used everywhere:
 | `SpscQueue<T>` | Lock-free single-producer-single-consumer queue with fixed capacity |
 | `InlineSplitVector<T, N>` | Inline storage for ≤N elements, overflows to heap vector |
 
-> **Note:** `TimerWheel` lives in `include/nimblefix/runtime/timer_wheel.h`, not `base/`. It is listed in the Runtime section below.
+> **Note:** `TimerWheel` is included as `nimblefix/runtime/timer_wheel.h`, not from `base/`. It is listed in the Runtime section below.
 
 `Status` error codes:
 
@@ -75,7 +76,7 @@ kOk, kInvalidArgument, kIoError, kBusy, kFormatError,
 kVersionMismatch, kNotFound, kAlreadyExists
 ```
 
-### 2. Profile (`include/nimblefix/profile/`)
+### 2. Profile (public include: `nimblefix/profile/`)
 
 Protocol metadata system. NimbleFIX keeps XML out of the hot path, but protocol metadata can arrive either as precompiled `.art` artifacts or as `.ffd` dictionaries parsed once at startup. Both paths normalize into the same runtime dictionary layout before workers start.
 
@@ -123,7 +124,7 @@ group|453|448|Parties|0|448:r,447:r,452:r
 
 **Overlay format**: Multiple `.ffd` files can be merged. The first provides the baseline, additional files extend or override fields/messages/groups.
 
-### 3. Message (`include/nimblefix/message/`)
+### 3. Message (public include: `nimblefix/message/`)
 
 Two representations of a FIX message:
 
@@ -176,7 +177,7 @@ writer.encode_to_buffer(dictionary, options, &buffer);
 
 **Internal storage**: Fields use a `FieldSlot` linked-list structure within a flat buffer. Groups track entry boundaries via a small frame stack matched against dictionary group definitions.
 
-### 4. Codec (`include/nimblefix/codec/`)
+### 4. Codec (public include: `nimblefix/codec/`)
 
 Parsing and encoding FIX byte streams.
 
@@ -234,7 +235,7 @@ kUnknownField, kFieldNotAllowed, kDuplicateField,
 kFieldOutOfOrder, kIncorrectNumInGroupCount
 ```
 
-### 5. Session (`include/nimblefix/session/`)
+### 5. Session (public include: `nimblefix/session/`)
 
 FIX session state machine and admin message protocol.
 
@@ -330,7 +331,7 @@ Inbound seq 45, expected 42 → gap [42, 44]
     └── SessionCore tracks progress, CompleteResend() when gap filled
 ```
 
-### 6. Store (`include/nimblefix/store/`)
+### 6. Store (public include: `nimblefix/store/`)
 
 Persistence layer for message recovery and sequence state.
 
@@ -392,7 +393,7 @@ store_root/
 | `kLocalTime` | Automatic at local midnight (configurable UTC offset) |
 | `kExternal` | Manual `Rollover()` call |
 
-### 7. Transport (`include/nimblefix/transport/`)
+### 7. Transport (public include: `nimblefix/transport/`)
 
 TCP socket I/O with frame boundary detection.
 
@@ -413,7 +414,7 @@ class TcpAcceptor {
 
 **Frame detection**: The receiver scans for `8=` (BeginString), reads BodyLength, consumes the body, and verifies the checksum before returning a complete frame.
 
-### 8. Runtime (`include/nimblefix/runtime/`)
+### 8. Runtime (public include: `nimblefix/runtime/`)
 
 The runtime layer is where the library becomes a process. It loads profiles, builds worker shards, binds sockets, owns timer wheels and wakeups, routes connections, exposes `SessionHandle`s, and turns configuration knobs into a concrete topology.
 

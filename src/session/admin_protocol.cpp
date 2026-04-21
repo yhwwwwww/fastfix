@@ -6,12 +6,15 @@
 #include <cstring>
 #include <string_view>
 
+#include "nimblefix/codec/compiled_decoder.h"
 #include "nimblefix/codec/fast_int_format.h"
 #include "nimblefix/codec/fix_tags.h"
 #include "nimblefix/codec/raw_passthrough.h"
 #include "nimblefix/codec/simd_scan.h"
 #include "nimblefix/message/message_builder.h"
 #include "nimblefix/message/typed_message_view.h"
+#include "nimblefix/profile/normalized_dictionary.h"
+#include "nimblefix/store/session_store.h"
 
 namespace nimble::session {
 
@@ -335,56 +338,117 @@ EncodePreEncodedApplicationToBuffer(EncodedApplicationMessageView message,
 
 } // namespace
 
+struct AdminProtocol::Impl
+{
+  AdminProtocolConfig config_{};
+  const profile::NormalizedDictionaryView* dictionary_{ nullptr };
+  store::SessionStore* store_{ nullptr };
+  std::optional<SessionCore> session_{};
+  std::string outstanding_test_request_id_;
+  bool logout_sent_{ false };
+  std::uint64_t test_request_sent_ns_{ 0 };
+  std::uint64_t logout_sent_ns_{ 0 };
+  std::optional<base::Status> initialization_error_;
+  codec::PrecompiledTemplateTable encode_templates_;
+  codec::CompiledDecoderTable decode_table_;
+  codec::DecodedMessageView inbound_decode_scratch_;
+  codec::EncodeBuffer encode_buffer_;
+  store::MessageRecordViewRange replay_range_buffer_;
+  std::array<std::shared_ptr<ProtocolFrameList>, kReplayFrameBufferPoolSize> replay_frame_buffers_{};
+  std::size_t replay_frame_buffer_cursor_{ 0U };
+  std::vector<std::vector<std::byte>> deferred_gap_frames_;
+};
+
 AdminProtocol::AdminProtocol(AdminProtocolConfig config,
                              const profile::NormalizedDictionaryView& dictionary,
                              store::SessionStore* store)
-  : config_(std::move(config))
-  , dictionary_(dictionary)
-  , store_(store)
-  , session_(config_.session)
+  : impl_(std::make_unique<Impl>())
 {
+  impl_->config_ = std::move(config);
+  impl_->dictionary_ = &dictionary;
+  impl_->store_ = store;
+  impl_->session_.emplace(impl_->config_.session);
+
   // If transport_profile was left at default but begin_string was set, derive
   // the profile from begin_string so callers that only set begin_string still
   // get correct transport semantics.
-  if (config_.transport_profile.begin_string != config_.begin_string && !config_.begin_string.empty()) {
-    config_.transport_profile = TransportSessionProfile::FromBeginString(config_.begin_string);
+  if (impl_->config_.transport_profile.begin_string != impl_->config_.begin_string &&
+      !impl_->config_.begin_string.empty()) {
+    impl_->config_.transport_profile = TransportSessionProfile::FromBeginString(impl_->config_.begin_string);
   }
-  session_.set_transport_profile(&config_.transport_profile);
-  encode_buffer_.storage.reserve(kInitialEncodeBufferBytes);
-  for (auto& replay_frames : replay_frame_buffers_) {
+  impl_->session_->set_transport_profile(&impl_->config_.transport_profile);
+  impl_->encode_buffer_.storage.reserve(kInitialEncodeBufferBytes);
+  for (auto& replay_frames : impl_->replay_frame_buffers_) {
     replay_frames = std::make_shared<ProtocolFrameList>();
   }
 
-  auto table = codec::PrecompiledTemplateTable::Build(dictionary_,
+  auto table = codec::PrecompiledTemplateTable::Build(*impl_->dictionary_,
                                                       codec::EncodeTemplateConfig{
-                                                        .begin_string = config_.begin_string,
-                                                        .sender_comp_id = config_.sender_comp_id,
-                                                        .target_comp_id = config_.target_comp_id,
-                                                        .default_appl_ver_id = config_.default_appl_ver_id,
+                                                        .begin_string = impl_->config_.begin_string,
+                                                        .sender_comp_id = impl_->config_.sender_comp_id,
+                                                        .target_comp_id = impl_->config_.target_comp_id,
+                                                        .default_appl_ver_id = impl_->config_.default_appl_ver_id,
                                                       });
   if (table.ok()) {
-    encode_templates_ = std::move(table).value();
+    impl_->encode_templates_ = std::move(table).value();
   }
 
-  decode_table_ = codec::CompiledDecoderTable::Build(dictionary_);
+  impl_->decode_table_ = codec::CompiledDecoderTable::Build(*impl_->dictionary_);
 
-  if (store_ == nullptr) {
+  if (impl_->store_ == nullptr) {
     return;
   }
 
-  auto recovery = store_->LoadRecoveryState(session_.session_id());
+  auto recovery = impl_->store_->LoadRecoveryState(impl_->session_->session_id());
   if (!recovery.ok()) {
     if (recovery.status().code() != base::ErrorCode::kNotFound) {
-      initialization_error_ = recovery.status();
+      impl_->initialization_error_ = recovery.status();
     }
     return;
   }
 
-  auto status = session_.RestoreSequenceState(recovery.value().next_in_seq, recovery.value().next_out_seq);
+  auto status = impl_->session_->RestoreSequenceState(recovery.value().next_in_seq, recovery.value().next_out_seq);
   if (!status.ok()) {
-    initialization_error_ = status;
+    impl_->initialization_error_ = status;
   }
 }
+
+AdminProtocol::~AdminProtocol() = default;
+
+AdminProtocol::AdminProtocol(AdminProtocol&& other) noexcept = default;
+
+auto
+AdminProtocol::operator=(AdminProtocol&& other) noexcept -> AdminProtocol& = default;
+
+auto
+AdminProtocol::session() const -> const SessionCore&
+{
+  return *impl_->session_;
+}
+
+auto
+AdminProtocol::mutable_session() -> SessionCore&
+{
+  return *impl_->session_;
+}
+
+#define config_ impl_->config_
+#define dictionary_ (*impl_->dictionary_)
+#define store_ impl_->store_
+#define session_ (*impl_->session_)
+#define outstanding_test_request_id_ impl_->outstanding_test_request_id_
+#define logout_sent_ impl_->logout_sent_
+#define test_request_sent_ns_ impl_->test_request_sent_ns_
+#define logout_sent_ns_ impl_->logout_sent_ns_
+#define initialization_error_ impl_->initialization_error_
+#define encode_templates_ impl_->encode_templates_
+#define decode_table_ impl_->decode_table_
+#define inbound_decode_scratch_ impl_->inbound_decode_scratch_
+#define encode_buffer_ impl_->encode_buffer_
+#define replay_range_buffer_ impl_->replay_range_buffer_
+#define replay_frame_buffers_ impl_->replay_frame_buffers_
+#define replay_frame_buffer_cursor_ impl_->replay_frame_buffer_cursor_
+#define deferred_gap_frames_ impl_->deferred_gap_frames_
 
 auto
 AdminProtocol::EnsureInitialized() const -> base::Status
@@ -1948,5 +2012,23 @@ AdminProtocol::DrainDeferredGapFrames(std::uint64_t timestamp_ns, ProtocolEvent*
   }
   return base::Status::Ok();
 }
+
+#undef config_
+#undef dictionary_
+#undef store_
+#undef session_
+#undef outstanding_test_request_id_
+#undef logout_sent_
+#undef test_request_sent_ns_
+#undef logout_sent_ns_
+#undef initialization_error_
+#undef encode_templates_
+#undef decode_table_
+#undef inbound_decode_scratch_
+#undef encode_buffer_
+#undef replay_range_buffer_
+#undef replay_frame_buffers_
+#undef replay_frame_buffer_cursor_
+#undef deferred_gap_frames_
 
 } // namespace nimble::session

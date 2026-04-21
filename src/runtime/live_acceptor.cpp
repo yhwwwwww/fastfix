@@ -1,26 +1,37 @@
 #include "nimblefix/runtime/live_acceptor.h"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <condition_variable>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <sys/epoll.h>
 #include <unistd.h>
 
 #include "nimblefix/base/spsc_queue.h"
 #include "nimblefix/codec/fix_tags.h"
+#include "nimblefix/runtime/engine.h"
+#include "nimblefix/runtime/shard_poller.h"
 #include "nimblefix/runtime/thread_affinity.h"
+#include "nimblefix/session/admin_protocol.h"
 #include "nimblefix/store/durable_batch_store.h"
 #include "nimblefix/store/memory_store.h"
 #include "nimblefix/store/mmap_store.h"
+#include "nimblefix/store/session_store.h"
+#include "nimblefix/transport/tcp_transport.h"
 
 namespace nimble::runtime {
 
@@ -187,6 +198,117 @@ private:
   base::SpscQueue<session::SessionNotification> queue_;
 };
 
+struct LiveAcceptor::ActiveSession
+{
+  CounterpartyConfig counterparty;
+  std::uint32_t worker_id{ 0 };
+  std::uint32_t routed_worker_id{ 0 };
+  session::SessionHandle handle;
+  std::unique_ptr<profile::NormalizedDictionaryView> dictionary;
+  std::unique_ptr<store::SessionStore> store;
+  std::optional<session::AdminProtocol> protocol;
+};
+
+struct LiveAcceptor::ListenerState
+{
+  std::string name;
+  std::uint32_t worker_hint{ 0 };
+  transport::TcpAcceptor acceptor;
+};
+
+struct LiveAcceptor::ConnectionState
+{
+  std::uint64_t connection_id{ 0 };
+  transport::TcpConnection connection;
+  std::unique_ptr<ActiveSession> session;
+  std::uint64_t last_progress_ns{ 0 };
+  std::optional<RuntimeEvent> pending_app_event;
+  std::vector<std::byte> stashed_app_frame;
+  bool close_requested{ false };
+  bool count_completion{ false };
+  std::string close_reason;
+};
+
+struct LiveAcceptor::WorkerInbox
+{
+  std::mutex mutex;
+  std::vector<ConnectionState> pending_connections;
+};
+
+struct LiveAcceptor::WorkerShardState
+{
+  WorkerShardState() = default;
+  WorkerShardState(const WorkerShardState&) = delete;
+  auto operator=(const WorkerShardState&) -> WorkerShardState& = delete;
+
+  WorkerShardState(WorkerShardState&& other) noexcept
+    : worker_id(other.worker_id)
+    , active_connections(other.active_connections.load(std::memory_order_relaxed))
+    , connections(std::move(other.connections))
+    , poller(std::move(other.poller))
+    , connection_indices(std::move(other.connection_indices))
+    , session_connection_indices(std::move(other.session_connection_indices))
+    , command_sink(std::move(other.command_sink))
+    , inbox(std::move(other.inbox))
+    , io_ready_state(std::move(other.io_ready_state))
+  {
+    other.active_connections.store(0U, std::memory_order_relaxed);
+  }
+
+  auto operator=(WorkerShardState&& other) noexcept -> WorkerShardState&
+  {
+    if (this == &other) {
+      return *this;
+    }
+
+    worker_id = other.worker_id;
+    active_connections.store(other.active_connections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    connections = std::move(other.connections);
+    poller = std::move(other.poller);
+    connection_indices = std::move(other.connection_indices);
+    session_connection_indices = std::move(other.session_connection_indices);
+    command_sink = std::move(other.command_sink);
+    inbox = std::move(other.inbox);
+    io_ready_state = std::move(other.io_ready_state);
+    other.active_connections.store(0U, std::memory_order_relaxed);
+    return *this;
+  }
+
+  std::uint32_t worker_id{ 0 };
+  std::atomic<std::size_t> active_connections{ 0 };
+  std::vector<ConnectionState> connections;
+  ShardPoller poller{};
+  std::unordered_map<std::uint64_t, std::size_t> connection_indices;
+  std::unordered_map<std::uint64_t, std::size_t> session_connection_indices;
+  std::shared_ptr<CommandSink> command_sink;
+  std::unique_ptr<WorkerInbox> inbox;
+  ShardPoller::IoReadyState io_ready_state;
+};
+
+struct LiveAcceptor::Impl
+{
+  Engine* engine{ nullptr };
+  Options options{};
+  std::vector<ListenerState> listeners;
+  std::vector<WorkerShardState> worker_shards;
+  std::vector<std::jthread> worker_threads;
+  mutable std::mutex run_state_mutex;
+  std::condition_variable run_state_cv;
+  mutable std::mutex control_mutex;
+  std::unordered_map<std::uint64_t, session::SessionSnapshot> session_snapshots;
+  std::unordered_map<std::uint64_t, std::vector<std::weak_ptr<session::SessionSubscriptionStream>>> session_subscribers;
+  std::unordered_set<std::uint64_t> active_session_ids;
+  std::optional<base::Status> terminal_status;
+  std::uint64_t next_connection_id{ 1 };
+  std::atomic<std::size_t> active_connection_count{ 0 };
+  std::atomic<std::uint64_t> last_progress_ns{ 0 };
+  std::atomic<std::size_t> completed_sessions{ 0 };
+  bool opened{ false };
+  bool run_active{ false };
+  std::thread::id run_thread_id{};
+  std::atomic<bool> stop_requested{ false };
+};
+
 class LiveAcceptor::CommandSink final : public session::SessionCommandSink
 {
 public:
@@ -322,18 +444,52 @@ LiveAcceptor::LiveAcceptor(Engine* engine)
 }
 
 LiveAcceptor::LiveAcceptor(Engine* engine, Options options)
-  : engine_(engine)
-  , options_(std::move(options))
+  : impl_(std::make_unique<Impl>())
 {
+  impl_->engine = engine;
+  impl_->options = std::move(options);
 }
 
 LiveAcceptor::~LiveAcceptor()
 {
   Stop();
-  if (engine_ != nullptr) {
-    static_cast<void>(engine_->ReleaseManagedQueueRunner(this));
+  if (impl_->engine != nullptr) {
+    static_cast<void>(impl_->engine->ReleaseManagedQueueRunner(this));
   }
 }
+
+auto
+LiveAcceptor::active_connection_count() const -> std::size_t
+{
+  return impl_->active_connection_count.load(std::memory_order_relaxed);
+}
+
+auto
+LiveAcceptor::completed_session_count() const -> std::size_t
+{
+  return impl_->completed_sessions.load(std::memory_order_relaxed);
+}
+
+#define engine_ impl_->engine
+#define options_ impl_->options
+#define listeners_ impl_->listeners
+#define worker_shards_ impl_->worker_shards
+#define worker_threads_ impl_->worker_threads
+#define run_state_mutex_ impl_->run_state_mutex
+#define run_state_cv_ impl_->run_state_cv
+#define control_mutex_ impl_->control_mutex
+#define session_snapshots_ impl_->session_snapshots
+#define session_subscribers_ impl_->session_subscribers
+#define active_session_ids_ impl_->active_session_ids
+#define terminal_status_ impl_->terminal_status
+#define next_connection_id_ impl_->next_connection_id
+#define active_connection_count_ impl_->active_connection_count
+#define last_progress_ns_ impl_->last_progress_ns
+#define completed_sessions_ impl_->completed_sessions
+#define opened_ impl_->opened
+#define run_active_ impl_->run_active
+#define run_thread_id_ impl_->run_thread_id
+#define stop_requested_ impl_->stop_requested
 
 auto
 LiveAcceptor::EnsureManagedQueueRunnerStarted() -> base::Status
@@ -1580,38 +1736,39 @@ LiveAcceptor::BindConnectionFromLogon(WorkerShardState& shard,
   }
 
   auto matched = std::move(resolved).value();
-  auto active = MakeActiveSession(matched.counterparty, std::move(matched.dictionary));
-  if (!active.ok()) {
-    return active.status();
+  auto active_session = MakeActiveSession(matched.counterparty, std::move(matched.dictionary));
+  if (!active_session.ok()) {
+    return active_session.status();
   }
 
-  active.value().routed_worker_id = ResolveWorkerId(active.value().worker_id);
+  auto session_state = std::move(active_session).value();
+  session_state->routed_worker_id = ResolveWorkerId(session_state->worker_id);
 
-  auto* target_shard = FindWorkerShard(active.value().routed_worker_id);
+  auto* target_shard = FindWorkerShard(session_state->routed_worker_id);
   if (target_shard == nullptr) {
     return base::Status::NotFound("acceptor worker shard was not found for bound session");
   }
 
   const bool threaded_handoff = !worker_threads_.empty() && target_shard != &shard;
-  active.value().worker_id = threaded_handoff ? shard.worker_id : active.value().routed_worker_id;
+  session_state->worker_id = threaded_handoff ? shard.worker_id : session_state->routed_worker_id;
 
   std::shared_ptr<session::SessionCommandSink> command_sink;
   auto* bound_command_shard = threaded_handoff ? &shard : target_shard;
   if (bound_command_shard->command_sink != nullptr) {
     command_sink = bound_command_shard->command_sink;
   }
-  active.value().handle = session::SessionHandle(
-    active.value().counterparty.session.session_id, active.value().worker_id, std::move(command_sink));
+  session_state->handle = session::SessionHandle(
+    session_state->counterparty.session.session_id, session_state->worker_id, std::move(command_sink));
 
-  auto start = active.value().protocol->OnTransportConnected(timestamp_ns);
+  auto start = session_state->protocol->OnTransportConnected(timestamp_ns);
   if (!start.ok()) {
     return start.status();
   }
 
-  if (!RegisterActiveSession(active.value().counterparty.session.session_id)) {
+  if (!RegisterActiveSession(session_state->counterparty.session.session_id)) {
     return base::Status::AlreadyExists("session already has an active transport connection");
   }
-  connection->session = std::make_unique<ActiveSession>(std::move(active).value());
+  connection->session = std::move(session_state);
 
   ConnectionState* bound_connection = connection;
   if (target_shard != &shard && worker_threads_.empty()) {
@@ -1986,7 +2143,7 @@ LiveAcceptor::SendFrame(ConnectionState& connection, const session::EncodedFrame
 
 auto
 LiveAcceptor::SendFrames(ConnectionState& connection,
-                         const session::ProtocolFrameList& frames,
+                         const session::ProtocolFrameCollection& frames,
                          std::uint64_t timestamp_ns) -> base::Status
 {
   for (const auto& frame : frames) {
@@ -2000,7 +2157,7 @@ LiveAcceptor::SendFrames(ConnectionState& connection,
 
 auto
 LiveAcceptor::SendFramesBatch(ConnectionState& connection,
-                              const session::ProtocolFrameList& frames,
+                              const session::ProtocolFrameCollection& frames,
                               std::uint64_t timestamp_ns) -> base::Status
 {
   if (frames.size() <= 1U) {
@@ -2367,7 +2524,8 @@ LiveAcceptor::MakeStore(const CounterpartyConfig& counterparty) const
 
 auto
 LiveAcceptor::MakeActiveSession(const CounterpartyConfig& counterparty,
-                                profile::NormalizedDictionaryView dictionary) const -> base::Result<ActiveSession>
+                                profile::NormalizedDictionaryView dictionary) const
+  -> base::Result<std::unique_ptr<ActiveSession>>
 {
   auto store = MakeStore(counterparty);
   if (!store.ok()) {
@@ -2382,16 +2540,13 @@ LiveAcceptor::MakeActiveSession(const CounterpartyConfig& counterparty,
     }
   }
 
-  ActiveSession session_state{
-    .counterparty = counterparty,
-    .worker_id = worker_id,
-    .handle = {},
-    .dictionary = std::make_unique<profile::NormalizedDictionaryView>(std::move(dictionary)),
-    .store = std::move(store).value(),
-    .protocol = std::nullopt,
-  };
-  session_state.protocol.emplace(
-    MakeProtocolConfig(counterparty), *session_state.dictionary, session_state.store.get());
+  auto session_state = std::make_unique<ActiveSession>();
+  session_state->counterparty = counterparty;
+  session_state->worker_id = worker_id;
+  session_state->dictionary = std::make_unique<profile::NormalizedDictionaryView>(std::move(dictionary));
+  session_state->store = std::move(store).value();
+  session_state->protocol.emplace(
+    MakeProtocolConfig(counterparty), *session_state->dictionary, session_state->store.get());
   return session_state;
 }
 
@@ -2452,5 +2607,26 @@ LiveAcceptor::RecordTrace(TraceEventKind kind,
 {
   engine_->mutable_trace()->Record(kind, session_id, worker_id, timestamp_ns, arg0, arg1, text);
 }
+
+#undef engine_
+#undef options_
+#undef listeners_
+#undef worker_shards_
+#undef worker_threads_
+#undef run_state_mutex_
+#undef run_state_cv_
+#undef control_mutex_
+#undef session_snapshots_
+#undef session_subscribers_
+#undef active_session_ids_
+#undef terminal_status_
+#undef next_connection_id_
+#undef active_connection_count_
+#undef last_progress_ns_
+#undef completed_sessions_
+#undef opened_
+#undef run_active_
+#undef run_thread_id_
+#undef stop_requested_
 
 } // namespace nimble::runtime

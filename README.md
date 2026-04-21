@@ -149,7 +149,7 @@ NimbleFIX currently compiles into a single static library `libnimblefix.a`. To u
 
 1. **Build the library**: `xmake f -m release -y && xmake build nimblefix` or, if you need the alternative path, `cmake --build build/cmake/dev-release --target nimblefix` (or `build/cmake/dev-release-make` when forcing the make fallback)
 2. **Compile a protocol profile**: Run `nimblefix-dictgen` to produce a `.art` binary artifact from your dictionary (optional — `.ffd` files can also be loaded directly at runtime)
-3. **Link and include**: Point your compiler at `include/` for headers and link against `libnimblefix.a`
+3. **Link and include**: Point your compiler at `include/public/` for headers and link against `libnimblefix.a`
 
 **xmake (as a subdependency):**
 
@@ -159,7 +159,7 @@ includes("path/to/nimblefix")   -- path to the nimblefix source tree
 
 target("my-trading-app")
     set_kind("binary")
-    add_deps("nimblefix")        -- links libnimblefix.a + adds include path
+    add_deps("nimblefix")        -- links libnimblefix.a + adds include/public/
     add_files("src/*.cpp")
 ```
 
@@ -170,10 +170,34 @@ target("my-trading-app")
 cd path/to/nimblefix && cmake -S . -B build/cmake/dev-release -DCMAKE_BUILD_TYPE=Release && cmake --build build/cmake/dev-release --target nimblefix
 
 # 2. In your build system, add:
-#    Include path:  path/to/nimblefix/include
+#    Include path:  path/to/nimblefix/include/public
 #    Link library:  path/to/nimblefix/build/cmake/dev-release/lib/libnimblefix.a
 #    Standard:      C++20
 ```
+
+### Public Headers
+
+External consumers should include only the exported headers under `include/public/nimblefix/`; `include/internal/nimblefix/` is repository-private.
+
+Most applications only need these direct includes:
+
+- `nimblefix/runtime/application.h`
+- `nimblefix/runtime/config.h`
+- `nimblefix/runtime/engine.h`
+- `nimblefix/runtime/live_acceptor.h`
+- `nimblefix/runtime/live_initiator.h`
+- `nimblefix/message/message_builder.h`
+- `nimblefix/message/message_view.h`
+- `nimblefix/message/fixed_layout_writer.h`
+- `nimblefix/codec/fix_codec.h`
+- `nimblefix/codec/fix_tags.h`
+- `nimblefix/profile/profile_loader.h`
+- `nimblefix/store/memory_store.h`
+- `nimblefix/store/mmap_store.h`
+- `nimblefix/store/durable_batch_store.h`
+- `nimblefix/session/session_handle.h`
+
+Advanced consumers can add `nimblefix/session/admin_protocol.h`, `nimblefix/session/resend_recovery.h`, `nimblefix/runtime/sharded_runtime.h`, `nimblefix/runtime/metrics.h`, and `nimblefix/runtime/trace.h` as needed. The complete exported header policy is documented in [docs/public-api.md](docs/public-api.md).
 
 ---
 

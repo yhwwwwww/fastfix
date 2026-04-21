@@ -10,6 +10,8 @@ local local_deps = NIMBLEFIX_LOCAL_DEPS or {}
 local vendor_hint = "run `git submodule update --init --recursive`"
 local catch2_override_root = path.join("deps", "include")
 local quickfix_root = path.join("bench", "vendor", "quickfix")
+local public_include_root = path.join("include", "public")
+local internal_include_root = path.join("include", "internal")
 local table_unpack = table.unpack or unpack
 local xmake_raise = raise or os.raise or function (format, ...)
     error(string.format(format, ...), 0)
@@ -63,6 +65,11 @@ local function generated_tool_path(name)
     local mode = get_config("mode") or "release"
     local suffix = is_plat("windows") and ".exe" or ""
     return path.join(buildir, plat, arch, mode, name .. suffix)
+end
+
+local function add_internal_repo_includedirs(target_name)
+    target(target_name)
+    add_sysincludedirs(internal_include_root)
 end
 
 local function output_is_stale(output_path, input_paths)
@@ -242,7 +249,8 @@ target("nimblefix-thirdparty-catch2-main")
 
 target("nimblefix")
     set_kind("static")
-    add_includedirs("include", {public = true})
+    add_includedirs(public_include_root, {public = true})
+    add_includedirs(internal_include_root)
     add_defines("NIMBLEFIX_PROJECT_DIR=\"$(projectdir)\"", {public = true})
     add_files("src/profile/*.cpp", "src/runtime/*.cpp", "src/session/*.cpp", "src/store/*.cpp", "src/message/*.cpp", "src/codec/*.cpp", "src/transport/*.cpp")
     if os.isfile("/usr/include/liburing.h") or os.isfile("/usr/local/include/liburing.h") then
@@ -363,6 +371,19 @@ target("nimblefix-tests")
     add_includedirs("build/generated")
     add_files("tests/*.cpp", "tools/xml2ffd/xml2ffd.cpp")
     remove_files("tests/test_main.cpp")
+
+add_internal_repo_includedirs("nimblefix-dictgen")
+add_internal_repo_includedirs("nimblefix-interop-runner")
+add_internal_repo_includedirs("nimblefix-soak")
+add_internal_repo_includedirs("nimblefix-fuzz-config")
+add_internal_repo_includedirs("nimblefix-fuzz-dictgen")
+add_internal_repo_includedirs("nimblefix-fuzz-codec")
+add_internal_repo_includedirs("nimblefix-fuzz-codec-libfuzzer")
+add_internal_repo_includedirs("nimblefix-initiator")
+add_internal_repo_includedirs("nimblefix-acceptor")
+add_internal_repo_includedirs("nimblefix-xml2ffd")
+add_internal_repo_includedirs("nimblefix-bench")
+add_internal_repo_includedirs("nimblefix-tests")
 
 apply_local_dep("nimblefix", "nimblefix")
 apply_local_dep("nimblefix-dictgen", "nimblefix-dictgen")
