@@ -33,6 +33,7 @@ NimbleFIX was designed to answer: *what if every design decision optimized for t
 | **Session management** | Full Logon/Logout/Heartbeat/TestRequest/ResendRequest/SequenceReset |
 | **Repeating groups** | Nested groups fully supported via dictionary metadata |
 | **Reconnect with backoff** | Configurable exponential backoff with jitter for initiator reconnect |
+| **Optional TLS transport** | OpenSSL-backed TLS can be compiled in and enabled per initiator counterparty or acceptor listener |
 | **Dynamic session factory** | Acceptor can accept unknown CompIDs via callback or whitelist |
 | **Pluggable persistence** | Memory, mmap, and durable batch stores with configurable rollover |
 | **Worker sharding** | Per-worker event loops with CPU affinity pinning |
@@ -123,6 +124,18 @@ ctest --test-dir build/cmake/dev-release-manual-make --output-on-failure
 
 # Direct xmake target build, using the pinned Catch2/pugixml submodules instead of package downloads
 xmake f -m release --ccache=n -y
+xmake build nimblefix-tests
+```
+
+TLS support is optional. Enabling it at build time only links OpenSSL and compiles the TLS transport; connections still use plain TCP unless their runtime TLS config has `enabled=true`.
+
+```bash
+# CMake TLS-capable build
+cmake -S . -B build/cmake/tls-release -DCMAKE_BUILD_TYPE=Release -DNIMBLEFIX_ENABLE_TLS=ON
+cmake --build build/cmake/tls-release
+
+# xmake TLS-capable build
+xmake f -m release --nimblefix_enable_tls=true --ccache=n -y
 xmake build nimblefix-tests
 ```
 
@@ -599,6 +612,7 @@ auto OnAppMessage(const nimble::runtime::RuntimeEvent& event)
 | `host` | string | `"0.0.0.0"` | Bind address |
 | `port` | uint16 | 0 | Listen port |
 | `worker_hint` | uint32 | 0 | Routing hint for worker pool |
+| `tls_server` | TlsServerConfig | disabled | Optional TLS server policy for this listener |
 
 ### CounterpartyConfig
 
@@ -632,6 +646,45 @@ auto OnAppMessage(const nimble::runtime::RuntimeEvent& event)
 | `send_next_expected_msg_seq_num` | bool | false | Include tag 789 on Logon |
 | `session_schedule` | struct | — | Session time window (start/end time/day, logon/logout windows) |
 | `day_cut` | struct | — | Day-cut mode and timing for sequence reset |
+| `tls_client` | TlsClientConfig | disabled | Optional TLS client policy for initiator connections |
+| `acceptor_transport_security` | enum | `kAny` | Accept-side requirement: any, plain-only, or TLS-only |
+
+### TLS Runtime Config
+
+TLS is negotiated before FIX Logon. Acceptor TLS therefore belongs to `ListenerConfig`; initiator TLS belongs to the initiator `CounterpartyConfig`. TLS does not change `SessionKey`, sequence numbers, store keys, profile selection, or replay semantics.
+
+```cpp
+nimble::runtime::TlsServerConfig server_tls;
+server_tls.enabled = true;
+server_tls.certificate_chain_file = "/etc/nimblefix/server-chain.pem";
+server_tls.private_key_file = "/etc/nimblefix/server-key.pem";
+server_tls.ca_file = "/etc/nimblefix/client-ca.pem";
+server_tls.verify_peer = true;
+server_tls.require_client_certificate = true;
+
+config.listeners.push_back(
+    nimble::runtime::ListenerConfigBuilder::Named("tls-main")
+        .bind("0.0.0.0", 9877)
+        .tls_server(std::move(server_tls))
+        .build());
+
+nimble::runtime::TlsClientConfig client_tls;
+client_tls.enabled = true;
+client_tls.server_name = "fix.example.com";
+client_tls.expected_peer_name = "fix.example.com";
+client_tls.ca_file = "/etc/nimblefix/ca.pem";
+client_tls.min_version = nimble::runtime::TlsProtocolVersion::kTls12;
+
+config.counterparties.push_back(
+    nimble::runtime::CounterpartyConfigBuilder::Initiator(
+        "buy-side-tls", 1001U,
+        nimble::session::SessionKey{ .sender_comp_id = "BUY1", .target_comp_id = "SELL1" },
+        4400U)
+        .tls_client(std::move(client_tls))
+        .build());
+```
+
+For acceptors, use `acceptor_transport_security(kTlsOnly)` when a sensitive session must not bind on a plain listener. `verify_peer=false` is intended only for controlled tests; production deployments should keep peer verification enabled and provide CA files or paths.
 
 ### Tool Runtime Config (`.ffcfg`)
 

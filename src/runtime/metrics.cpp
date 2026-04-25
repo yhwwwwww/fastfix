@@ -175,6 +175,40 @@ MetricsRegistry::ObserveStoreFlushLatency(std::uint64_t session_id, std::uint64_
 }
 
 auto
+MetricsRegistry::RecordPlainConnection(std::uint32_t worker_id) -> base::Status
+{
+  auto* worker = FindMutableWorker(worker_id);
+  if (worker == nullptr) {
+    return base::Status::NotFound("metrics worker_id is not registered");
+  }
+  worker->plain_connections.fetch_add(1U, std::memory_order_relaxed);
+  return base::Status::Ok();
+}
+
+auto
+MetricsRegistry::RecordTlsHandshake(std::uint32_t worker_id,
+                                    bool success,
+                                    std::uint64_t latency_ns,
+                                    bool session_reused) -> base::Status
+{
+  auto* worker = FindMutableWorker(worker_id);
+  if (worker == nullptr) {
+    return base::Status::NotFound("metrics worker_id is not registered");
+  }
+  worker->tls_handshake_latency_ns.fetch_add(latency_ns, std::memory_order_relaxed);
+  if (success) {
+    worker->tls_connections.fetch_add(1U, std::memory_order_relaxed);
+    worker->tls_handshake_successes.fetch_add(1U, std::memory_order_relaxed);
+    if (session_reused) {
+      worker->tls_session_resumptions.fetch_add(1U, std::memory_order_relaxed);
+    }
+  } else {
+    worker->tls_handshake_failures.fetch_add(1U, std::memory_order_relaxed);
+  }
+  return base::Status::Ok();
+}
+
+auto
 MetricsRegistry::Snapshot() const -> RuntimeMetricsSnapshot
 {
   std::shared_lock lock(sessions_mutex_);
@@ -200,6 +234,12 @@ MetricsRegistry::Snapshot() const -> RuntimeMetricsSnapshot
       .timer_process_ns = w.timer_process_ns.load(std::memory_order_relaxed),
       .send_ns = w.send_ns.load(std::memory_order_relaxed),
       .poll_iterations = w.poll_iterations.load(std::memory_order_relaxed),
+      .plain_connections = w.plain_connections.load(std::memory_order_relaxed),
+      .tls_connections = w.tls_connections.load(std::memory_order_relaxed),
+      .tls_handshake_successes = w.tls_handshake_successes.load(std::memory_order_relaxed),
+      .tls_handshake_failures = w.tls_handshake_failures.load(std::memory_order_relaxed),
+      .tls_handshake_latency_ns = w.tls_handshake_latency_ns.load(std::memory_order_relaxed),
+      .tls_session_resumptions = w.tls_session_resumptions.load(std::memory_order_relaxed),
     });
   }
   snapshot.sessions.reserve(sessions_.size());

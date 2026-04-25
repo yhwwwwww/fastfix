@@ -16,12 +16,20 @@ option(NIMBLEFIX_BUILD_BENCHMARKS "Build the NimbleFIX and QuickFIX benchmark dr
 option(NIMBLEFIX_BUILD_FUZZERS "Build the standalone fuzz corpus runners" ON)
 option(NIMBLEFIX_BUILD_LIBFUZZER "Build the libFuzzer entrypoint" OFF)
 option(NIMBLEFIX_ENABLE_LIBURING "Enable io_uring when liburing headers and library are available" ON)
+option(NIMBLEFIX_ENABLE_TLS "Enable optional TLS support via OpenSSL" OFF)
 
 include(CTest)
 include(GNUInstallDirs)
 include(CheckIncludeFileCXX)
 
 find_package(Threads REQUIRED)
+
+if(NIMBLEFIX_ENABLE_TLS)
+    find_package(OpenSSL REQUIRED)
+    message(STATUS "NimbleFIX: enabling optional TLS support via OpenSSL")
+else()
+    message(STATUS "NimbleFIX: building without optional TLS support")
+endif()
 
 set(NIMBLEFIX_PROJECT_ROOT "${PROJECT_SOURCE_DIR}")
 set(NIMBLEFIX_PUBLIC_INCLUDE_DIR "${PROJECT_SOURCE_DIR}/include/public")
@@ -112,6 +120,11 @@ target_compile_definitions(nimblefix
         NIMBLEFIX_PROJECT_DIR=\"${NIMBLEFIX_PROJECT_ROOT}\"
 )
 target_link_libraries(nimblefix PUBLIC Threads::Threads)
+
+if(NIMBLEFIX_ENABLE_TLS)
+    target_compile_definitions(nimblefix PUBLIC NIMBLEFIX_ENABLE_TLS)
+    target_link_libraries(nimblefix PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 if(NIMBLEFIX_USE_LIBURING)
     target_link_libraries(nimblefix PUBLIC "${NIMBLEFIX_URING_LIBRARY}")
@@ -366,6 +379,12 @@ if(NIMBLEFIX_BUILD_BENCHMARKS)
         "${PROJECT_SOURCE_DIR}/bench/tcp_rtt.cpp"
     )
     target_link_libraries(tcp-rtt PRIVATE Threads::Threads)
+
+    # Transport RTT benchmark: plain TCP baseline plus optional TLS run.
+    add_executable(nimblefix-tls-transport-bench
+        "${PROJECT_SOURCE_DIR}/bench/tls_transport.cpp"
+    )
+    target_link_libraries(nimblefix-tls-transport-bench PRIVATE nimblefix Threads::Threads)
 
     # Two-process loopback benchmark: QuickFIX
     add_executable(quickfix-loopback

@@ -33,6 +33,7 @@ NimbleFIX 的设计出发点是：*如果每个设计决策都为热路径优化
 | **完整会话管理** | Logon/Logout/Heartbeat/TestRequest/ResendRequest/SequenceReset |
 | **嵌套重复组** | 通过字典元数据完整支持嵌套 repeating group |
 | **自动重连退避** | initiator 可配置指数退避 + 随机抖动的自动重连 |
+| **可选 TLS 传输** | 可编译 OpenSSL 支持，并按 initiator counterparty 或 acceptor listener 在运行时启用 |
 | **动态会话工厂** | acceptor 可通过回调或白名单接纳未知 CompID |
 | **可插拔持久化** | Memory、mmap、durable batch store，支持可配置 rollover |
 | **Worker 分片** | 每 worker 独立事件循环，支持 CPU 亲和性绑定 |
@@ -123,6 +124,18 @@ ctest --test-dir build/cmake/dev-release-manual-make --output-on-failure
 
 # 直接用 xmake 编译目标：依赖已改为本地源码，不再触发在线包管理
 xmake f -m release --ccache=n -y
+xmake build nimblefix-tests
+```
+
+TLS 支持是可选能力。构建时打开它只表示链接 OpenSSL 并编译 TLS transport；连接默认仍是明文 TCP，只有运行时配置里的 `enabled=true` 才会启用 TLS。
+
+```bash
+# CMake TLS-capable build
+cmake -S . -B build/cmake/tls-release -DCMAKE_BUILD_TYPE=Release -DNIMBLEFIX_ENABLE_TLS=ON
+cmake --build build/cmake/tls-release
+
+# xmake TLS-capable build
+xmake f -m release --nimblefix_enable_tls=true --ccache=n -y
 xmake build nimblefix-tests
 ```
 
@@ -591,6 +604,7 @@ auto OnAppMessage(const nimble::runtime::RuntimeEvent& event)
 | `host` | string | `"0.0.0.0"` | 绑定地址 |
 | `port` | uint16 | 0 | 侦听端口 |
 | `worker_hint` | uint32 | 0 | Worker 池路由提示 |
+| `tls_server` | TlsServerConfig | disabled | 此 listener 的可选 TLS server 策略 |
 
 ### CounterpartyConfig（对端配置）
 
@@ -624,6 +638,45 @@ auto OnAppMessage(const nimble::runtime::RuntimeEvent& event)
 | `send_next_expected_msg_seq_num` | bool | false | 在 Logon 中包含 tag 789 |
 | `session_schedule` | struct | — | 会话时间窗口（开始/结束时间/日期、登录/登出窗口） |
 | `day_cut` | struct | — | 日切模式和时间，用于序列号重置 |
+| `tls_client` | TlsClientConfig | disabled | initiator 连接的可选 TLS client 策略 |
+| `acceptor_transport_security` | enum | `kAny` | acceptor 侧要求：任意、仅明文或仅 TLS |
+
+### TLS 运行时配置
+
+TLS 在 FIX Logon 之前完成握手。因此 acceptor TLS 配置属于 `ListenerConfig`，initiator TLS 配置属于 initiator `CounterpartyConfig`。TLS 不改变 `SessionKey`、序列号、store key、profile 选择或 replay 语义。
+
+```cpp
+nimble::runtime::TlsServerConfig server_tls;
+server_tls.enabled = true;
+server_tls.certificate_chain_file = "/etc/nimblefix/server-chain.pem";
+server_tls.private_key_file = "/etc/nimblefix/server-key.pem";
+server_tls.ca_file = "/etc/nimblefix/client-ca.pem";
+server_tls.verify_peer = true;
+server_tls.require_client_certificate = true;
+
+config.listeners.push_back(
+    nimble::runtime::ListenerConfigBuilder::Named("tls-main")
+        .bind("0.0.0.0", 9877)
+        .tls_server(std::move(server_tls))
+        .build());
+
+nimble::runtime::TlsClientConfig client_tls;
+client_tls.enabled = true;
+client_tls.server_name = "fix.example.com";
+client_tls.expected_peer_name = "fix.example.com";
+client_tls.ca_file = "/etc/nimblefix/ca.pem";
+client_tls.min_version = nimble::runtime::TlsProtocolVersion::kTls12;
+
+config.counterparties.push_back(
+    nimble::runtime::CounterpartyConfigBuilder::Initiator(
+        "buy-side-tls", 1001U,
+        nimble::session::SessionKey{ .sender_comp_id = "BUY1", .target_comp_id = "SELL1" },
+        4400U)
+        .tls_client(std::move(client_tls))
+        .build());
+```
+
+对 acceptor，如果敏感 session 不能绑定到明文 listener，可配置 `acceptor_transport_security(kTlsOnly)`。`verify_peer=false` 只适合受控测试环境；生产部署应启用 peer verification，并提供 CA 文件或目录。
 
 ### 工具运行时配置（`.ffcfg`）
 

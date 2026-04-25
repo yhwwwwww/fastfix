@@ -750,6 +750,141 @@ NextLogonWindowStart(const SessionScheduleConfig& schedule, std::uint64_t unix_t
   return NextWindowStart(*window, unix_time_ns);
 }
 
+namespace {
+
+auto
+TlsVersionRank(TlsProtocolVersion version) -> int
+{
+  switch (version) {
+    case TlsProtocolVersion::kSystemDefault:
+      return 0;
+    case TlsProtocolVersion::kTls10:
+      return 10;
+    case TlsProtocolVersion::kTls11:
+      return 11;
+    case TlsProtocolVersion::kTls12:
+      return 12;
+    case TlsProtocolVersion::kTls13:
+      return 13;
+  }
+  return 0;
+}
+
+auto
+PathExists(const std::filesystem::path& path) -> bool
+{
+  return path.empty() || std::filesystem::exists(path);
+}
+
+auto
+ValidateTlsVersionRange(TlsProtocolVersion min_version, TlsProtocolVersion max_version, std::string_view owner_label)
+  -> base::Status
+{
+  const auto min_rank = TlsVersionRank(min_version);
+  const auto max_rank = TlsVersionRank(max_version);
+  if (min_rank != 0 && max_rank != 0 && min_rank > max_rank) {
+    return base::Status::InvalidArgument(std::string(owner_label) + " config has min_version above max_version");
+  }
+  return base::Status::Ok();
+}
+
+auto
+ValidateTlsClientConfig(std::string_view counterparty_name, const TlsClientConfig& config) -> base::Status
+{
+  if (!config.enabled) {
+    return base::Status::Ok();
+  }
+
+  if (!TlsTransportEnabledAtBuild()) {
+    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
+                                         "' sets tls_client.enabled=true but this build was compiled without "
+                                         "optional TLS support");
+  }
+  if (config.certificate_chain_file.empty() != config.private_key_file.empty()) {
+    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
+                                         "' TLS client certificate_chain_file and private_key_file must be configured "
+                                         "together");
+  }
+  if (!PathExists(config.certificate_chain_file)) {
+    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
+                                         "' TLS client certificate_chain_file does not exist");
+  }
+  if (!PathExists(config.private_key_file)) {
+    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
+                                         "' TLS client private_key_file does not exist");
+  }
+  if (!PathExists(config.ca_file)) {
+    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
+                                         "' TLS client ca_file does not exist");
+  }
+  if (!PathExists(config.ca_path)) {
+    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
+                                         "' TLS client ca_path does not exist");
+  }
+  if (!config.expected_peer_name.empty() && !config.verify_peer) {
+    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
+                                         "' sets expected_peer_name while verify_peer is disabled");
+  }
+  return ValidateTlsVersionRange(
+    config.min_version, config.max_version, "counterparty '" + std::string(counterparty_name) + "' TLS client");
+}
+
+auto
+ValidateTlsServerConfig(std::string_view listener_name, const TlsServerConfig& config) -> base::Status
+{
+  if (!config.enabled) {
+    return base::Status::Ok();
+  }
+
+  if (!TlsTransportEnabledAtBuild()) {
+    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
+                                         "' sets tls_server.enabled=true but this build was compiled without "
+                                         "optional TLS support");
+  }
+  if (config.certificate_chain_file.empty() || config.private_key_file.empty()) {
+    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
+                                         "' TLS server requires certificate_chain_file and private_key_file");
+  }
+  if (!PathExists(config.certificate_chain_file)) {
+    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
+                                         "' TLS server certificate_chain_file does not exist");
+  }
+  if (!PathExists(config.private_key_file)) {
+    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
+                                         "' TLS server private_key_file does not exist");
+  }
+  if (!PathExists(config.ca_file)) {
+    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
+                                         "' TLS server ca_file does not exist");
+  }
+  if (!PathExists(config.ca_path)) {
+    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
+                                         "' TLS server ca_path does not exist");
+  }
+  if (config.require_client_certificate && !config.verify_peer) {
+    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
+                                         "' TLS server require_client_certificate implies verify_peer=true");
+  }
+  if (config.require_client_certificate && config.ca_file.empty() && config.ca_path.empty()) {
+    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
+                                         "' TLS server require_client_certificate requires ca_file or ca_path");
+  }
+  return ValidateTlsVersionRange(
+    config.min_version, config.max_version, "listener '" + std::string(listener_name) + "' TLS server");
+}
+
+} // namespace
+
+auto
+TlsTransportEnabledAtBuild() noexcept -> bool
+{
+#if defined(NIMBLEFIX_ENABLE_TLS)
+  return true;
+#else
+  return false;
+#endif
+}
+
 auto
 ValidateEngineConfig(const EngineConfig& config) -> base::Status
 {
@@ -773,6 +908,8 @@ ValidateEngineConfig(const EngineConfig& config) -> base::Status
   }
 
   std::unordered_set<std::string> listener_names;
+  bool has_plain_listener = false;
+  bool has_tls_listener = false;
   for (const auto& listener : config.listeners) {
     if (listener.name.empty()) {
       return base::Status::InvalidArgument("listener name must not be empty");
@@ -782,6 +919,15 @@ ValidateEngineConfig(const EngineConfig& config) -> base::Status
     }
     if (listener.worker_hint >= config.worker_count) {
       return base::Status::InvalidArgument("listener worker_hint must be less than worker_count");
+    }
+    auto tls_status = ValidateTlsServerConfig(listener.name, listener.tls_server);
+    if (!tls_status.ok()) {
+      return tls_status;
+    }
+    if (listener.tls_server.enabled) {
+      has_tls_listener = true;
+    } else {
+      has_plain_listener = true;
     }
   }
 
@@ -827,6 +973,31 @@ ValidateEngineConfig(const EngineConfig& config) -> base::Status
     if (!schedule_status.ok()) {
       return schedule_status;
     }
+    auto tls_status = ValidateTlsClientConfig(counterparty.name, counterparty.tls_client);
+    if (!tls_status.ok()) {
+      return tls_status;
+    }
+    if (!counterparty.session.is_initiator && counterparty.tls_client.enabled) {
+      return base::Status::InvalidArgument("counterparty '" + counterparty.name +
+                                           "' is acceptor-mode but configures initiator TLS client settings");
+    }
+    if (counterparty.session.is_initiator &&
+        counterparty.acceptor_transport_security != TransportSecurityRequirement::kAny) {
+      return base::Status::InvalidArgument("counterparty '" + counterparty.name +
+                                           "' is initiator-mode and must not set acceptor_transport_security");
+    }
+    if (!counterparty.session.is_initiator) {
+      if (counterparty.acceptor_transport_security == TransportSecurityRequirement::kTlsOnly && !has_tls_listener) {
+        return base::Status::InvalidArgument("counterparty '" + counterparty.name +
+                                             "' requires TLS-only acceptor transport but no TLS listener is "
+                                             "configured");
+      }
+      if (counterparty.acceptor_transport_security == TransportSecurityRequirement::kPlainOnly && !has_plain_listener) {
+        return base::Status::InvalidArgument("counterparty '" + counterparty.name +
+                                             "' requires plain-only acceptor transport but no plain listener is "
+                                             "configured");
+      }
+    }
   }
 
   return base::Status::Ok();
@@ -855,6 +1026,13 @@ auto
 ListenerConfigBuilder::worker_hint(std::uint32_t worker_id) -> ListenerConfigBuilder&
 {
   config_.worker_hint = worker_id;
+  return *this;
+}
+
+auto
+ListenerConfigBuilder::tls_server(TlsServerConfig config) -> ListenerConfigBuilder&
+{
+  config_.tls_server = std::move(config);
   return *this;
 }
 
@@ -954,6 +1132,21 @@ auto
 CounterpartyConfigBuilder::validation_policy(session::ValidationPolicy policy) -> CounterpartyConfigBuilder&
 {
   config_.validation_policy = std::move(policy);
+  return *this;
+}
+
+auto
+CounterpartyConfigBuilder::tls_client(TlsClientConfig config) -> CounterpartyConfigBuilder&
+{
+  config_.tls_client = std::move(config);
+  return *this;
+}
+
+auto
+CounterpartyConfigBuilder::acceptor_transport_security(TransportSecurityRequirement requirement)
+  -> CounterpartyConfigBuilder&
+{
+  config_.acceptor_transport_security = requirement;
   return *this;
 }
 

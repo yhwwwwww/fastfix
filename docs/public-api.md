@@ -156,6 +156,68 @@ Additional conditional requirements:
 
 `CounterpartyConfigBuilder` and `ListenerConfigBuilder` exist to reduce boilerplate for the common cases above.
 
+## Optional TLS Transport
+
+TLS support has two separate switches:
+
+- Build support: compile with `NIMBLEFIX_ENABLE_TLS=ON` in CMake or `--nimblefix_enable_tls=true` in xmake. This links OpenSSL and makes TLS code available.
+- Runtime enablement: set `TlsClientConfig::enabled` or `TlsServerConfig::enabled`. Leaving those flags false keeps the connection on plain TCP even in a TLS-capable binary.
+
+If the binary was built without TLS support, `ValidateEngineConfig()` rejects any runtime config with `enabled=true`, and direct TLS connection creation returns a clear error. It never silently falls back to plain TCP.
+
+Initiator TLS is configured on the counterparty:
+
+```cpp
+nimble::runtime::TlsClientConfig tls;
+tls.enabled = true;
+tls.server_name = "fix.example.com";       // SNI
+tls.expected_peer_name = "fix.example.com";
+tls.ca_file = "/etc/nimblefix/ca.pem";
+tls.min_version = nimble::runtime::TlsProtocolVersion::kTls12;
+
+config.counterparties.push_back(
+	nimble::runtime::CounterpartyConfigBuilder::Initiator(
+		"buy-side-tls",
+		1001U,
+		nimble::session::SessionKey{ .sender_comp_id = "BUY1", .target_comp_id = "SELL1" },
+		4400U)
+		.tls_client(std::move(tls))
+		.build());
+```
+
+Acceptor TLS is configured on the listener because TLS is negotiated before FIX Logon identifies a session:
+
+```cpp
+nimble::runtime::TlsServerConfig tls;
+tls.enabled = true;
+tls.certificate_chain_file = "/etc/nimblefix/server-chain.pem";
+tls.private_key_file = "/etc/nimblefix/server-key.pem";
+tls.ca_file = "/etc/nimblefix/client-ca.pem";       // Required for mTLS verification.
+tls.verify_peer = true;
+tls.require_client_certificate = true;
+
+config.listeners.push_back(
+	nimble::runtime::ListenerConfigBuilder::Named("tls-main")
+		.bind("0.0.0.0", 9877)
+		.tls_server(std::move(tls))
+		.build());
+```
+
+For acceptor sessions, `CounterpartyConfig::acceptor_transport_security` can require a session to bind only over TLS or only over plain TCP. The runtime checks this against the actual accepted connection after Logon matching:
+
+```cpp
+config.counterparties.push_back(
+	nimble::runtime::CounterpartyConfigBuilder::Acceptor(
+		"sell-side-sensitive",
+		2001U,
+		nimble::session::SessionKey{ .sender_comp_id = "SELL1", .target_comp_id = "BUY1" },
+		4400U)
+		.acceptor_transport_security(nimble::runtime::TransportSecurityRequirement::kTlsOnly)
+		.build());
+```
+
+TLS does not participate in `SessionKey`, worker routing, store keys, FIX sequence numbers, or profile selection. `verify_peer=false` is available for controlled test environments, but production configurations should keep peer verification enabled and provide CA material.
+
 ## Minimal Static Acceptor Walkthrough
 
 ```cpp

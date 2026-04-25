@@ -4,6 +4,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <string>
 
 #include "nimblefix/codec/fix_codec.h"
 #include "nimblefix/message/message_builder.h"
@@ -12,6 +13,7 @@
 #include "nimblefix/runtime/config.h"
 #include "nimblefix/runtime/config_io.h"
 #include "nimblefix/runtime/engine.h"
+#include "nimblefix/transport/transport_connection.h"
 
 namespace {
 
@@ -44,7 +46,244 @@ MakeUtcNs(int year, int month, int day, int hour, int minute, int second) -> std
   return static_cast<std::uint64_t>(timegm(&value)) * 1'000'000'000ULL;
 }
 
+auto
+StatusContains(const nimble::base::Status& status, std::string_view text) -> bool
+{
+  return status.message().find(text) != std::string_view::npos;
+}
+
+auto
+TouchFile(const std::filesystem::path& path) -> void
+{
+  std::ofstream out(path, std::ios::trunc);
+  out << "test fixture\n";
+}
+
+auto
+MakeTlsValidationConfig(const std::filesystem::path& artifact_path) -> nimble::runtime::EngineConfig
+{
+  nimble::runtime::EngineConfig config;
+  config.worker_count = 1U;
+  config.profile_artifacts.push_back(artifact_path);
+  return config;
+}
+
+auto
+MakeInitiator(std::string name, nimble::runtime::TlsClientConfig tls_client = {}) -> nimble::runtime::CounterpartyConfig
+{
+  return nimble::runtime::CounterpartyConfigBuilder::Initiator(
+           std::move(name),
+           6001U,
+           nimble::session::SessionKey{ .sender_comp_id = "BUYTLS", .target_comp_id = "SELLTLS" },
+           4400U)
+    .tls_client(std::move(tls_client))
+    .build();
+}
+
+auto
+MakeAcceptor(std::string name, nimble::runtime::TransportSecurityRequirement requirement)
+  -> nimble::runtime::CounterpartyConfig
+{
+  return nimble::runtime::CounterpartyConfigBuilder::Acceptor(
+           std::move(name),
+           7001U,
+           nimble::session::SessionKey{ .sender_comp_id = "SELLTLS", .target_comp_id = "BUYTLS" },
+           4400U)
+    .acceptor_transport_security(requirement)
+    .build();
+}
+
 } // namespace
+
+TEST_CASE("runtime TLS config validation", "[runtime-config][tls]")
+{
+  const auto temp_root = std::filesystem::temp_directory_path() / "nimblefix-runtime-tls-config-test";
+  std::filesystem::remove_all(temp_root);
+  std::filesystem::create_directories(temp_root);
+
+  const auto artifact_path = temp_root / "sample-profile.art";
+  const auto cert_path = temp_root / "server-chain.pem";
+  const auto key_path = temp_root / "server-key.pem";
+  const auto ca_path = temp_root / "ca.pem";
+  TouchFile(artifact_path);
+  TouchFile(cert_path);
+  TouchFile(key_path);
+  TouchFile(ca_path);
+
+  REQUIRE(!nimble::runtime::TlsClientConfig{}.enabled);
+  REQUIRE(!nimble::runtime::TlsServerConfig{}.enabled);
+
+  if (!nimble::runtime::TlsTransportEnabledAtBuild()) {
+    auto listener_config = MakeTlsValidationConfig(artifact_path);
+    listener_config.listeners.push_back(nimble::runtime::ListenerConfigBuilder::Named("tls-listener")
+                                          .bind("127.0.0.1", 9101U)
+                                          .tls_server(nimble::runtime::TlsServerConfig{ .enabled = true })
+                                          .build());
+    const auto listener_status = nimble::runtime::ValidateEngineConfig(listener_config);
+    REQUIRE(!listener_status.ok());
+    REQUIRE(StatusContains(listener_status, "tls_server.enabled=true"));
+
+    auto counterparty_config = MakeTlsValidationConfig(artifact_path);
+    counterparty_config.counterparties.push_back(
+      MakeInitiator("tls-initiator", nimble::runtime::TlsClientConfig{ .enabled = true }));
+    const auto counterparty_status = nimble::runtime::ValidateEngineConfig(counterparty_config);
+    REQUIRE(!counterparty_status.ok());
+    REQUIRE(StatusContains(counterparty_status, "tls_client.enabled=true"));
+
+    auto tls_connect = nimble::transport::TransportConnection::Connect(
+      "127.0.0.1", 1U, std::chrono::milliseconds(5), &counterparty_config.counterparties.front().tls_client);
+    REQUIRE(!tls_connect.ok());
+    REQUIRE(StatusContains(tls_connect.status(), "without optional TLS support"));
+
+    std::filesystem::remove_all(temp_root);
+    return;
+  }
+
+  {
+    auto config = MakeTlsValidationConfig(artifact_path);
+    config.listeners.push_back(
+      nimble::runtime::ListenerConfigBuilder::Named("tls-missing-key")
+        .bind("127.0.0.1", 9102U)
+        .tls_server(nimble::runtime::TlsServerConfig{ .enabled = true, .certificate_chain_file = cert_path })
+        .build());
+    const auto status = nimble::runtime::ValidateEngineConfig(config);
+    REQUIRE(!status.ok());
+    REQUIRE(StatusContains(status, "requires certificate_chain_file and private_key_file"));
+  }
+
+  {
+    auto config = MakeTlsValidationConfig(artifact_path);
+    config.listeners.push_back(
+      nimble::runtime::ListenerConfigBuilder::Named("tls-bad-ca")
+        .bind("127.0.0.1", 9103U)
+        .tls_server(nimble::runtime::TlsServerConfig{ .enabled = true,
+                                                      .certificate_chain_file = cert_path,
+                                                      .private_key_file = key_path,
+                                                      .ca_file = temp_root / "missing-ca.pem" })
+        .build());
+    const auto status = nimble::runtime::ValidateEngineConfig(config);
+    REQUIRE(!status.ok());
+    REQUIRE(StatusContains(status, "ca_file does not exist"));
+  }
+
+  {
+    auto config = MakeTlsValidationConfig(artifact_path);
+    config.counterparties.push_back(MakeInitiator(
+      "tls-client-pair", nimble::runtime::TlsClientConfig{ .enabled = true, .certificate_chain_file = cert_path }));
+    const auto status = nimble::runtime::ValidateEngineConfig(config);
+    REQUIRE(!status.ok());
+    REQUIRE(StatusContains(status, "certificate_chain_file and private_key_file must be configured together"));
+  }
+
+  {
+    auto config = MakeTlsValidationConfig(artifact_path);
+    config.counterparties.push_back(
+      MakeInitiator("tls-client-peer-name",
+                    nimble::runtime::TlsClientConfig{
+                      .enabled = true, .expected_peer_name = "fix.example.test", .verify_peer = false }));
+    const auto status = nimble::runtime::ValidateEngineConfig(config);
+    REQUIRE(!status.ok());
+    REQUIRE(StatusContains(status, "expected_peer_name while verify_peer is disabled"));
+  }
+
+  {
+    auto config = MakeTlsValidationConfig(artifact_path);
+    config.counterparties.push_back(
+      MakeInitiator("tls-client-version",
+                    nimble::runtime::TlsClientConfig{ .enabled = true,
+                                                      .ca_file = ca_path,
+                                                      .min_version = nimble::runtime::TlsProtocolVersion::kTls13,
+                                                      .max_version = nimble::runtime::TlsProtocolVersion::kTls12 }));
+    const auto status = nimble::runtime::ValidateEngineConfig(config);
+    REQUIRE(!status.ok());
+    REQUIRE(StatusContains(status, "min_version above max_version"));
+  }
+
+  {
+    auto config = MakeTlsValidationConfig(artifact_path);
+    config.listeners.push_back(nimble::runtime::ListenerConfigBuilder::Named("tls-mtls-no-verify")
+                                 .bind("127.0.0.1", 9104U)
+                                 .tls_server(nimble::runtime::TlsServerConfig{ .enabled = true,
+                                                                               .certificate_chain_file = cert_path,
+                                                                               .private_key_file = key_path,
+                                                                               .require_client_certificate = true })
+                                 .build());
+    const auto status = nimble::runtime::ValidateEngineConfig(config);
+    REQUIRE(!status.ok());
+    REQUIRE(StatusContains(status, "require_client_certificate implies verify_peer=true"));
+  }
+
+  {
+    auto config = MakeTlsValidationConfig(artifact_path);
+    config.listeners.push_back(nimble::runtime::ListenerConfigBuilder::Named("tls-mtls-no-ca")
+                                 .bind("127.0.0.1", 9105U)
+                                 .tls_server(nimble::runtime::TlsServerConfig{ .enabled = true,
+                                                                               .certificate_chain_file = cert_path,
+                                                                               .private_key_file = key_path,
+                                                                               .verify_peer = true,
+                                                                               .require_client_certificate = true })
+                                 .build());
+    const auto status = nimble::runtime::ValidateEngineConfig(config);
+    REQUIRE(!status.ok());
+    REQUIRE(StatusContains(status, "requires ca_file or ca_path"));
+  }
+
+  {
+    auto config = MakeTlsValidationConfig(artifact_path);
+    config.listeners.push_back(nimble::runtime::ListenerConfigBuilder::Named("plain").bind("127.0.0.1", 9106U).build());
+    config.counterparties.push_back(
+      MakeAcceptor("tls-only-session", nimble::runtime::TransportSecurityRequirement::kTlsOnly));
+    const auto status = nimble::runtime::ValidateEngineConfig(config);
+    REQUIRE(!status.ok());
+    REQUIRE(StatusContains(status, "requires TLS-only acceptor transport"));
+  }
+
+  {
+    auto config = MakeTlsValidationConfig(artifact_path);
+    config.listeners.push_back(nimble::runtime::ListenerConfigBuilder::Named("tls")
+                                 .bind("127.0.0.1", 9107U)
+                                 .tls_server(nimble::runtime::TlsServerConfig{
+                                   .enabled = true, .certificate_chain_file = cert_path, .private_key_file = key_path })
+                                 .build());
+    config.counterparties.push_back(
+      MakeAcceptor("plain-only-session", nimble::runtime::TransportSecurityRequirement::kPlainOnly));
+    const auto status = nimble::runtime::ValidateEngineConfig(config);
+    REQUIRE(!status.ok());
+    REQUIRE(StatusContains(status, "requires plain-only acceptor transport"));
+  }
+
+  {
+    auto config = MakeTlsValidationConfig(artifact_path);
+    config.listeners.push_back(nimble::runtime::ListenerConfigBuilder::Named("tls")
+                                 .bind("127.0.0.1", 9108U)
+                                 .tls_server(nimble::runtime::TlsServerConfig{ .enabled = true,
+                                                                               .certificate_chain_file = cert_path,
+                                                                               .private_key_file = key_path,
+                                                                               .ca_file = ca_path,
+                                                                               .verify_peer = true,
+                                                                               .require_client_certificate = true })
+                                 .build());
+    config.counterparties.push_back(
+      MakeAcceptor("tls-only-session", nimble::runtime::TransportSecurityRequirement::kTlsOnly));
+    REQUIRE(nimble::runtime::ValidateEngineConfig(config).ok());
+  }
+
+  {
+    auto config = MakeTlsValidationConfig(artifact_path);
+    config.counterparties.push_back(
+      MakeInitiator("tls-client-valid",
+                    nimble::runtime::TlsClientConfig{ .enabled = true,
+                                                      .server_name = "fix.example.test",
+                                                      .ca_file = ca_path,
+                                                      .certificate_chain_file = cert_path,
+                                                      .private_key_file = key_path,
+                                                      .min_version = nimble::runtime::TlsProtocolVersion::kTls12,
+                                                      .max_version = nimble::runtime::TlsProtocolVersion::kTls13 }));
+    REQUIRE(nimble::runtime::ValidateEngineConfig(config).ok());
+  }
+
+  std::filesystem::remove_all(temp_root);
+}
 
 TEST_CASE("runtime-config", "[runtime-config]")
 {
@@ -308,6 +547,44 @@ TEST_CASE("runtime-config", "[runtime-config]")
   REQUIRE(acceptor.dispatch_mode == nimble::runtime::AppDispatchMode::kQueueDecoupled);
   REQUIRE(acceptor.validation_policy.mode == nimble::session::ValidationMode::kCompatible);
   REQUIRE(!acceptor.reconnect_enabled);
+
+  REQUIRE(!nimble::runtime::TlsClientConfig{}.enabled);
+  REQUIRE(!nimble::runtime::TlsServerConfig{}.enabled);
+
+  if (!nimble::runtime::TlsTransportEnabledAtBuild()) {
+    nimble::runtime::EngineConfig tls_listener_config;
+    tls_listener_config.worker_count = 1U;
+    tls_listener_config.profile_artifacts.push_back(artifact_path);
+    tls_listener_config.listeners.push_back(nimble::runtime::ListenerConfigBuilder::Named("tls-listener")
+                                              .bind("127.0.0.1", 9101U)
+                                              .tls_server(nimble::runtime::TlsServerConfig{ .enabled = true })
+                                              .build());
+
+    const auto listener_status = nimble::runtime::ValidateEngineConfig(tls_listener_config);
+    REQUIRE(!listener_status.ok());
+    REQUIRE(listener_status.message().find("tls_server.enabled=true") != std::string::npos);
+
+    nimble::runtime::EngineConfig tls_counterparty_config;
+    tls_counterparty_config.worker_count = 1U;
+    tls_counterparty_config.profile_artifacts.push_back(artifact_path);
+    tls_counterparty_config.counterparties.push_back(
+      nimble::runtime::CounterpartyConfigBuilder::Initiator(
+        "tls-initiator",
+        4001U,
+        nimble::session::SessionKey{ .sender_comp_id = "BUYTLS", .target_comp_id = "SELLTLS" },
+        4400U)
+        .tls_client(nimble::runtime::TlsClientConfig{ .enabled = true })
+        .build());
+
+    const auto counterparty_status = nimble::runtime::ValidateEngineConfig(tls_counterparty_config);
+    REQUIRE(!counterparty_status.ok());
+    REQUIRE(counterparty_status.message().find("tls_client.enabled=true") != std::string::npos);
+
+    auto tls_connect = nimble::transport::TransportConnection::Connect(
+      "127.0.0.1", 1U, std::chrono::milliseconds(5), &tls_counterparty_config.counterparties.front().tls_client);
+    REQUIRE(!tls_connect.ok());
+    REQUIRE(tls_connect.status().message().find("without optional TLS support") != std::string::npos);
+  }
 
   std::filesystem::remove(config_path);
   std::filesystem::remove(artifact_path);

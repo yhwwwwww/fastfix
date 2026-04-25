@@ -4,6 +4,16 @@ set_languages("cxx20")
 set_warnings("all")
 add_rules("mode.debug", "mode.release")
 
+option("nimblefix_enable_tls")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable optional TLS support via OpenSSL")
+option_end()
+
+if has_config("nimblefix_enable_tls") then
+    add_requires("openssl")
+end
+
 includes("config/deps.lua")
 
 local local_deps = NIMBLEFIX_LOCAL_DEPS or {}
@@ -252,6 +262,10 @@ target("nimblefix")
     add_includedirs(public_include_root, {public = true})
     add_includedirs(internal_include_root)
     add_defines("NIMBLEFIX_PROJECT_DIR=\"$(projectdir)\"", {public = true})
+    if has_config("nimblefix_enable_tls") then
+        add_packages("openssl", {public = true})
+        add_defines("NIMBLEFIX_ENABLE_TLS", {public = true})
+    end
     add_files("src/profile/*.cpp", "src/runtime/*.cpp", "src/session/*.cpp", "src/store/*.cpp", "src/message/*.cpp", "src/codec/*.cpp", "src/transport/*.cpp")
     if os.isfile("/usr/include/liburing.h") or os.isfile("/usr/local/include/liburing.h") then
         add_syslinks("uring")
@@ -340,6 +354,12 @@ target("nimblefix-bench")
     add_includedirs("build/generated")
     add_files("bench/main.cpp")
 
+target("nimblefix-tls-transport-bench")
+    set_kind("binary")
+    set_default(false)
+    add_deps("nimblefix")
+    add_files("bench/tls_transport.cpp")
+
 target("nimblefix-vendor-quickfix")
     set_kind("static")
     set_default(false)
@@ -383,6 +403,7 @@ add_internal_repo_includedirs("nimblefix-initiator")
 add_internal_repo_includedirs("nimblefix-acceptor")
 add_internal_repo_includedirs("nimblefix-xml2ffd")
 add_internal_repo_includedirs("nimblefix-bench")
+add_internal_repo_includedirs("nimblefix-tls-transport-bench")
 add_internal_repo_includedirs("nimblefix-tests")
 
 apply_local_dep("nimblefix", "nimblefix")
@@ -396,6 +417,7 @@ apply_local_dep("nimblefix-fuzz-codec-libfuzzer", "nimblefix-fuzz-codec-libfuzze
 apply_local_dep("nimblefix-initiator", "nimblefix-initiator")
 apply_local_dep("nimblefix-acceptor", "nimblefix-acceptor")
 apply_local_dep("nimblefix-bench", "nimblefix-bench")
+apply_local_dep("nimblefix-tls-transport-bench", "nimblefix-tls-transport-bench")
 apply_local_dep("nimblefix-vendor-quickfix", "nimblefix-vendor-quickfix")
 apply_local_dep("nimblefix-quickfix-cpp-bench", "nimblefix-quickfix-cpp-bench")
 apply_local_dep("nimblefix-tests", "nimblefix-tests")

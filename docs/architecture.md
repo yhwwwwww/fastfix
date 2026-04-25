@@ -14,7 +14,7 @@ nimblefix/
 ├── profile/       Protocol profile loading, dictionary, artifact format
 ├── session/       Session state machine, admin protocol, recovery
 ├── store/         Message persistence (memory, mmap, durable batch)
-├── transport/     TCP socket I/O
+├── transport/     TCP socket I/O and optional TLS record I/O
 └── runtime/       Engine orchestration, workers, pollers, metrics, trace
 ```
 
@@ -395,7 +395,7 @@ store_root/
 
 ### 7. Transport (public include: `nimblefix/transport/`)
 
-TCP socket I/O with frame boundary detection.
+TCP socket I/O with frame boundary detection, plus optional TLS record I/O when the binary is built with OpenSSL support.
 
 ```cpp
 class TcpConnection {
@@ -410,9 +410,27 @@ class TcpAcceptor {
     auto TryAccept() -> Result<optional<TcpConnection>>;
     auto Accept(timeout) -> Result<TcpConnection>;
 };
+
+class TransportConnection {
+    static auto Connect(host, port, timeout, tls_client_config) -> Result<TransportConnection>;
+    static auto FromAcceptedTcp(tcp, timeout, tls_server_config) -> Result<TransportConnection>;
+    auto fd() const -> int;
+    auto uses_tls() const -> bool;
+    auto Send(bytes, timeout) -> Status;
+    auto SendGather(segments, timeout) -> Status;
+    auto ReceiveFrameView(timeout) -> Result<span<const byte>>;
+};
 ```
 
 **Frame detection**: The receiver scans for `8=` (BeginString), reads BodyLength, consumes the body, and verifies the checksum before returning a complete frame.
+
+**TLS boundary**: `NIMBLEFIX_ENABLE_TLS` means optional TLS support is compiled in and OpenSSL is linked. It does not make all connections encrypted. Runtime encryption is selected per connection through `TlsClientConfig::enabled` for initiators and `TlsServerConfig::enabled` for acceptor listeners. When runtime TLS is requested without compiled support, validation and connection creation fail explicitly.
+
+`TransportConnection` is the runtime-facing value type. It wraps either a plain `TcpConnection` or a TLS connection while keeping the same frame-level contract for `fd()`, send, gather send, receive, and close. TLS handshakes happen before `AdminProtocol::OnTransportConnected()` and therefore before FIX Logon. Once the handshake succeeds, codec, session, profile, and store layers see only decrypted FIX frames.
+
+TLS peer identity is security input, not FIX identity. It is not part of `SessionKey`, worker hashing, store keys, sequence state, profile id, or dynamic session id allocation. Acceptor counterparties can still require `kTlsOnly` or `kPlainOnly`; `BindConnectionFromLogon()` checks that requirement against the actual connection after Logon matching.
+
+Metrics track plain connection count, TLS connection count, TLS handshake successes/failures, cumulative handshake latency, and session resumption count per worker. Trace events record handshake success/failure, negotiated version/cipher, and whether resumption was used, without logging private keys or full certificate bodies.
 
 ### 8. Runtime (public include: `nimblefix/runtime/`)
 
@@ -446,12 +464,12 @@ Event-driven endpoint drivers:
 LiveAcceptor                          LiveInitiator
     │                                     │
     ├── OpenListeners("main")             ├── OpenSession(id, host, port)
-    │   └── TcpAcceptor::Listen()         │   └── TcpConnection::Connect()
+    │   └── TcpAcceptor::Listen()         │   └── TransportConnection::Connect()
     │                                     │
     └── Run()                             └── Run()
         ├── poll() on listener FDs            ├── poll() on connection FDs
         ├── AcceptReadyListener()             ├── ProcessConnection()
-        │   └── Accept → ConnectionState      │   ├── ReceiveFrameView()
+        │   └── Accept → TransportConnection  │   ├── ReceiveFrameView()
         ├── ProcessConnection()               │   ├── DecodeFixMessageView()
         │   ├── Peek header                   │   ├── AdminProtocol::OnInbound()
         │   ├── BindConnectionFromLogon()     │   └── DispatchAppMessage()

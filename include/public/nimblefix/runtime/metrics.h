@@ -39,6 +39,12 @@ struct WorkerMetrics
   std::atomic<std::uint64_t> checksum_failures{ 0 };
   std::atomic<std::uint64_t> outbound_queue_depth{ 0 };
   std::atomic<std::uint64_t> last_store_flush_latency_ns{ 0 };
+  std::atomic<std::uint64_t> plain_connections{ 0 };
+  std::atomic<std::uint64_t> tls_connections{ 0 };
+  std::atomic<std::uint64_t> tls_handshake_successes{ 0 };
+  std::atomic<std::uint64_t> tls_handshake_failures{ 0 };
+  std::atomic<std::uint64_t> tls_handshake_latency_ns{ 0 };
+  std::atomic<std::uint64_t> tls_session_resumptions{ 0 };
 
   // Steady-state breakdown timing (nanoseconds, relaxed stores from worker
   // thread).
@@ -86,6 +92,12 @@ struct RuntimeMetricsSnapshot
     std::uint64_t timer_process_ns{ 0 };
     std::uint64_t send_ns{ 0 };
     std::uint64_t poll_iterations{ 0 };
+    std::uint64_t plain_connections{ 0 };
+    std::uint64_t tls_connections{ 0 };
+    std::uint64_t tls_handshake_successes{ 0 };
+    std::uint64_t tls_handshake_failures{ 0 };
+    std::uint64_t tls_handshake_latency_ns{ 0 };
+    std::uint64_t tls_session_resumptions{ 0 };
   };
 
   std::vector<WorkerEntry> workers;
@@ -106,6 +118,9 @@ public:
   auto RecordChecksumFailure(std::uint64_t session_id) -> base::Status;
   auto UpdateOutboundQueueDepth(std::uint64_t session_id, std::uint32_t depth) -> base::Status;
   auto ObserveStoreFlushLatency(std::uint64_t session_id, std::uint64_t latency_ns) -> base::Status;
+  auto RecordPlainConnection(std::uint32_t worker_id) -> base::Status;
+  auto RecordTlsHandshake(std::uint32_t worker_id, bool success, std::uint64_t latency_ns, bool session_reused)
+    -> base::Status;
 
   [[nodiscard]] auto Snapshot() const -> RuntimeMetricsSnapshot;
   [[nodiscard]] auto FindSession(std::uint64_t session_id) const -> const SessionMetrics*;

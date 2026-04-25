@@ -3,8 +3,8 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <cstddef>
 #include <condition_variable>
+#include <cstddef>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -31,7 +31,7 @@
 #include "nimblefix/store/memory_store.h"
 #include "nimblefix/store/mmap_store.h"
 #include "nimblefix/store/session_store.h"
-#include "nimblefix/transport/tcp_transport.h"
+#include "nimblefix/transport/transport_connection.h"
 
 namespace nimble::runtime {
 
@@ -62,6 +62,76 @@ auto
 SessionKeyText(const session::SessionKey& key) -> std::string
 {
   return key.begin_string + ':' + key.sender_comp_id + "->" + key.target_comp_id;
+}
+
+auto
+RecordTransportMetrics(Engine* engine,
+                       std::uint32_t worker_id,
+                       const transport::TransportConnection& connection,
+                       std::uint64_t latency_ns) -> void
+{
+  const auto* config = engine != nullptr ? engine->config() : nullptr;
+  if (config == nullptr || !config->enable_metrics) {
+    return;
+  }
+  auto* metrics = engine->mutable_metrics();
+  if (!connection.uses_tls()) {
+    static_cast<void>(metrics->RecordPlainConnection(worker_id));
+    return;
+  }
+  const auto session_info = connection.tls_session_info();
+  static_cast<void>(
+    metrics->RecordTlsHandshake(worker_id, true, latency_ns, session_info.has_value() && session_info->session_reused));
+}
+
+auto
+RecordTlsFailureMetrics(Engine* engine, std::uint32_t worker_id, std::uint64_t latency_ns) -> void
+{
+  const auto* config = engine != nullptr ? engine->config() : nullptr;
+  if (config == nullptr || !config->enable_metrics) {
+    return;
+  }
+  static_cast<void>(engine->mutable_metrics()->RecordTlsHandshake(worker_id, false, latency_ns, false));
+}
+
+auto
+TlsTraceText(std::string_view prefix, const transport::TransportConnection& connection) -> std::string
+{
+  std::string text(prefix);
+  const auto session_info = connection.tls_session_info();
+  if (!session_info.has_value()) {
+    return text;
+  }
+  text.append(" ");
+  text.append(session_info->protocol);
+  text.append(" ");
+  text.append(session_info->cipher);
+  if (session_info->session_reused) {
+    text.append(" reused");
+  }
+  return text;
+}
+
+auto
+ValidateAcceptorTransportSecurity(const CounterpartyConfig& counterparty, bool uses_tls) -> base::Status
+{
+  switch (counterparty.acceptor_transport_security) {
+    case TransportSecurityRequirement::kAny:
+      return base::Status::Ok();
+    case TransportSecurityRequirement::kPlainOnly:
+      if (uses_tls) {
+        return base::Status::InvalidArgument("counterparty '" + counterparty.name +
+                                             "' requires plain-only acceptor transport but matched a TLS connection");
+      }
+      return base::Status::Ok();
+    case TransportSecurityRequirement::kTlsOnly:
+      if (!uses_tls) {
+        return base::Status::InvalidArgument("counterparty '" + counterparty.name +
+                                             "' requires TLS-only acceptor transport but matched a plain connection");
+      }
+      return base::Status::Ok();
+  }
+  return base::Status::InvalidArgument("unknown acceptor transport security requirement");
 }
 
 auto
@@ -213,13 +283,14 @@ struct LiveAcceptor::ListenerState
 {
   std::string name;
   std::uint32_t worker_hint{ 0 };
+  TlsServerConfig tls_server;
   transport::TcpAcceptor acceptor;
 };
 
 struct LiveAcceptor::ConnectionState
 {
   std::uint64_t connection_id{ 0 };
-  transport::TcpConnection connection;
+  transport::TransportConnection connection;
   std::unique_ptr<ActiveSession> session;
   std::uint64_t last_progress_ns{ 0 };
   std::optional<RuntimeEvent> pending_app_event;
@@ -803,6 +874,7 @@ LiveAcceptor::OpenListeners(std::string_view listener_name) -> base::Status
     listeners_.push_back(ListenerState{
       .name = listener->name,
       .worker_hint = listener->worker_hint,
+      .tls_server = listener->tls_server,
       .acceptor = std::move(acceptor).value(),
     });
     RecordTrace(TraceEventKind::kSessionEvent,
@@ -1343,10 +1415,43 @@ LiveAcceptor::AcceptReadyListener(std::size_t listener_index, std::uint64_t time
       return base::Status::NotFound("live acceptor worker shard was not found");
     }
 
+    const auto handshake_started_ns = NowNs();
+    const bool tls_requested = listeners_[listener_index].tls_server.enabled;
+    auto connection_result =
+      transport::TransportConnection::FromAcceptedTcp(std::move(*accepted.value()),
+                                                      options_.io_timeout,
+                                                      tls_requested ? &listeners_[listener_index].tls_server : nullptr);
+    const auto handshake_latency_ns = NowNs() - handshake_started_ns;
+    if (!connection_result.ok()) {
+      if (tls_requested) {
+        RecordTlsFailureMetrics(engine_, shard->worker_id, handshake_latency_ns);
+        RecordTrace(TraceEventKind::kSessionEvent,
+                    0U,
+                    shard->worker_id,
+                    timestamp_ns,
+                    handshake_latency_ns,
+                    listeners_[listener_index].acceptor.port(),
+                    "tls server handshake failed");
+      }
+      return connection_result.status();
+    }
+
+    auto transport_connection = std::move(connection_result).value();
+    RecordTransportMetrics(engine_, shard->worker_id, transport_connection, handshake_latency_ns);
+    if (transport_connection.uses_tls()) {
+      RecordTrace(TraceEventKind::kSessionEvent,
+                  0U,
+                  shard->worker_id,
+                  timestamp_ns,
+                  handshake_latency_ns,
+                  listeners_[listener_index].acceptor.port(),
+                  TlsTraceText("tls server handshake", transport_connection));
+    }
+
     const auto connection_id = next_connection_id_++;
     ConnectionState connection{
       .connection_id = connection_id,
-      .connection = std::move(*accepted.value()),
+      .connection = std::move(transport_connection),
       .last_progress_ns = timestamp_ns,
     };
     if (worker_threads_.empty()) {
@@ -1368,7 +1473,7 @@ LiveAcceptor::AcceptReadyListener(std::size_t listener_index, std::uint64_t time
                 timestamp_ns,
                 connection_id,
                 listeners_[listener_index].acceptor.port(),
-                "tcp accept");
+                tls_requested ? "tls accept" : "tcp accept");
   }
 }
 
@@ -1727,15 +1832,20 @@ LiveAcceptor::BindConnectionFromLogon(WorkerShardState& shard,
     return resolved.status();
   }
 
-  if (!IsWithinLogonWindow(resolved.value().counterparty.session_schedule, WallClockNowNs())) {
+  auto matched = std::move(resolved).value();
+  auto security_status = ValidateAcceptorTransportSecurity(matched.counterparty, connection->connection.uses_tls());
+  if (!security_status.ok()) {
+    return security_status;
+  }
+
+  if (!IsWithinLogonWindow(matched.counterparty.session_schedule, WallClockNowNs())) {
     return base::Status::InvalidArgument("inbound Logon arrived outside the configured logon window");
   }
 
-  if (HasActiveSession(resolved.value().counterparty.session.session_id)) {
+  if (HasActiveSession(matched.counterparty.session.session_id)) {
     return base::Status::AlreadyExists("session already has an active transport connection");
   }
 
-  auto matched = std::move(resolved).value();
   auto active_session = MakeActiveSession(matched.counterparty, std::move(matched.dictionary));
   if (!active_session.ok()) {
     return active_session.status();

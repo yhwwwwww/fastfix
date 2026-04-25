@@ -26,7 +26,7 @@
 #include "nimblefix/runtime/shard_poller.h"
 #include "nimblefix/session/admin_protocol.h"
 #include "nimblefix/store/session_store.h"
-#include "nimblefix/transport/tcp_transport.h"
+#include "nimblefix/transport/transport_connection.h"
 
 namespace nimble::runtime {
 
@@ -144,7 +144,7 @@ protected:
   struct ConnectionState
   {
     std::uint64_t connection_id{ 0 };
-    transport::TcpConnection connection;
+    transport::TransportConnection connection;
     std::unique_ptr<ActiveSession> session;
     std::uint64_t last_progress_ns{ 0 };
     std::optional<RuntimeEvent> pending_app_event;

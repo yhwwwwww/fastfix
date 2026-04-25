@@ -123,6 +123,26 @@ The NimbleFIX loopback benchmark prints an additional per-phase breakdown inside
 
 Those four sub-measurements are nested inside the single `loopback-roundtrip` percentile table.
 
+## TLS Transport Baseline
+
+`nimblefix-tls-transport-bench` is a focused transport-level benchmark for the optional TLS layer. It always prints a plain `TransportConnection` TCP RTT baseline. When the binary is built with `NIMBLEFIX_ENABLE_TLS=ON` and certificate material is provided, it also prints TLS connect/handshake latency, steady-state RTT, negotiated protocol/cipher, and whether OpenSSL reported session reuse.
+
+Build and run:
+
+```bash
+cmake -S . -B build/cmake/tls-bench -DCMAKE_BUILD_TYPE=Release -DNIMBLEFIX_ENABLE_TLS=ON
+cmake --build build/cmake/tls-bench --target nimblefix-tls-transport-bench
+
+./build/cmake/tls-bench/nimblefix-tls-transport-bench \
+	--iterations 10000 \
+	--warmup 1000 \
+	--cert /path/to/server-chain.pem \
+	--key /path/to/server-key.pem \
+	--ca /path/to/ca.pem
+```
+
+The benchmark uses the same frame boundary detection and send/gather-send surface that the live runtime uses. If you omit `--cert`, `--key`, or `--ca`, the run intentionally records only the TCP baseline. If the binary was built without TLS support, the TLS leg is skipped explicitly rather than falling back to plaintext.
+
 ## Current Side-By-Side Snapshot (2026-04-14)
 
 Command used:

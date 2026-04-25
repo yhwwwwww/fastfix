@@ -74,6 +74,28 @@ enum class PollMode : std::uint32_t
   kBusy = 1,
 };
 
+/// Lower/upper bound selectors for TLS protocol negotiation.
+enum class TlsProtocolVersion : std::uint32_t
+{
+  /// Leave the bound to the TLS library default policy.
+  kSystemDefault = 0,
+  kTls10,
+  kTls11,
+  kTls12,
+  kTls13,
+};
+
+/// Accept-side transport security policy for one FIX session.
+enum class TransportSecurityRequirement : std::uint32_t
+{
+  /// Session may bind over either plain TCP or TLS.
+  kAny = 0,
+  /// Session must bind only over plain TCP listeners.
+  kPlainOnly,
+  /// Session must bind only over TLS-protected listeners.
+  kTlsOnly,
+};
+
 /// Calendar day values used by SessionScheduleConfig.
 enum class SessionDayOfWeek : std::uint32_t
 {
@@ -127,6 +149,47 @@ struct SessionScheduleConfig
   std::optional<SessionDayOfWeek> logout_day;
 };
 
+/// Optional TLS client policy for initiator connections.
+///
+/// Runtime TLS remains disabled unless enabled is set true.
+struct TlsClientConfig
+{
+  // Runtime TLS is disabled unless this is set true.
+  bool enabled{ false };
+  std::string server_name;
+  std::string expected_peer_name;
+  std::filesystem::path ca_file;
+  std::filesystem::path ca_path;
+  std::filesystem::path certificate_chain_file;
+  std::filesystem::path private_key_file;
+  bool verify_peer{ true };
+  TlsProtocolVersion min_version{ TlsProtocolVersion::kSystemDefault };
+  TlsProtocolVersion max_version{ TlsProtocolVersion::kSystemDefault };
+  std::string cipher_list;
+  std::string cipher_suites;
+  bool session_resumption{ true };
+};
+
+/// Optional TLS server policy for acceptor listeners.
+///
+/// Runtime TLS remains disabled unless enabled is set true.
+struct TlsServerConfig
+{
+  // Runtime TLS is disabled unless this is set true.
+  bool enabled{ false };
+  std::filesystem::path certificate_chain_file;
+  std::filesystem::path private_key_file;
+  std::filesystem::path ca_file;
+  std::filesystem::path ca_path;
+  bool verify_peer{ false };
+  bool require_client_certificate{ false };
+  TlsProtocolVersion min_version{ TlsProtocolVersion::kSystemDefault };
+  TlsProtocolVersion max_version{ TlsProtocolVersion::kSystemDefault };
+  std::string cipher_list;
+  std::string cipher_suites;
+  bool session_cache{ true };
+};
+
 /// Listener definition for one acceptor front door.
 ///
 /// Design intent: separate transport listener identity from session matching so
@@ -143,6 +206,9 @@ struct ListenerConfig
   // Optional accept-side routing hint. After Logon, the bound session worker
   // owns steady-state protocol and application work.
   std::uint32_t worker_hint{ 0 };
+  // Optional TLS server policy for this listener. Runtime TLS remains off
+  // unless tls_server.enabled is true.
+  TlsServerConfig tls_server;
 };
 
 /// Static runtime configuration for one counterparty session.
@@ -190,6 +256,12 @@ struct CounterpartyConfig
   bool send_next_expected_msg_seq_num{ false };
   // Session-active and logon window policy.
   SessionScheduleConfig session_schedule;
+  // Optional initiator TLS policy. Runtime TLS remains off unless
+  // tls_client.enabled is true. Acceptor sessions ignore this field.
+  TlsClientConfig tls_client;
+  // Acceptor-side transport security requirement. Initiator sessions should
+  // leave this at kAny.
+  TransportSecurityRequirement acceptor_transport_security{ TransportSecurityRequirement::kAny };
   // Initiator reconnect defaults. Leave disabled for acceptors.
   bool reconnect_enabled = false;
   std::uint32_t reconnect_initial_ms = kDefaultReconnectInitialMs;
@@ -272,6 +344,14 @@ public:
   /// \param worker_id Preferred worker id.
   /// \return This builder.
   auto worker_hint(std::uint32_t worker_id) -> ListenerConfigBuilder&;
+
+  /// Configure optional TLS server support on this listener.
+  ///
+  /// Runtime TLS uses this policy only when config.enabled is true.
+  ///
+  /// \param config TLS server configuration.
+  /// \return This builder.
+  auto tls_server(TlsServerConfig config) -> ListenerConfigBuilder&;
 
   /// Materialize the current builder state.
   ///
@@ -368,6 +448,20 @@ public:
   /// \return This builder.
   auto validation_policy(session::ValidationPolicy policy) -> CounterpartyConfigBuilder&;
 
+  /// Configure optional initiator TLS client support.
+  ///
+  /// Runtime TLS uses this policy only when config.enabled is true.
+  ///
+  /// \param config TLS client configuration.
+  /// \return This builder.
+  auto tls_client(TlsClientConfig config) -> CounterpartyConfigBuilder&;
+
+  /// Restrict which accept-side transport security levels may bind this session.
+  ///
+  /// \param requirement Plain/TLS binding requirement for acceptors.
+  /// \return This builder.
+  auto acceptor_transport_security(TransportSecurityRequirement requirement) -> CounterpartyConfigBuilder&;
+
   /// Enable initiator reconnect with backoff limits.
   ///
   /// \param initial_ms Initial reconnect backoff in milliseconds.
@@ -433,6 +527,10 @@ IsWithinLogonWindow(const SessionScheduleConfig& schedule, std::uint64_t unix_ti
 /// \return Next opening timestamp, or nullopt when no future opening can be derived.
 [[nodiscard]] auto
 NextLogonWindowStart(const SessionScheduleConfig& schedule, std::uint64_t unix_time_ns) -> std::optional<std::uint64_t>;
+
+/// Report whether this build was compiled with optional TLS support.
+[[nodiscard]] auto
+TlsTransportEnabledAtBuild() noexcept -> bool;
 
 /// Validate a full engine configuration before boot.
 ///

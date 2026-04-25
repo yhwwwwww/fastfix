@@ -19,8 +19,8 @@
 #include "nimblefix/base/spsc_queue.h"
 #include "nimblefix/codec/fix_tags.h"
 #include "nimblefix/runtime/engine.h"
-#include "nimblefix/runtime/live_session_registry.h"
 #include "nimblefix/runtime/live_runtime_support.h"
+#include "nimblefix/runtime/live_session_registry.h"
 #include "nimblefix/runtime/shard_poller.h"
 #include "nimblefix/runtime/thread_affinity.h"
 #include "nimblefix/session/admin_protocol.h"
@@ -28,7 +28,7 @@
 #include "nimblefix/store/memory_store.h"
 #include "nimblefix/store/mmap_store.h"
 #include "nimblefix/store/session_store.h"
-#include "nimblefix/transport/tcp_transport.h"
+#include "nimblefix/transport/transport_connection.h"
 
 namespace nimble::runtime {
 
@@ -77,6 +77,54 @@ auto
 ReconnectJitterLimit(std::uint32_t backoff_ms) -> std::uint32_t
 {
   return backoff_ms / kReconnectJitterDivisor;
+}
+
+auto
+RecordTransportMetrics(Engine* engine,
+                       std::uint32_t worker_id,
+                       const transport::TransportConnection& connection,
+                       std::uint64_t latency_ns) -> void
+{
+  const auto* config = engine != nullptr ? engine->config() : nullptr;
+  if (config == nullptr || !config->enable_metrics) {
+    return;
+  }
+  auto* metrics = engine->mutable_metrics();
+  if (!connection.uses_tls()) {
+    static_cast<void>(metrics->RecordPlainConnection(worker_id));
+    return;
+  }
+  const auto session_info = connection.tls_session_info();
+  static_cast<void>(
+    metrics->RecordTlsHandshake(worker_id, true, latency_ns, session_info.has_value() && session_info->session_reused));
+}
+
+auto
+RecordTlsFailureMetrics(Engine* engine, std::uint32_t worker_id, std::uint64_t latency_ns) -> void
+{
+  const auto* config = engine != nullptr ? engine->config() : nullptr;
+  if (config == nullptr || !config->enable_metrics) {
+    return;
+  }
+  static_cast<void>(engine->mutable_metrics()->RecordTlsHandshake(worker_id, false, latency_ns, false));
+}
+
+auto
+TlsTraceText(std::string_view prefix, const transport::TransportConnection& connection) -> std::string
+{
+  std::string text(prefix);
+  const auto session_info = connection.tls_session_info();
+  if (!session_info.has_value()) {
+    return text;
+  }
+  text.append(" ");
+  text.append(session_info->protocol);
+  text.append(" ");
+  text.append(session_info->cipher);
+  if (session_info->session_reused) {
+    text.append(" reused");
+  }
+  return text;
 }
 
 auto
@@ -198,7 +246,7 @@ struct LiveInitiator::ActiveSession
 struct LiveInitiator::ConnectionState
 {
   std::uint64_t connection_id{ 0 };
-  transport::TcpConnection connection;
+  transport::TransportConnection connection;
   std::unique_ptr<ActiveSession> session;
   std::uint64_t last_progress_ns{ 0 };
   std::optional<RuntimeEvent> pending_app_event;
@@ -807,9 +855,34 @@ LiveInitiator::OpenSession(std::uint64_t session_id, std::string host, std::uint
     return base::Status::Ok();
   }
 
-  auto connection = transport::TcpConnection::Connect(active_session->host, active_session->port, options_.io_timeout);
+  const auto connect_started_ns = NowNs();
+  auto connection = transport::TransportConnection::Connect(
+    active_session->host, active_session->port, options_.io_timeout, &active_session->counterparty.tls_client);
+  const auto connect_latency_ns = NowNs() - connect_started_ns;
   if (!connection.ok()) {
+    if (active_session->counterparty.tls_client.enabled) {
+      RecordTlsFailureMetrics(engine_, active_session->worker_id, connect_latency_ns);
+      RecordTrace(TraceEventKind::kSessionEvent,
+                  active_session->counterparty.session.session_id,
+                  active_session->worker_id,
+                  timestamp_ns,
+                  connect_latency_ns,
+                  active_session->port,
+                  "tls client handshake failed");
+    }
     return connection.status();
+  }
+
+  auto transport_connection = std::move(connection).value();
+  RecordTransportMetrics(engine_, active_session->worker_id, transport_connection, connect_latency_ns);
+  if (transport_connection.uses_tls()) {
+    RecordTrace(TraceEventKind::kSessionEvent,
+                active_session->counterparty.session.session_id,
+                active_session->worker_id,
+                timestamp_ns,
+                connect_latency_ns,
+                active_session->port,
+                TlsTraceText("tls client handshake", transport_connection));
   }
 
   auto start = active_session->protocol->OnTransportConnected(timestamp_ns);
@@ -819,7 +892,7 @@ LiveInitiator::OpenSession(std::uint64_t session_id, std::string host, std::uint
 
   ConnectionState state{
     .connection_id = next_connection_id_.fetch_add(1U, std::memory_order_relaxed),
-    .connection = std::move(connection).value(),
+    .connection = std::move(transport_connection),
     .session = std::move(active_session),
     .last_progress_ns = timestamp_ns,
   };
@@ -925,9 +998,10 @@ LiveInitiator::OpenSessionAsync(std::uint64_t session_id, std::string host, std:
 
   const auto timestamp_ns = NowNs();
   const auto wall_now_ns = WallClockNowNs();
-  const auto next_attempt_ns = IsWithinLogonWindow(active_session->counterparty.session_schedule, wall_now_ns)
-                                 ? timestamp_ns
-                                 : ComputeScheduledAttemptNs(active_session->counterparty, timestamp_ns, wall_now_ns, 0U);
+  const auto next_attempt_ns =
+    IsWithinLogonWindow(active_session->counterparty.session_schedule, wall_now_ns)
+      ? timestamp_ns
+      : ComputeScheduledAttemptNs(active_session->counterparty, timestamp_ns, wall_now_ns, 0U);
 
   if (!RegisterActiveSession(active_session->counterparty.session.session_id)) {
     return base::Status::AlreadyExists("initiator session already has an active transport connection");
@@ -1459,9 +1533,22 @@ LiveInitiator::ProcessPendingReconnects(WorkerShardState& shard, std::uint64_t t
       continue;
     }
 
-    auto connection_result = transport::TcpConnection::Connect(it->host, it->port, options_.io_timeout);
+    const auto connect_started_ns = NowNs();
+    auto connection_result = transport::TransportConnection::Connect(
+      it->host, it->port, options_.io_timeout, &it->session->counterparty.tls_client);
+    const auto connect_latency_ns = NowNs() - connect_started_ns;
 
     if (!connection_result.ok()) {
+      if (it->session->counterparty.tls_client.enabled) {
+        RecordTlsFailureMetrics(engine_, it->session->worker_id, connect_latency_ns);
+        RecordTrace(TraceEventKind::kSessionEvent,
+                    it->session_id,
+                    it->session->worker_id,
+                    timestamp_ns,
+                    connect_latency_ns,
+                    it->port,
+                    "tls client handshake failed");
+      }
       it->retry_count++;
       const auto max_retries = it->session->counterparty.reconnect_max_retries;
       if (max_retries > 0 && it->retry_count >= max_retries) {
@@ -1497,6 +1584,18 @@ LiveInitiator::ProcessPendingReconnects(WorkerShardState& shard, std::uint64_t t
       continue;
     }
 
+    auto transport_connection = std::move(connection_result).value();
+    RecordTransportMetrics(engine_, it->session->worker_id, transport_connection, connect_latency_ns);
+    if (transport_connection.uses_tls()) {
+      RecordTrace(TraceEventKind::kSessionEvent,
+                  it->session_id,
+                  it->session->worker_id,
+                  timestamp_ns,
+                  connect_latency_ns,
+                  it->port,
+                  TlsTraceText("tls client handshake", transport_connection));
+    }
+
     auto connected = it->session->protocol->OnTransportConnected(timestamp_ns);
     if (!connected.ok()) {
       if (it->session_registered) {
@@ -1526,7 +1625,7 @@ LiveInitiator::ProcessPendingReconnects(WorkerShardState& shard, std::uint64_t t
 
     ConnectionState state{
       .connection_id = next_connection_id_.fetch_add(1U, std::memory_order_relaxed),
-      .connection = std::move(connection_result).value(),
+      .connection = std::move(transport_connection),
       .session = std::move(it->session),
       .last_progress_ns = timestamp_ns,
     };

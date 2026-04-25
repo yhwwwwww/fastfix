@@ -16,6 +16,9 @@ TEST_CASE("metrics-trace", "[metrics-trace]")
   REQUIRE(metrics.RecordChecksumFailure(1001U).ok());
   REQUIRE(metrics.UpdateOutboundQueueDepth(1001U, 4U).ok());
   REQUIRE(metrics.ObserveStoreFlushLatency(1001U, 1234U).ok());
+  REQUIRE(metrics.RecordPlainConnection(1U).ok());
+  REQUIRE(metrics.RecordTlsHandshake(1U, true, 2500U, true).ok());
+  REQUIRE(metrics.RecordTlsHandshake(1U, false, 500U, false).ok());
 
   const auto snapshot = metrics.Snapshot();
   REQUIRE(snapshot.workers.size() == 2U);
@@ -31,6 +34,12 @@ TEST_CASE("metrics-trace", "[metrics-trace]")
   REQUIRE(snapshot.sessions[0].last_store_flush_latency_ns == 1234U);
   REQUIRE(snapshot.workers[1].registered_sessions == 1U);
   REQUIRE(snapshot.workers[1].outbound_queue_depth == 4U);
+  REQUIRE(snapshot.workers[1].plain_connections == 1U);
+  REQUIRE(snapshot.workers[1].tls_connections == 1U);
+  REQUIRE(snapshot.workers[1].tls_handshake_successes == 1U);
+  REQUIRE(snapshot.workers[1].tls_handshake_failures == 1U);
+  REQUIRE(snapshot.workers[1].tls_handshake_latency_ns == 3000U);
+  REQUIRE(snapshot.workers[1].tls_session_resumptions == 1U);
 
   nimble::runtime::TraceRecorder trace;
   trace.Configure(nimble::runtime::TraceMode::kRing, 2U, 2U);
