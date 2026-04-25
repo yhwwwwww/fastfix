@@ -51,35 +51,38 @@ Important environment notes:
 | `builder` | `--iterations 100000 --loopback 0 --replay 0` | Encode-focused NimbleFIX iteration loop without replay/loopback noise |
 | `compare` | NimbleFIX defaults, then QuickFIX defaults | Full side-by-side report used by the README numbers |
 
-## Where Each Metric Sits In The Flow
+## Where Each Metric Starts And Ends
 
-### NimbleFIX Measurement Points
+Each diagram below shows a complete benchmark flow. `START` and `END` mark timing boundaries, and the arrow label is the printed benchmark metric for that segment. A separate diagram is used only when the underlying runtime flow is different.
+
+### NimbleFIX Flow
 
 ```mermaid
 flowchart LR
-	A["Fix44BusinessOrder<br/>neutral fixture"] -->|encode| B["generated NewOrderSingleWriter<br/>+ FixedLayoutWriter"]
-	B --> C["wire frame bytes<br/>EncodeBuffer"]
-	C -->|peek| D["PeekSessionHeaderView"]
-	C -->|parse| E["DecodeFixMessageView<br/>MessageView + validation"]
-	A -->|session-outbound| M["AdminProtocol::SendApplication<br/>full outbound session encode"]
-	A -->|session-outbound-pre-encoded| N["EncodedApplicationMessage<br/>+ AdminProtocol::SendEncodedApplication"]
-	C -->|session-inbound| F["AdminProtocol::OnInbound<br/>ProtocolEvent"]
-	G["preloaded outbound history<br/>in SessionStore"] --> H["ResendRequest frame"]
-	H -->|replay| I["ProtocolEvent.outbound_frames"]
-	A -->|loopback-roundtrip| J["Live initiator send"] --> K["TCP loopback + acceptor"] --> L["ExecutionReport ack<br/>received by initiator"]
+	BO["START encode:<br/>before writer.clear and field assignment"] -->|encode| WF["END encode / START peek, parse, session-inbound:<br/>wire frame bytes in EncodeBuffer"]
+	WF -->|peek| PH["END peek:<br/>session header view"]
+	WF -->|parse| MV["END parse / START session-outbound:<br/>decoded MessageView + validation"]
+	MV -->|session-outbound| OF["END session-outbound:<br/>session-managed outbound wire frame"]
+	PB["START session-outbound-pre-encoded:<br/>pre-encoded application body"] -->|session-outbound-pre-encoded| OF
+	WF -->|session-inbound| PE["END session-inbound:<br/>inbound ProtocolEvent"]
+	RR["START replay:<br/>ResendRequest frame"] -->|replay| RF["END replay:<br/>ProtocolEvent outbound_frames"]
+
+	LS["START loopback-roundtrip:<br/>live initiator submits NewOrderSingle"] -->|session-outbound| LO["END session-outbound / START transport-send:<br/>encoded outbound order frame"] -->|transport-send| TX["END transport-send:<br/>bytes written to TCP socket"] --> AC["acceptor runtime handles order<br/>and sends ExecutionReport"] -->|transport-recv| RX["END transport-recv / START session-inbound:<br/>ack frame received by initiator"] -->|session-inbound| LE["END session-inbound and loopback-roundtrip:<br/>ExecutionReport ack processed"]
+	LS -.->|loopback-roundtrip outer timer| LE
 ```
 
-### QuickFIX Measurement Points
+### QuickFIX Flow
 
 ```mermaid
 flowchart LR
-	A["Fix44BusinessOrder<br/>neutral fixture"] -->|quickfix-encode / quickfix-encode-buffer| B["FIX44::NewOrderSingle"]
-	B --> C["serialized FIX string"]
-	C -->|quickfix-parse| D["setString(...) into<br/>FIX44::NewOrderSingle"] --> E["ExtractOrderFromQFMessage"]
-	C -->|quickfix-session-inbound| F["Session::next(frame, now)"]
-	G["preloaded MessageStore<br/>seq 2..N"] --> H["ResendRequest string"]
-	H -->|quickfix-replay| I["BufferedResponder frames"]
-	A -->|quickfix-loopback| J["ThreadedSocketInitiator send"] --> K["ThreadedSocketAcceptor"] --> L["ExecutionReport ack<br/>back to initiator"]
+	BO["START quickfix-encode and quickfix-encode-buffer:<br/>neutral business order fixture"] -->|quickfix-encode| QS["END quickfix-encode / START quickfix-parse, quickfix-session-inbound:<br/>fresh serialized FIX string"]
+	BO -->|quickfix-encode-buffer| QB["END quickfix-encode-buffer:<br/>caller-owned buffer filled"]
+	QS -->|quickfix-parse| QP["END quickfix-parse:<br/>extracted neutral business order view"]
+	QS -->|quickfix-session-inbound| QI["END quickfix-session-inbound:<br/>acceptor Session::next returns"]
+	QRR["START quickfix-replay:<br/>ResendRequest string"] -->|quickfix-replay| QR["END quickfix-replay:<br/>Session::next returns; responder frames counted"]
+
+	QLS["START quickfix-loopback:<br/>ThreadedSocketInitiator sends order"] --> QTX["QuickFIX initiator socket send"] --> QAC["ThreadedSocketAcceptor<br/>and QuickFIX session stack"] --> QACK["ExecutionReport generated<br/>and sent back"] --> QLE["END quickfix-loopback:<br/>initiator-side app sees ack"]
+	QLS -.->|quickfix-loopback outer timer| QLE
 ```
 
 ## Exact Measurement Boundaries
@@ -126,6 +129,17 @@ Those four sub-measurements are nested inside the single `loopback-roundtrip` pe
 ## TLS Transport Baseline
 
 `nimblefix-tls-transport-bench` is a focused transport-level benchmark for the optional TLS layer. It always prints a plain `TransportConnection` TCP RTT baseline. When the binary is built with `NIMBLEFIX_ENABLE_TLS=ON` and certificate material is provided, it also prints TLS connect/handshake latency, steady-state RTT, negotiated protocol/cipher, and whether OpenSSL reported session reuse.
+
+```mermaid
+flowchart LR
+	subgraph Plain["Plain TCP transport path"]
+		PC0["START: before TransportConnection::Connect<br/>without TLS config"] -->|tcp connect_or_handshake_ns| PC1["END: plain TransportConnection returned"] --> PS0["START: before sending<br/>one FIX heartbeat frame"] -->|tcp-transport-rtt| PE["echo server receives frame<br/>and sends it back"] --> PS1["END: client ReceiveFrameView<br/>returns echoed frame"]
+	end
+
+	subgraph TLS["TLS transport path"]
+		TC0["START: before TransportConnection::Connect<br/>with TlsClientConfig.enabled=true"] -->|tls connect_or_handshake_ns| TC1["END: TCP connect and TLS handshake complete;<br/>TLS TransportConnection returned"] --> TS0["START: before sending one FIX heartbeat<br/>through TLS record layer"] -->|tls-transport-rtt| TE["server decrypts frame, echoes it,<br/>client decrypts response"] --> TS1["END: client ReceiveFrameView<br/>returns echoed frame"]
+	end
+```
 
 Build and run:
 
