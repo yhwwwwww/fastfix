@@ -194,21 +194,21 @@ auto
 ApplyInitiatorMainThreadSetup(const Engine* engine, bool single_worker) -> base::Status
 {
   if (single_worker) {
-    SetCurrentThreadName("ff-ini-w0");
+    SetCurrentThreadName("nf-ini-w0");
     if (const auto worker_cpu = WorkerCpuAffinity(engine, 0U)) {
       return ApplyCurrentThreadAffinity(*worker_cpu, "initiator worker 0");
     }
     return base::Status::Ok();
   }
 
-  SetCurrentThreadName("ff-ini-main");
+  SetCurrentThreadName("nf-ini-main");
   return base::Status::Ok();
 }
 
 auto
 ApplyInitiatorWorkerThreadSetup(const Engine* engine, std::uint32_t worker_id) -> base::Status
 {
-  SetCurrentThreadName("ff-ini-w" + std::to_string(worker_id));
+  SetCurrentThreadName("nf-ini-w" + std::to_string(worker_id));
   if (const auto worker_cpu = WorkerCpuAffinity(engine, worker_id)) {
     return ApplyCurrentThreadAffinity(*worker_cpu, "initiator worker " + std::to_string(worker_id));
   }

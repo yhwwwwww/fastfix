@@ -191,7 +191,7 @@ auto
 ApplyAcceptorFrontDoorThreadSetup(const Engine* engine, bool single_worker) -> base::Status
 {
   if (single_worker) {
-    SetCurrentThreadName("ff-acc-w0");
+    SetCurrentThreadName("nf-acc-w0");
     if (const auto worker_cpu = WorkerCpuAffinity(engine, 0U)) {
       return ApplyCurrentThreadAffinity(*worker_cpu, "acceptor worker 0");
     }
@@ -201,7 +201,7 @@ ApplyAcceptorFrontDoorThreadSetup(const Engine* engine, bool single_worker) -> b
     return base::Status::Ok();
   }
 
-  SetCurrentThreadName("ff-acc-main");
+  SetCurrentThreadName("nf-acc-main");
   if (const auto front_door_cpu = FrontDoorCpuAffinity(engine)) {
     return ApplyCurrentThreadAffinity(*front_door_cpu, "acceptor front door");
   }
@@ -211,7 +211,7 @@ ApplyAcceptorFrontDoorThreadSetup(const Engine* engine, bool single_worker) -> b
 auto
 ApplyAcceptorWorkerThreadSetup(const Engine* engine, std::uint32_t worker_id) -> base::Status
 {
-  SetCurrentThreadName("ff-acc-w" + std::to_string(worker_id));
+  SetCurrentThreadName("nf-acc-w" + std::to_string(worker_id));
   if (const auto worker_cpu = WorkerCpuAffinity(engine, worker_id)) {
     return ApplyCurrentThreadAffinity(*worker_cpu, "acceptor worker " + std::to_string(worker_id));
   }

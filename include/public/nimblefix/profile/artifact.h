@@ -12,7 +12,7 @@
 
 namespace nimble::profile {
 
-inline constexpr std::array<std::uint8_t, 8> kArtifactMagic = { 'F', 'X', 'A', 'R', 'T', '0', '0', '1' };
+inline constexpr std::array<std::uint8_t, 4> kArtifactMagic = { 'N', 'F', 'P', 'F' };
 inline constexpr std::uint32_t kArtifactFormatVersion = 1;
 inline constexpr std::uint32_t kArtifactEndianLittle = 0x01020304u;
 
@@ -46,7 +46,7 @@ enum class SectionFlags : std::uint32_t
 #pragma pack(push, 1)
 struct ArtifactHeader
 {
-  std::uint8_t magic[8];
+  std::uint8_t magic[4];
   std::uint32_t format_version;
   std::uint32_t header_size;
   std::uint32_t section_entry_size;
@@ -72,7 +72,7 @@ struct ArtifactSection
 };
 #pragma pack(pop)
 
-static_assert(sizeof(ArtifactHeader) == 80);
+static_assert(sizeof(ArtifactHeader) == 76);
 static_assert(sizeof(ArtifactSection) == 40);
 
 struct ArtifactSpan

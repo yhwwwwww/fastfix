@@ -6,8 +6,6 @@
 #include "nimblefix/profile/profile_loader.h"
 #include "nimblefix/runtime/engine.h"
 
-#include "test_support.h"
-
 TEST_CASE("profile-loader", "[profile-loader]")
 {
   const auto artifact_path = std::filesystem::path(NIMBLEFIX_PROJECT_DIR) / "build" / "bench" / "quickfix_FIX44.nfa";
@@ -33,6 +31,15 @@ TEST_CASE("profile-loader", "[profile-loader]")
   REQUIRE(status.ok());
   REQUIRE(engine.profiles().size() == 1U);
   REQUIRE(engine.profiles().Find(loaded.value().profile_id()) != nullptr);
+}
+
+TEST_CASE("profile artifact magic uses NimbleFIX magic", "[profile-loader]")
+{
+  REQUIRE(nimble::profile::kArtifactMagic.size() == 4U);
+  REQUIRE(nimble::profile::kArtifactMagic[0] == static_cast<std::uint8_t>('N'));
+  REQUIRE(nimble::profile::kArtifactMagic[1] == static_cast<std::uint8_t>('F'));
+  REQUIRE(nimble::profile::kArtifactMagic[2] == static_cast<std::uint8_t>('P'));
+  REQUIRE(nimble::profile::kArtifactMagic[3] == static_cast<std::uint8_t>('F'));
 }
 
 TEST_CASE("profile madvise warming", "[profile-loader]")

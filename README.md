@@ -757,11 +757,11 @@ NimbleFIX does not create threads behind your back. Every thread is explicitly c
 
 | Thread | Name | Count | Role | CPU Pin |
 |--------|------|-------|------|---------|
-| Front-door | `ff-acc-main` | 1 | Accept TCP connections, read Logon, route to least-loaded worker | `front_door_cpu` |
-| Session worker | `ff-acc-w{N}` | `worker_count` | Own sessions exclusively: decode, sequence, timer, encode, send | `worker_cpu_affinity[N]` |
-| App worker | `ff-app-w{N}` | `worker_count` | Drain SPSC queues, invoke business callbacks | `app_cpu_affinity[N]` |
+| Front-door | `nf-acc-main` | 1 | Accept TCP connections, read Logon, route to least-loaded worker | `front_door_cpu` |
+| Session worker | `nf-acc-w{N}` | `worker_count` | Own sessions exclusively: decode, sequence, timer, encode, send | `worker_cpu_affinity[N]` |
+| App worker | `nf-app-w{N}` | `worker_count` | Drain SPSC queues, invoke business callbacks | `app_cpu_affinity[N]` |
 
-**Initiator:** Same as acceptor but without the front-door thread. Session workers are named `ff-ini-w{N}`.
+**Initiator:** Same as acceptor but without the front-door thread. Session workers are named `nf-ini-w{N}`.
 
 When `worker_count=1`, the single worker runs on the caller's thread — no extra thread is spawned. App workers only exist when `queue_app_mode = kThreaded`.
 
@@ -792,7 +792,7 @@ message_view.get_string(11);
 |------|---------------------|------------|
 | `kInline` (default) | On session worker thread, inside the I/O loop | Must not block |
 | `kQueueDecoupled` + `kCoScheduled` | On session worker thread, during explicit poll call | Must not block |
-| `kQueueDecoupled` + `kThreaded` | On dedicated app worker thread (`ff-app-wN`) | May block (within reason) |
+| `kQueueDecoupled` + `kThreaded` | On dedicated app worker thread (`nf-app-wN`) | May block (within reason) |
 
 **Inline mode** gives the lowest latency — your `OnAppMessage()` callback receives a zero-copy `MessageView` directly from the decode buffer. But it must return quickly; any blocking will stall all sessions on that worker.
 

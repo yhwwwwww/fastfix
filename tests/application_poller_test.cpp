@@ -10,8 +10,6 @@
 
 #include "nimblefix/runtime/application.h"
 
-#include "test_support.h"
-
 namespace {
 
 auto
@@ -290,7 +288,7 @@ TEST_CASE("application-poller", "[application-poller]")
                                                           },
                                                           nimble::runtime::QueueApplicationRunnerThreadOptions{
                                                             .cpu_affinity = {},
-                                                            .thread_name_prefix = "ff-app-test-w",
+                                                            .thread_name_prefix = "nf-app-test-w",
                                                           });
   REQUIRE(affinity_runner.Start().ok());
 

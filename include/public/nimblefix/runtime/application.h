@@ -233,7 +233,7 @@ struct QueueApplicationPollerOptions
 struct QueueApplicationRunnerThreadOptions
 {
   std::vector<std::uint32_t> cpu_affinity;
-  std::string thread_name_prefix{ "ff-app-w" };
+  std::string thread_name_prefix{ "nf-app-w" };
 };
 
 /// Execution strategy for the managed queue application runner.

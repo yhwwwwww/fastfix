@@ -25,9 +25,9 @@ namespace {
 
 constexpr std::uint32_t kStoreVersion = 1U;
 constexpr std::uint64_t kNanosPerDay = 86'400ULL * 1'000'000'000ULL;
-constexpr std::array<char, 8> kLogMagic = { 'F', 'F', 'D', 'B', 'L', 'O', 'G', '1' };
-constexpr std::array<char, 8> kIndexMagic = { 'F', 'F', 'D', 'B', 'I', 'D', 'X', '1' };
-constexpr std::array<char, 8> kRecoveryMagic = { 'F', 'F', 'D', 'B', 'R', 'E', 'C', '1' };
+constexpr std::array<char, 8> kLogMagic = { 'N', 'F', 'D', 'B', 'L', 'O', 'G', '1' };
+constexpr std::array<char, 8> kIndexMagic = { 'N', 'F', 'D', 'B', 'I', 'D', 'X', '1' };
+constexpr std::array<char, 8> kRecoveryMagic = { 'N', 'F', 'D', 'B', 'R', 'E', 'C', '1' };
 constexpr std::size_t kPendingPayloadArenaFloorBytes = 16U * 1024U;
 constexpr std::size_t kPendingPayloadBytesPerEntry = 512U;
 constexpr std::string_view kSegmentFilePrefix = "segment-";

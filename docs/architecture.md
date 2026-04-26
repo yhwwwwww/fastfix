@@ -539,7 +539,7 @@ Each live session is owned by exactly one shard. That shard owns the socket regi
 - `kInline`: the application callback runs directly on the session worker thread.
 - `kQueueDecoupled`: the worker emits queue items into a per-worker SPSC queue.
 - `queue_app_mode=kCoScheduled`: the queue is drained on the same worker thread when the runtime polls managed queues.
-- `queue_app_mode=kThreaded`: a dedicated `ff-app-wN` thread drains the queue and runs callbacks off the hot path.
+- `queue_app_mode=kThreaded`: a dedicated `nf-app-wN` thread drains the queue and runs callbacks off the hot path.
 
 Queue overflow handling is explicit through `queue_full_policy` (`kCloseSession`, `kBackpressure`, `kDropNewest`).
 
@@ -626,22 +626,22 @@ NimbleFIX does not hide topology decisions. Thread count, callback placement, po
 ```mermaid
 flowchart TB
     CALLER["caller thread"] -->|worker_count=1| ONE["single worker runtime"]
-    CALLER -->|acceptor + worker_count>1| FD["ff-acc-main front-door"]
-    CALLER -->|initiator + worker_count>1| W0["ff-ini-w0"]
-    FD --> W1["ff-acc-w0"]
-    FD --> W2["ff-acc-w1..N"]
-    W0 -->|queue_app_mode=threaded| A0["ff-app-w0"]
-    W1 -->|queue_app_mode=threaded| A1["ff-app-w0"]
-    W2 -->|queue_app_mode=threaded| A2["ff-app-w1..N"]
+    CALLER -->|acceptor + worker_count>1| FD["nf-acc-main front-door"]
+    CALLER -->|initiator + worker_count>1| W0["nf-ini-w0"]
+    FD --> W1["nf-acc-w0"]
+    FD --> W2["nf-acc-w1..N"]
+    W0 -->|queue_app_mode=threaded| A0["nf-app-w0"]
+    W1 -->|queue_app_mode=threaded| A1["nf-app-w0"]
+    W2 -->|queue_app_mode=threaded| A2["nf-app-w1..N"]
 ```
 
 #### Acceptor
 
 | Thread | Name | Count | Role | CPU Pin |
 |--------|------|-------|------|---------|
-| Front-door | `ff-acc-main` | 1 | Accept TCP connections, read Logon, choose a worker, and hand off the socket | `front_door_cpu` |
-| Session worker | `ff-acc-w{N}` | `worker_count` | Own sessions exclusively: decode, sequence, timer, encode, send, replay | `worker_cpu_affinity[N]` |
-| App worker | `ff-app-w{N}` | `worker_count` (if `queue_app_mode=threaded`) | Drain SPSC queues and invoke business callbacks | `app_cpu_affinity[N]` |
+| Front-door | `nf-acc-main` | 1 | Accept TCP connections, read Logon, choose a worker, and hand off the socket | `front_door_cpu` |
+| Session worker | `nf-acc-w{N}` | `worker_count` | Own sessions exclusively: decode, sequence, timer, encode, send, replay | `worker_cpu_affinity[N]` |
+| App worker | `nf-app-w{N}` | `worker_count` (if `queue_app_mode=threaded`) | Drain SPSC queues and invoke business callbacks | `app_cpu_affinity[N]` |
 
 #### Initiator
 
@@ -649,8 +649,8 @@ Same worker/app structure, minus the front-door thread:
 
 | Thread | Name | Count | Role | CPU Pin |
 |--------|------|-------|------|---------|
-| Session worker | `ff-ini-w{N}` | `worker_count` | Own sessions: connect, reconnect, decode, sequence, timer, encode, send | `worker_cpu_affinity[N]` |
-| App worker | `ff-app-w{N}` | `worker_count` (if `queue_app_mode=threaded`) | Drain SPSC queues and invoke business callbacks | `app_cpu_affinity[N]` |
+| Session worker | `nf-ini-w{N}` | `worker_count` | Own sessions: connect, reconnect, decode, sequence, timer, encode, send | `worker_cpu_affinity[N]` |
+| App worker | `nf-app-w{N}` | `worker_count` (if `queue_app_mode=threaded`) | Drain SPSC queues and invoke business callbacks | `app_cpu_affinity[N]` |
 
 When `worker_count=1`, the runtime stays on the caller's thread and does not spawn worker `std::jthread`s. Raising `worker_count` turns each shard into its own thread; enabling `queue_app_mode=threaded` then creates one app worker per session worker.
 
@@ -660,9 +660,9 @@ When `worker_count=1`, the runtime stays on the caller's thread and does not spa
 |-------|---------|----------------|-------------------------|
 | Single-thread initiator | caller thread only | `worker_count=1`, `dispatch_mode=inline` | simplest debugging and deterministic local testing |
 | Single-thread acceptor | caller thread only | `worker_count=1`, `dispatch_mode=inline` | single-session local harnesses and smoke setups |
-| Multi-worker acceptor | `ff-acc-main` + `ff-acc-wN` | `worker_count>1`, `dispatch_mode=inline` | isolate session hot paths without paying a queue hop |
+| Multi-worker acceptor | `nf-acc-main` + `nf-acc-wN` | `worker_count>1`, `dispatch_mode=inline` | isolate session hot paths without paying a queue hop |
 | Co-scheduled queue runtime | same as above | `dispatch_mode=queue-decoupled`, `queue_app_mode=co-scheduled` | decouple callback lifetime from decode while keeping thread count flat |
-| Threaded queue runtime | workers + `ff-app-wN` | `dispatch_mode=queue-decoupled`, `queue_app_mode=threaded` | protect session workers from blocking business logic |
+| Threaded queue runtime | workers + `nf-app-wN` | `dispatch_mode=queue-decoupled`, `queue_app_mode=threaded` | protect session workers from blocking business logic |
 
 ### Thread Lifecycle
 
@@ -679,7 +679,7 @@ LiveAcceptor::Run()
     │
     ├── if N > 1: StartWorkerThreads()
     │   └── spawn N std::jthread, each runs WorkerLoop(worker_id)
-    │       ├── SetCurrentThreadName("ff-acc-wN")
+    │       ├── SetCurrentThreadName("nf-acc-wN")
     │       └── ApplyCurrentThreadAffinity(worker_cpu_affinity[N])
     │
     └── Front-door loop on caller's thread
@@ -743,7 +743,7 @@ Two sub-modes:
 | Sub-mode | Where app callback runs | Thread |
 |----------|------------------------|--------|
 | `kCoScheduled` | On session worker thread, during explicit `PollManagedQueueWorkerOnce()` call | Same as session worker |
-| `kThreaded` | On dedicated app worker thread (`ff-app-wN`) | Separate thread |
+| `kThreaded` | On dedicated app worker thread (`nf-app-wN`) | Separate thread |
 
 `kCoScheduled` is useful when you want queue ownership semantics without increasing thread count. `kThreaded` is the runtime shape to choose when application code may block or when you want clean CPU isolation between protocol work and business logic.
 
@@ -818,14 +818,20 @@ Binary format loaded via mmap:
 
 ```
 ┌──────────────────────────┐
-│ Magic (4 bytes)          │  "FFPF"
+│ Magic (4 bytes)          │  "NFPF"
 │ Format Version (4 bytes) │
-│ Profile ID (8 bytes)     │
-│ Schema Hash (8 bytes)    │
-│ Build ID (8 bytes)       │
+│ Header Size (4 bytes)    │
+│ Section Entry Size (4B)  │
+│ Endian Tag (4 bytes)     │
+│ File Size (8 bytes)      │
+│ Section Table Off (8B)   │
 │ Section Count (4 bytes)  │
+│ Flags (4 bytes)          │
+│ Schema Hash (8 bytes)    │
+│ Profile ID (8 bytes)     │
+│ Reserved (16 bytes)      │
 ├──────────────────────────┤
-│ Section Table            │  Array of {kind, offset, size}
+│ Section Table            │  Array of {kind, flags, offset, size, entry_count, entry_size}
 ├──────────────────────────┤
 │ StringTable              │  Packed null-terminated strings
 ├──────────────────────────┤
