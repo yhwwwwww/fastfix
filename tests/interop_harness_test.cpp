@@ -132,9 +132,8 @@ TEST_CASE("interop-harness", "[interop-harness]")
     scenario_out << "action|protocol-connect|4101|ts=1\n";
     scenario_out << "action|protocol-inbound|4101|seq=1|ts=10|body=35=0\n";
     scenario_out << "expect-action|1|outbound=0|app=0|disconnect=0\n";
-    scenario_out << "expect-action|2|outbound=1|app=0|disconnect=1\n";
-    scenario_out << "expect-outbound|2|1|msg-type=5|text-contains=received 0 before Logon completed\n";
-    scenario_out << "expect-session|4101|disconnected|2|2|0\n";
+    scenario_out << "expect-action|2|outbound=0|app=0|disconnect=1|error=1|next-in-after=1\n";
+    scenario_out << "expect-session|4101|disconnected|1|1|0\n";
   }
 
   auto official_scenario = nimble::runtime::LoadInteropScenarioFile(official_scenario_path);
@@ -143,8 +142,8 @@ TEST_CASE("interop-harness", "[interop-harness]")
   auto official_report = nimble::runtime::RunInteropScenario(official_scenario.value());
   REQUIRE(official_report.ok());
   REQUIRE(official_report.value().action_reports.size() == 2U);
-  REQUIRE(official_report.value().action_reports[1].outbound_frame_summaries.size() == 1U);
-  REQUIRE(official_report.value().action_reports[1].outbound_frame_summaries.front().msg_type == "5");
+  REQUIRE(official_report.value().action_reports[1].outbound_frame_summaries.empty());
+  REQUIRE(!official_report.value().action_reports[1].errors.empty());
 
   const auto poss_resend_scenario_path = official_root / "official-case-19.nfscenario";
   {

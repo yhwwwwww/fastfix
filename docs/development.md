@@ -54,7 +54,7 @@ ctest --preset dev-release
 
 The helper scripts auto-select `xmake >= 3.0.0`, then `cmake + Ninja`, then `cmake + make`. Default xmake builds write executables to `./build/linux/x86_64/release/`. Ninja-based CMake presets remain available at `./build/cmake/<preset>/bin/`, and make-based fallback presets live at `./build/cmake/<preset>-make/bin/`. The examples below assume `BIN_DIR=./build/linux/x86_64/release` for the default path and invoke binaries directly for reproducibility and predictable argument handling.
 
-`offline_build.sh` now gates the repository's official FIX session baseline after the Catch2 or CTest pass. The default local and CI regression path therefore covers both the core unit/integration suite and `tests/data/fix-session/official-session-cases.nfcases`.
+`offline_build.sh` now gates the repository's official FIX session baseline after the Catch2 or CTest pass. The default local and CI regression path therefore covers both the core unit/integration suite and `tests/data/fix-session/official-session-cases.nfcases`; it invokes the official runner with `--fail-on-partial`, so any mapped case missing machine-verified `verify=verified` metadata fails CI.
 
 Both `offline_build.sh` and `bench.sh` default `NIMBLEFIX_XMAKE_CCACHE=n` on the xmake path. That mirrors the CI-safe setting and avoids Linux `.build_cache/... file busy` failures seen on the larger benchmark and QuickFIX targets.
 
@@ -668,6 +668,12 @@ $BIN_DIR/nimblefix-fix-session-testcases --import-html /path/to/session-cases.ht
 ```
 
 The repository keeps the canonical Phase 11 baseline as `tests/data/fix-session/official-session-cases.nfcases` plus mapped `.nfscenario` files under `tests/data/fix-session/cases/`. Raw FIX Trading HTML is not required at build or test time; if you obtain an updated official page offline, use `--import-html` to bootstrap a local manifest and then map cases onto the existing interop harness.
+
+The runner reports scenario execution and official semantic verification separately. `scenario-pass` means the mapped `.nfscenario` executed successfully. `official-verified` additionally requires manifest metadata for the official condition, expected behavior, and checked assertions, and the runner machine-checks every structured `verified=` predicate against both the `.nfscenario` expectations and the produced `InteropReport`. `partial` means the local scenario passes but does not yet prove every official expectation. Manifest records may append optional metadata fields such as `verify=verified`, `condition=...`, `expected=...`, `scope=...`, `verified=...`, and `missing=...` after the legacy 8 fields; explanatory material that cannot be machine-checked belongs in `note` or `scope`, not in `verified=`.
+
+Current baseline: `total=85 mapped=72 scenario-pass=72 official-verified=72 partial=0 fail=0 unsupported=13`. `14.n` remains mandatory unsupported because the official case requires FIX session-layer SecureData / cleartext-encrypted field comparison semantics; NimbleFIX's TLS support is transport-layer encryption and intentionally does not satisfy that session-layer requirement.
+
+For official warning/error cases, `.nfscenario` action expectations can assert `warning=1`, `error=1`, `session-reject=0/1`, and post-action sequence state with `next-in-after=N`. Outbound expectations also support `begin-seq=`, `end-seq=`, `new-seq=`, `gap-fill=`, `text-exact=...` alongside `text-contains=...`, plus `sending-time-present=1` / `sending-time-not=...` for queue-flush and resend timestamp checks. Manifest predicates also include scenario-shape checks such as `transport-connected`, `inbound-msg-type=`, `inbound-seq=`, `inbound-new-seq=`, `inbound-gap-fill=`, `inbound-possdup=`, and `no-session-rejects` where the official condition is about the stimulus rather than only the response.
 
 ### External Interop (QuickFIX)
 

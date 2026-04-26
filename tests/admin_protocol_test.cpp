@@ -742,13 +742,22 @@ TEST_CASE("admin-protocol", "[admin-protocol]")
 
     auto event = protocol.OnInbound(inbound.value(), 10U);
     REQUIRE(event.ok());
-    REQUIRE(event.value().outbound_frames.size() == 1U);
+    REQUIRE(event.value().outbound_frames.size() == 2U);
     REQUIRE(event.value().disconnect);
+    REQUIRE(!event.value().errors.empty());
 
-    auto decoded = nimble::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
-    REQUIRE(decoded.ok());
-    REQUIRE(decoded.value().header.msg_type == "5");
-    REQUIRE(decoded.value().message.view().get_string(kText).value() == "unexpected SenderCompID on inbound frame");
+    auto reject = nimble::codec::DecodeFixMessage(event.value().outbound_frames[0].bytes, dictionary.value());
+    REQUIRE(reject.ok());
+    REQUIRE(reject.value().header.msg_type == "3");
+    REQUIRE(reject.value().message.view().get_int(kRefTagID).value() == kSenderCompID);
+    REQUIRE(reject.value().message.view().get_int(kRejectReason).value() == 9);
+    REQUIRE(reject.value().message.view().get_string(kRefMsgType).value() == "A");
+
+    auto logout = nimble::codec::DecodeFixMessage(event.value().outbound_frames[1].bytes, dictionary.value());
+    REQUIRE(logout.ok());
+    REQUIRE(logout.value().header.msg_type == "5");
+    REQUIRE(logout.value().message.view().get_string(kText).value() == "unexpected SenderCompID on inbound frame");
+    REQUIRE(protocol.session().Snapshot().next_in_seq == 2U);
   }
 
   {
@@ -1135,17 +1144,13 @@ TEST_CASE("admin-protocol", "[admin-protocol]")
 
     auto event = protocol.OnInbound(inbound.value(), 10U);
     REQUIRE(event.ok());
-    REQUIRE(event.value().outbound_frames.size() == 1U);
+    REQUIRE(event.value().outbound_frames.empty());
     REQUIRE(event.value().disconnect);
-
-    auto decoded = nimble::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
-    REQUIRE(decoded.ok());
-    REQUIRE(decoded.value().header.msg_type == "5");
-    REQUIRE(decoded.value().message.view().get_string(kText).value() == "received 0 before Logon completed");
+    REQUIRE(!event.value().errors.empty());
 
     const auto snapshot = protocol.session().Snapshot();
-    REQUIRE(snapshot.next_in_seq == 2U);
-    REQUIRE(snapshot.next_out_seq == 2U);
+    REQUIRE(snapshot.next_in_seq == 1U);
+    REQUIRE(snapshot.next_out_seq == 1U);
   }
 
   {
@@ -1178,18 +1183,14 @@ TEST_CASE("admin-protocol", "[admin-protocol]")
 
     auto event = protocol.OnInbound(inbound.value(), 10U);
     REQUIRE(event.ok());
-    REQUIRE(event.value().outbound_frames.size() == 1U);
+    REQUIRE(event.value().outbound_frames.empty());
     REQUIRE(event.value().disconnect);
-
-    auto decoded = nimble::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
-    REQUIRE(decoded.ok());
-    REQUIRE(decoded.value().header.msg_type == "5");
-    REQUIRE(decoded.value().message.view().get_string(kText).value() == "received 2 before Logon completed");
+    REQUIRE(!event.value().errors.empty());
 
     const auto snapshot = protocol.session().Snapshot();
-    REQUIRE(snapshot.state == nimble::session::SessionState::kAwaitingLogout);
+    REQUIRE(snapshot.state == nimble::session::SessionState::kConnected);
     REQUIRE(snapshot.next_in_seq == 1U);
-    REQUIRE(snapshot.next_out_seq == 2U);
+    REQUIRE(snapshot.next_out_seq == 1U);
   }
 
   {
@@ -2115,7 +2116,7 @@ TEST_CASE("admin-protocol", "[admin-protocol]")
     REQUIRE(decoded.value().header.msg_type == "3");
     REQUIRE(decoded.value().message.view().get_int(kRefTagID).value() == 9999);
     REQUIRE(decoded.value().message.view().get_string(kRefMsgType).value() == "D");
-    REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 3);
+    REQUIRE(decoded.value().message.view().get_int(kRejectReason).value() == 0);
   }
 
   {
@@ -2806,6 +2807,7 @@ TEST_CASE("malformed raw inbound frames are ignored without consuming sequence",
   REQUIRE(malformed_event.value().outbound_frames.empty());
   REQUIRE(malformed_event.value().application_messages.empty());
   REQUIRE(!malformed_event.value().disconnect);
+  REQUIRE(!malformed_event.value().warnings.empty());
   REQUIRE(protocol.session().Snapshot().next_in_seq == 2U);
   REQUIRE(protocol.session().Snapshot().last_inbound_ns == 20U);
 
@@ -3277,9 +3279,9 @@ TEST_CASE("TestRequest timeout triggers disconnect", "[admin-protocol]")
   REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIX.4.4").ok());
 
   // Activation happens at timestamp 2; no further inbound activity.
-  // After 2 * heartbeat_interval without inbound → protocol sends TestRequest.
+  // After HeartBtInt plus the official 20% grace period, protocol sends TestRequest.
   constexpr std::uint64_t kIntervalNs = 30ULL * 1'000'000'000ULL;
-  const std::uint64_t ts_test_request = 2U + 2U * kIntervalNs + 1U;
+  const std::uint64_t ts_test_request = 2U + kIntervalNs + (kIntervalNs / 5U) + 1U;
 
   auto timer1 = protocol.OnTimer(ts_test_request);
   REQUIRE(timer1.ok());

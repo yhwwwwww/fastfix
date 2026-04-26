@@ -22,7 +22,7 @@ NimbleFIX is intentionally focused on the classic low-latency FIX stack, not the
 | **FIX tagvalue encoding** | **Implemented** | Core codec, message builders, fixed-layout writers, raw pass-through, SIMD-assisted tag/value parsing |
 | **FIX over TLS (FIXS)** | **Implemented** | Optional OpenSSL-backed TLS transport, enabled at runtime per initiator counterparty or acceptor listener |
 | **FIX application-layer dictionaries** | **Partial** | Dictionary-driven `.nfd` / `.nfa` model with QuickFIX XML and FIX Orchestra XML import tooling; Orchestra behavior rules stay in separate `.nfct` sidecars |
-| **FIX official session test cases** | **Partial** | Offline FIX Trading session-case manifest plus executable `.nfscenario` baseline; 73 of 85 official cases currently map to in-tree passing scenarios, and the remaining 12 optional cases are explicitly tracked as unsupported |
+| **FIX official session test cases** | **Partial** | Offline FIX Trading session-case manifest plus executable `.nfscenario` baseline; the runner machine-checks official semantic predicates for all 72 mapped scenario-pass cases, with 0 partial mappings and 13 explicitly unsupported cases |
 | **FIX Orchestra** | **Partial** | Offline `nimblefix-orchestra-import` generates structural `.nfd` plus `.nfct` contract sidecars, dump/markdown/interop augmentations, and cold-path runtime binding with explicit unsupported warnings |
 | **FIXP / SOFH** | **Absent** | No FIX Performance Session Layer or Simple Open Framing Header support |
 | **FIXML / SBE / FAST** | **Absent** | No alternate wire encodings beyond classic tag=value FIX |

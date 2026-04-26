@@ -330,6 +330,8 @@ struct ProtocolEvent
     , disconnect(other.disconnect)
     , poss_resend(other.poss_resend)
     , session_reject(other.session_reject)
+    , warnings(other.warnings)
+    , errors(other.errors)
     , owned_application_message_(other.owned_application_message_)
   {
     RebindOwnedApplicationMessage();
@@ -342,6 +344,8 @@ struct ProtocolEvent
     , disconnect(other.disconnect)
     , poss_resend(other.poss_resend)
     , session_reject(other.session_reject)
+    , warnings(std::move(other.warnings))
+    , errors(std::move(other.errors))
     , owned_application_message_(std::move(other.owned_application_message_))
   {
     RebindOwnedApplicationMessage();
@@ -358,6 +362,8 @@ struct ProtocolEvent
     disconnect = other.disconnect;
     poss_resend = other.poss_resend;
     session_reject = other.session_reject;
+    warnings = other.warnings;
+    errors = other.errors;
     owned_application_message_ = other.owned_application_message_;
     RebindOwnedApplicationMessage();
     return *this;
@@ -374,6 +380,8 @@ struct ProtocolEvent
     disconnect = other.disconnect;
     poss_resend = other.poss_resend;
     session_reject = other.session_reject;
+    warnings = std::move(other.warnings);
+    errors = std::move(other.errors);
     owned_application_message_ = std::move(other.owned_application_message_);
     RebindOwnedApplicationMessage();
     return *this;
@@ -385,6 +393,8 @@ struct ProtocolEvent
   bool disconnect{ false };
   bool poss_resend{ false };
   bool session_reject{ false };
+  std::vector<std::string> warnings;
+  std::vector<std::string> errors;
 
   auto MaterializeApplicationMessages() -> void
   {

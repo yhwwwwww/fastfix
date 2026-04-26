@@ -64,6 +64,9 @@ struct InteropActionExpectation
   std::optional<bool> session_active;
   std::optional<bool> disconnect;
   std::optional<bool> session_reject;
+  std::optional<bool> warning_generated;
+  std::optional<bool> error_generated;
+  std::optional<std::uint32_t> next_in_seq_after_action;
 };
 
 struct InteropOutboundExpectation
@@ -83,6 +86,9 @@ struct InteropOutboundExpectation
   std::string ref_msg_type;
   std::string test_req_id;
   std::string text_contains;
+  std::string text_exact;
+  std::optional<bool> sending_time_present;
+  std::string sending_time_not;
 };
 
 struct InteropSessionExpectation
@@ -129,6 +135,7 @@ struct InteropOutboundFrameSummary
   std::optional<bool> gap_fill_flag;
   std::string ref_msg_type;
   std::string test_req_id;
+  std::string sending_time;
   std::string text;
 };
 
@@ -145,6 +152,10 @@ struct InteropActionReport
   bool session_active{ false };
   bool disconnect{ false };
   bool session_reject{ false };
+  std::uint32_t next_in_seq_after_action{ 0 };
+  std::uint32_t next_out_seq_after_action{ 0 };
+  std::vector<std::string> warnings;
+  std::vector<std::string> errors;
   std::vector<InteropOutboundFrameSummary> outbound_frame_summaries;
 };
 

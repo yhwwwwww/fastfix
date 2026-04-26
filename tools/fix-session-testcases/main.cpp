@@ -11,10 +11,10 @@ namespace {
 auto
 PrintUsage() -> void
 {
-  std::cout
-    << "usage:\n"
-    << "  nimblefix-fix-session-testcases --manifest <cases.nfcases> [--report <coverage.md>] [--filter <prefix>]\n"
-    << "  nimblefix-fix-session-testcases --import-html <session-cases.html> --output <cases.nfcases>\n";
+  std::cout << "usage:\n"
+            << "  nimblefix-fix-session-testcases --manifest <cases.nfcases> [--report <coverage.md>] [--filter "
+               "<prefix>] [--fail-on-partial]\n"
+            << "  nimblefix-fix-session-testcases --import-html <session-cases.html> --output <cases.nfcases>\n";
 }
 
 } // namespace
@@ -27,6 +27,7 @@ main(int argc, char** argv)
   std::filesystem::path import_html_path;
   std::filesystem::path output_path;
   std::optional<std::string> filter_prefix;
+  bool fail_on_partial = false;
 
   for (int index = 1; index < argc; ++index) {
     const std::string_view arg(argv[index]);
@@ -48,6 +49,10 @@ main(int argc, char** argv)
     }
     if (arg == "--output" && index + 1 < argc) {
       output_path = argv[++index];
+      continue;
+    }
+    if (arg == "--fail-on-partial") {
+      fail_on_partial = true;
       continue;
     }
     PrintUsage();
@@ -120,6 +125,12 @@ main(int argc, char** argv)
       case nimble::runtime::OfficialCaseOutcome::kUnexpectedPass:
         std::cout << "unexpected-pass";
         break;
+      case nimble::runtime::OfficialCaseOutcome::kPartial:
+        std::cout << "partial";
+        break;
+      case nimble::runtime::OfficialCaseOutcome::kOfficiallyVerified:
+        std::cout << "official-verified";
+        break;
     }
     if (!result.message.empty()) {
       std::cout << " - " << result.message;
@@ -128,7 +139,9 @@ main(int argc, char** argv)
   }
 
   std::cout << "summary: total=" << summary.value().total_cases << " mapped=" << summary.value().mapped_cases
-            << " pass=" << summary.value().passed_cases << " fail=" << summary.value().failed_cases
+            << " scenario-pass=" << summary.value().passed_cases
+            << " official-verified=" << summary.value().officially_verified_cases
+            << " partial=" << summary.value().partial_cases << " fail=" << summary.value().failed_cases
             << " unsupported=" << summary.value().unsupported_cases << " xfail=" << summary.value().expected_fail_cases
             << " unexpected-pass=" << summary.value().unexpected_pass_cases << '\n';
 
@@ -141,5 +154,15 @@ main(int argc, char** argv)
     out << nimble::runtime::RenderOfficialCaseCoverageReport(summary.value());
   }
 
-  return summary.value().failed_cases == 0U && summary.value().unexpected_pass_cases == 0U ? 0 : 1;
+  const auto has_partial_cases = summary.value().partial_cases > 0U;
+  if (fail_on_partial && has_partial_cases) {
+    std::cerr
+      << "official FIX session gate failed: partial_cases=" << summary.value().partial_cases
+      << "; add verify=verified condition/expected/verified metadata or mark the case unsupported with a reason\n";
+  }
+
+  return summary.value().failed_cases == 0U && summary.value().unexpected_pass_cases == 0U &&
+             (!fail_on_partial || !has_partial_cases)
+           ? 0
+           : 1;
 }

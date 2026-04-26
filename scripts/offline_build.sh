@@ -406,7 +406,7 @@ run_official_fix_session_gate() {
     fi
 
     echo "info: running official FIX session testcase gate" >&2
-    "$runner_path" --manifest "$OFFICIAL_FIX_SESSION_MANIFEST"
+    "$runner_path" --manifest "$OFFICIAL_FIX_SESSION_MANIFEST" --fail-on-partial
 }
 
 while [ "$#" -gt 0 ]; do

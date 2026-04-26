@@ -544,6 +544,8 @@ SummarizeProtocolEvent(const session::ProtocolEvent& event,
   report.session_active = event.session_active;
   report.disconnect = event.disconnect;
   report.session_reject = event.session_reject;
+  report.warnings = event.warnings;
+  report.errors = event.errors;
   report.outbound_frame_summaries.reserve(event.outbound_frames.size());
 
   for (const auto& frame : event.outbound_frames) {
@@ -566,11 +568,23 @@ SummarizeProtocolEvent(const session::ProtocolEvent& event,
     summary.gap_fill_flag = view.get_boolean(kGapFillFlag);
     summary.ref_msg_type = std::string(view.get_string(kRefMsgType).value_or(std::string_view{}));
     summary.test_req_id = std::string(view.get_string(kTestReqID).value_or(std::string_view{}));
+    summary.sending_time = std::string(decoded.value().header.sending_time);
     summary.text = std::string(view.get_string(kText).value_or(std::string_view{}));
     report.outbound_frame_summaries.push_back(std::move(summary));
   }
 
   return report;
+}
+
+auto
+AttachActionSessionSnapshot(const session::SessionCore& session, InteropActionReport* report) -> void
+{
+  if (report == nullptr) {
+    return;
+  }
+  const auto snapshot = session.Snapshot();
+  report->next_in_seq_after_action = snapshot.next_in_seq;
+  report->next_out_seq_after_action = snapshot.next_out_seq;
 }
 
 auto
@@ -739,6 +753,7 @@ SummarizeApplicationOutcomes(ScenarioRuntimeContext& context,
       --report->processed_application_messages;
     }
     ++report->ignored_application_messages;
+    report->warnings.push_back("PossResend duplicate application identifier ignored");
     context.trace.Record(
       TraceEventKind::kSessionEvent, session_id, worker_id, timestamp_ns, 0U, 0U, "app-poss-resend-duplicate");
   }
@@ -808,6 +823,17 @@ ValidateExpectations(const InteropScenario& scenario, const InteropReport& repor
     if (expectation.session_reject.has_value() && action.session_reject != expectation.session_reject.value()) {
       return base::Status::InvalidArgument("interop action expectation mismatch for session_reject");
     }
+    if (expectation.warning_generated.has_value() &&
+        (!action.warnings.empty()) != expectation.warning_generated.value()) {
+      return base::Status::InvalidArgument("interop action expectation mismatch for warning");
+    }
+    if (expectation.error_generated.has_value() && (!action.errors.empty()) != expectation.error_generated.value()) {
+      return base::Status::InvalidArgument("interop action expectation mismatch for error");
+    }
+    if (expectation.next_in_seq_after_action.has_value() &&
+        action.next_in_seq_after_action != expectation.next_in_seq_after_action.value()) {
+      return base::Status::InvalidArgument("interop action expectation mismatch for next_in_after");
+    }
   }
 
   for (const auto& expectation : scenario.outbound_expectations) {
@@ -860,6 +886,16 @@ ValidateExpectations(const InteropScenario& scenario, const InteropReport& repor
     }
     if (!expectation.text_contains.empty() && frame.text.find(expectation.text_contains) == std::string::npos) {
       return base::Status::InvalidArgument("interop outbound expectation mismatch for Text(58)");
+    }
+    if (!expectation.text_exact.empty() && frame.text != expectation.text_exact) {
+      return base::Status::InvalidArgument("interop outbound expectation mismatch for exact Text(58)");
+    }
+    if (expectation.sending_time_present.has_value() &&
+        frame.sending_time.empty() == expectation.sending_time_present.value()) {
+      return base::Status::InvalidArgument("interop outbound expectation mismatch for SendingTime presence");
+    }
+    if (!expectation.sending_time_not.empty() && frame.sending_time == expectation.sending_time_not) {
+      return base::Status::InvalidArgument("interop outbound expectation mismatch for excluded SendingTime");
     }
   }
 
@@ -1169,6 +1205,27 @@ LoadInteropScenarioText(std::string_view text, const std::filesystem::path& base
         }
         expectation.session_reject = value.value();
       }
+      if (options.value().contains("warning")) {
+        auto value = ParseOptionBoolean(options.value(), "warning", "warning");
+        if (!value.ok()) {
+          return value.status();
+        }
+        expectation.warning_generated = value.value();
+      }
+      if (options.value().contains("error")) {
+        auto value = ParseOptionBoolean(options.value(), "error", "error");
+        if (!value.ok()) {
+          return value.status();
+        }
+        expectation.error_generated = value.value();
+      }
+      if (options.value().contains("next-in-after")) {
+        auto value = ParseOptionInteger<std::uint32_t>(options.value(), "next-in-after", "next_in_after");
+        if (!value.ok()) {
+          return value.status();
+        }
+        expectation.next_in_seq_after_action = value.value();
+      }
 
       scenario.action_expectations.push_back(std::move(expectation));
       continue;
@@ -1199,6 +1256,8 @@ LoadInteropScenarioText(std::string_view text, const std::filesystem::path& base
       expectation.ref_msg_type = GetOptionString(options.value(), "ref-msg-type");
       expectation.test_req_id = GetOptionString(options.value(), "test-req-id");
       expectation.text_contains = GetOptionString(options.value(), "text-contains");
+      expectation.text_exact = GetOptionString(options.value(), "text-exact");
+      expectation.sending_time_not = GetOptionString(options.value(), "sending-time-not");
       if (options.value().contains("msg-seq-num")) {
         auto value = ParseOptionInteger<std::uint32_t>(options.value(), "msg-seq-num", "msg_seq_num");
         if (!value.ok()) {
@@ -1262,6 +1321,13 @@ LoadInteropScenarioText(std::string_view text, const std::filesystem::path& base
           return value.status();
         }
         expectation.gap_fill_flag = value.value();
+      }
+      if (options.value().contains("sending-time-present")) {
+        auto value = ParseOptionBoolean(options.value(), "sending-time-present", "sending_time_present");
+        if (!value.ok()) {
+          return value.status();
+        }
+        expectation.sending_time_present = value.value();
       }
 
       scenario.outbound_expectations.push_back(std::move(expectation));
@@ -1607,6 +1673,7 @@ RunInteropScenario(const InteropScenario& scenario) -> base::Result<InteropRepor
           return status;
         }
         context.sessions.at(action.session_id) = protocol_context->protocol->session();
+        AttachActionSessionSnapshot(protocol_context->protocol->session(), &action_report);
         context.trace.Record(
           TraceEventKind::kSessionEvent, action.session_id, worker_id, action.timestamp_ns, 0U, 0U, "protocol-connect");
         action_reports.push_back(std::move(action_report));
@@ -1646,6 +1713,7 @@ RunInteropScenario(const InteropScenario& scenario) -> base::Result<InteropRepor
           return status;
         }
         context.sessions.at(action.session_id) = protocol_context->protocol->session();
+        AttachActionSessionSnapshot(protocol_context->protocol->session(), &action_report);
         context.trace.Record(TraceEventKind::kSessionEvent,
                              action.session_id,
                              worker_id,
@@ -1686,6 +1754,7 @@ RunInteropScenario(const InteropScenario& scenario) -> base::Result<InteropRepor
           return status;
         }
         context.sessions.at(action.session_id) = protocol_context->protocol->session();
+        AttachActionSessionSnapshot(protocol_context->protocol->session(), &action_report);
         context.trace.Record(TraceEventKind::kSessionEvent,
                              action.session_id,
                              worker_id,
@@ -1748,6 +1817,7 @@ RunInteropScenario(const InteropScenario& scenario) -> base::Result<InteropRepor
           return status;
         }
         context.sessions.at(action.session_id) = protocol_context->protocol->session();
+        AttachActionSessionSnapshot(protocol_context->protocol->session(), &action_report);
         context.trace.Record(
           TraceEventKind::kSessionEvent, action.session_id, worker_id, action.timestamp_ns, 0U, 0U, "protocol-timer");
         action_reports.push_back(std::move(action_report));
@@ -1775,6 +1845,7 @@ RunInteropScenario(const InteropScenario& scenario) -> base::Result<InteropRepor
           return status;
         }
         context.sessions.at(action.session_id) = protocol_context->protocol->session();
+        AttachActionSessionSnapshot(protocol_context->protocol->session(), &action_report);
         context.trace.Record(TraceEventKind::kSessionEvent,
                              action.session_id,
                              worker_id,
@@ -1802,6 +1873,7 @@ RunInteropScenario(const InteropScenario& scenario) -> base::Result<InteropRepor
               "acceptor-logon-attempt does not model dynamic accept_unknown_sessions flows");
           }
           action_report.disconnect = true;
+          action_report.errors.push_back("acceptor Logon identity did not match a configured session");
           context.trace.Record(TraceEventKind::kSessionEvent,
                                action.session_id,
                                worker_id,
@@ -1820,6 +1892,7 @@ RunInteropScenario(const InteropScenario& scenario) -> base::Result<InteropRepor
 
         if (session_it->second.state() == session::SessionState::kActive) {
           action_report.disconnect = true;
+          action_report.errors.push_back("acceptor Logon identity is already bound to an active session");
           context.trace.Record(TraceEventKind::kSessionEvent,
                                matched->session.session_id,
                                context.workers.at(matched->session.session_id),

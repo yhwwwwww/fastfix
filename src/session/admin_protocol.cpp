@@ -24,9 +24,10 @@ namespace {
 using namespace nimble::codec::tags;
 
 constexpr std::uint64_t kNanosPerSecond = 1'000'000'000ULL;
+constexpr std::uint64_t kTestRequestGraceDivisor = 5U;
+constexpr std::uint32_t kSessionRejectInvalidTagNumber = 0U;
 constexpr std::uint32_t kSessionRejectRequiredTagMissing = 1U;
 constexpr std::uint32_t kSessionRejectTagNotDefinedForMessage = 2U;
-constexpr std::uint32_t kSessionRejectUndefinedTag = 3U;
 constexpr std::uint32_t kSessionRejectTagSpecifiedWithoutAValue = 4U;
 constexpr std::uint32_t kSessionRejectValueIncorrect = 5U;
 constexpr std::uint32_t kSessionRejectIncorrectDataFormatForValue = 6U;
@@ -309,7 +310,7 @@ ValidationIssueRejectReason(const codec::ValidationIssue& issue) -> std::uint32_
     case codec::ValidationIssueKind::kFieldNotAllowed:
       return kSessionRejectTagNotDefinedForMessage;
     case codec::ValidationIssueKind::kUnknownField:
-      return kSessionRejectUndefinedTag;
+      return kSessionRejectInvalidTagNumber;
     case codec::ValidationIssueKind::kTagSpecifiedWithoutAValue:
       return kSessionRejectTagSpecifiedWithoutAValue;
     case codec::ValidationIssueKind::kIncorrectDataFormatForValue:
@@ -1243,9 +1244,7 @@ AdminProtocol::BuildRejectFrame(std::uint32_t ref_seq_num,
   if (ref_tag_id != 0U) {
     builder.set_int(kRefTagID, static_cast<std::int64_t>(ref_tag_id));
   }
-  if (reject_reason != 0U) {
-    builder.set_int(kRejectReason, static_cast<std::int64_t>(reject_reason));
-  }
+  builder.set_int(kRejectReason, static_cast<std::int64_t>(reject_reason));
   if (!text.empty()) {
     builder.set_string(kText, std::move(text));
   }
@@ -1261,6 +1260,11 @@ AdminProtocol::RejectInbound(const codec::DecodedMessageView& decoded,
                              bool disconnect) -> base::Result<ProtocolEvent>
 {
   ProtocolEvent event;
+  if (reject_reason == kSessionRejectInvalidMsgType) {
+    event.warnings.push_back(std::string(text));
+  } else {
+    event.errors.push_back(std::string(text));
+  }
   if (disconnect && decoded.header.msg_type == "A") {
     auto logout = BeginLogout(std::string(text), timestamp_ns);
     if (!logout.ok()) {
@@ -1500,7 +1504,13 @@ AdminProtocol::OnInbound(std::span<const std::byte> frame, std::uint64_t timesta
     if (!status.ok()) {
       return status;
     }
-    return ProtocolEvent{};
+    ProtocolEvent event;
+    if (decode_status.message().empty()) {
+      event.warnings.push_back("malformed inbound frame ignored");
+    } else {
+      event.warnings.push_back(std::string(decode_status.message()));
+    }
+    return event;
   }
   auto event = OnInbound(inbound_decode_scratch_, timestamp_ns);
   if (!event.ok()) {
@@ -1544,7 +1554,13 @@ AdminProtocol::OnInbound(std::vector<std::byte>&& frame, std::uint64_t timestamp
     if (!status.ok()) {
       return status;
     }
-    return ProtocolEvent{};
+    ProtocolEvent event;
+    if (decode_status.message().empty()) {
+      event.warnings.push_back("malformed inbound frame ignored");
+    } else {
+      event.warnings.push_back(std::string(decode_status.message()));
+    }
+    return event;
   }
   auto event = OnInbound(inbound_decode_scratch_, timestamp_ns);
   if (!event.ok()) {
@@ -1633,6 +1649,24 @@ AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uint64_t
     if (!status.ok()) {
       return status;
     }
+    if (disconnect && reject_reason == kSessionRejectCompIdProblem) {
+      if (snapshot_before.state == SessionState::kConnected && is_logon &&
+          decoded.header.msg_seq_num == snapshot_before.next_in_seq) {
+        status = session_.ObserveInboundSeq(decoded.header.msg_seq_num);
+        if (!status.ok()) {
+          return status;
+        }
+        status = session_.RecordInboundActivity(timestamp_ns);
+        if (!status.ok()) {
+          return status;
+        }
+        status = PersistRecoveryState();
+        if (!status.ok()) {
+          return status;
+        }
+      }
+      return reject_then_logout(ref_tag_id, reject_reason, std::move(reject_text));
+    }
     return RejectInbound(decoded, ref_tag_id, reject_reason, std::move(reject_text), timestamp_ns, disconnect);
   }
 
@@ -1690,6 +1724,11 @@ AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uint64_t
   const auto phase_violation_text = AdminPhaseViolationText(snapshot_before.state, msg_type);
   const auto send_phase_violation_logout = [&](std::string text) -> base::Result<ProtocolEvent> {
     ProtocolEvent phase_event;
+    phase_event.errors.push_back(text);
+    if (!config_.session.is_initiator && snapshot_before.state == SessionState::kConnected && msg_type != "A") {
+      phase_event.disconnect = true;
+      return phase_event;
+    }
     auto logout = BeginLogout(std::move(text), timestamp_ns);
     if (!logout.ok()) {
       return logout.status();
@@ -1735,6 +1774,21 @@ AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uint64_t
     return PersistRecoveryState();
   };
 
+  if (phase_violation_text.has_value() && !config_.session.is_initiator &&
+      snapshot_before.state == SessionState::kConnected && msg_type != "A") {
+    status = session_.RecordInboundActivity(timestamp_ns);
+    if (!status.ok()) {
+      return status;
+    }
+    status = PersistRecoveryState();
+    if (!status.ok()) {
+      return status;
+    }
+    event.errors.push_back(*phase_violation_text);
+    event.disconnect = true;
+    return event;
+  }
+
   if (decoded.header.msg_seq_num < snapshot_before.next_in_seq) {
     if (is_sequence_reset) {
       std::uint32_t new_seq_num = 0U;
@@ -1749,6 +1803,8 @@ AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uint64_t
         if (!logout.ok()) {
           return logout.status();
         }
+        event.errors.push_back("MsgSeqNum too low, expecting " + std::to_string(snapshot_before.next_in_seq) +
+                               " but received " + std::to_string(decoded.header.msg_seq_num));
         event.outbound_frames.push_back(std::move(logout).value());
         event.disconnect = true;
         return event;
@@ -1798,6 +1854,7 @@ AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uint64_t
     if (!logout.ok()) {
       return logout.status();
     }
+    event.errors.push_back("received stale inbound FIX sequence number");
     event.outbound_frames.push_back(std::move(logout).value());
     event.disconnect = true;
     return event;
@@ -1831,6 +1888,10 @@ AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uint64_t
     status = record_inbound_liveness();
     if (!status.ok()) {
       return status;
+    }
+
+    if (new_seq_num == snapshot_before.next_in_seq) {
+      event.warnings.push_back("SequenceReset NewSeqNo equals expected inbound sequence");
     }
 
     if (phase_violation_text.has_value()) {
@@ -2064,6 +2125,12 @@ AdminProtocol::OnInbound(const codec::DecodedMessageView& decoded, std::uint64_t
       return frame.status();
     }
     business_reject_event.outbound_frames.push_back(std::move(frame).value());
+    if (business_reject_reason == kBusinessRejectUnsupportedMessageType ||
+        business_reject_reason == kBusinessRejectApplicationNotAvailable) {
+      business_reject_event.warnings.push_back(text);
+    } else {
+      business_reject_event.errors.push_back(text);
+    }
     return business_reject_event;
   };
   if (const auto business_reject_reason = ResolveApplicationBusinessRejectReason(config_, dictionary_, decoded);
@@ -2120,6 +2187,7 @@ AdminProtocol::OnTimer(std::uint64_t timestamp_ns) -> base::Result<ProtocolEvent
   // one interval.
   if (snapshot.state == SessionState::kAwaitingLogout && logout_sent_ns_ != 0U &&
       timestamp_ns > logout_sent_ns_ + interval_ns) {
+    event.warnings.push_back("Logout acknowledgement timeout");
     event.disconnect = true;
     return event;
   }
@@ -2132,9 +2200,11 @@ AdminProtocol::OnTimer(std::uint64_t timestamp_ns) -> base::Result<ProtocolEvent
     return event;
   }
 
-  // Send TestRequest after 2*interval of inbound silence (only if not already
-  // waiting for one).
-  if (snapshot.last_inbound_ns != 0U && timestamp_ns > snapshot.last_inbound_ns + (interval_ns * 2U) &&
+  const auto test_request_threshold_ns = interval_ns + (interval_ns / kTestRequestGraceDivisor);
+
+  // Send TestRequest after HeartBtInt plus the official 20% grace period of
+  // inbound silence (only if not already waiting for one).
+  if (snapshot.last_inbound_ns != 0U && timestamp_ns > snapshot.last_inbound_ns + test_request_threshold_ns &&
       outstanding_test_request_id_.empty()) {
     outstanding_test_request_id_ = std::to_string(timestamp_ns);
     test_request_sent_ns_ = timestamp_ns;
@@ -2197,7 +2267,8 @@ AdminProtocol::NextTimerDeadline(std::uint64_t timestamp_ns) const -> std::optio
   if (!outstanding_test_request_id_.empty() && test_request_sent_ns_ != 0U) {
     update_deadline(test_request_sent_ns_ + interval_ns);
   } else if (snapshot.last_inbound_ns != 0U) {
-    update_deadline(snapshot.last_inbound_ns + (interval_ns * 2U));
+    const auto test_request_threshold_ns = interval_ns + (interval_ns / kTestRequestGraceDivisor);
+    update_deadline(snapshot.last_inbound_ns + test_request_threshold_ns);
   }
 
   if (snapshot.last_outbound_ns == 0U) {
