@@ -9,8 +9,8 @@
 
 #include "nimblefix/base/result.h"
 #include "nimblefix/base/status.h"
+#include "nimblefix/advanced/encoded_application_message.h"
 #include "nimblefix/message/message_ref.h"
-#include "nimblefix/session/encoded_application_message.h"
 #include "nimblefix/session/session_key.h"
 #include "nimblefix/session/session_send_envelope.h"
 #include "nimblefix/session/session_snapshot.h"
@@ -234,7 +234,11 @@ public:
   virtual auto Subscribe(std::uint64_t session_id, std::size_t queue_capacity) -> base::Result<SessionSubscription> = 0;
 };
 
-/// Public send/control handle for one runtime session.
+/// Advanced raw send/control handle for one runtime session.
+///
+/// Prefer `runtime::Session<Profile>` and `runtime::InlineSession<Profile>` in
+/// new business code. `SessionHandle` remains the lower-level escape hatch for
+/// raw sends, subscriptions, and schema-agnostic integrations.
 ///
 /// Design intent: hand application code a small value object that can snapshot,
 /// subscribe, and send without exposing runtime internals.
@@ -242,10 +246,12 @@ public:
 /// Performance/lifecycle contract:
 /// - all send methods share a single-producer command path; one producer thread
 ///   must own each handle
-/// - `SendCopy()` copies payloads for safety
-/// - `SendTake()` avoids an extra copy by transferring ownership
-/// - `SendInlineBorrowed()` and encoded inline variants are the zero-copy fast
-///   path, but only while executing inside a direct runtime inline callback
+/// - use `message::MessageRef::Copy/Take/Borrow` to select owned vs borrowed
+///   decoded-message semantics
+/// - use `EncodedApplicationMessageRef::Copy/Take/Borrow` to select owned vs
+///   borrowed pre-encoded semantics
+/// - borrowed sends are the zero-copy fast path, but only while executing
+///   inside a direct runtime inline callback
 ///
 /// Boundary condition: a default-constructed or unbound handle reports
 /// `InvalidArgument` instead of silently dropping work.
@@ -256,10 +262,10 @@ public:
   // producer thread per handle. Cross-thread send attempts fast-fail instead of
   // silently violating the runtime's SPSC queue contract.
   //
-  // SendInlineBorrowed()/SendEncodedInlineBorrowed() are stricter: they are
-  // valid only from direct runtime inline callbacks such as
+  // Borrowed MessageRef/EncodedApplicationMessageRef sends are stricter: they
+  // are valid only from direct runtime inline callbacks such as
   // ApplicationCallbacks::OnSessionEvent/OnAdminMessage/OnAppMessage. Queue
-  // handlers and arbitrary application threads must use owned send variants.
+  // handlers and arbitrary application threads must use owned refs.
   SessionHandle() = default;
 
   SessionHandle(std::uint64_t session_id, std::uint32_t worker_id)
@@ -314,75 +320,36 @@ public:
   }
 
 public:
-  /// Copy a decoded message into the runtime send path.
+  /// Send a decoded application message into the runtime send path.
   ///
-  /// \param message Borrowed source view; payload is copied before the call returns.
+  /// Use `message::MessageRef::Copy/Take/Borrow` to choose ownership.
+  /// Borrowed refs are valid only from direct runtime inline callbacks.
+  ///
+  /// \param message Owned or borrowed decoded application message.
   /// \param envelope Optional `50/57` header overrides.
   /// \return `Ok()` when accepted, otherwise an error status.
-  auto SendCopy(message::MessageView message, SessionSendEnvelopeView envelope = {}) const -> base::Status
+  auto Send(message::MessageRef message, SessionSendEnvelopeView envelope = {}) const -> base::Status
   {
-    return SubmitOwnedMessage(message::MessageRef::Copy(message), SessionSendEnvelopeRef::Own(envelope));
+    if (message.borrows_view()) {
+      return SubmitInlineBorrowedMessage(message, envelope);
+    }
+    return SubmitOwnedMessage(std::move(message), SessionSendEnvelopeRef::Own(envelope));
   }
 
-  /// Move an owned decoded message into the runtime send path.
+  /// Send a pre-encoded application body into the runtime send path.
   ///
-  /// \param message Owned message transferred to the runtime.
+  /// Use `EncodedApplicationMessageRef::Copy/Take/Borrow` to choose ownership.
+  /// Borrowed refs are valid only from direct runtime inline callbacks.
+  ///
+  /// \param message Owned or borrowed pre-encoded application message.
   /// \param envelope Optional `50/57` header overrides.
   /// \return `Ok()` when accepted, otherwise an error status.
-  auto SendTake(message::Message&& message, SessionSendEnvelopeView envelope = {}) const -> base::Status
+  auto SendEncoded(EncodedApplicationMessageRef message, SessionSendEnvelopeView envelope = {}) const -> base::Status
   {
-    return SubmitOwnedMessage(message::MessageRef::Take(std::move(message)), SessionSendEnvelopeRef::Own(envelope));
-  }
-
-  /// Attempt the inline borrowed decoded-message fast path.
-  ///
-  /// This path avoids an application-side copy but is only legal from direct
-  /// runtime inline callbacks.
-  ///
-  /// \param message Borrowed decoded message view.
-  /// \param envelope Optional `50/57` header overrides.
-  /// \return `Ok()` when the runtime consumed the borrow inline, otherwise an error status.
-  auto SendInlineBorrowed(message::MessageView message, SessionSendEnvelopeView envelope = {}) const -> base::Status
-  {
-    return SubmitInlineBorrowedMessage(message::MessageRef::Borrow(message), envelope);
-  }
-
-  /// Copy a pre-encoded application body into the runtime send path.
-  ///
-  /// The runtime still owns session-managed FIX header/trailer fields.
-  ///
-  /// \param message Borrowed pre-encoded application message.
-  /// \param envelope Optional `50/57` header overrides.
-  /// \return `Ok()` when accepted, otherwise an error status.
-  auto SendEncodedCopy(EncodedApplicationMessageView message, SessionSendEnvelopeView envelope = {}) const
-    -> base::Status
-  {
-    return SubmitOwnedEncodedMessage(EncodedApplicationMessageRef::Copy(message),
-                                     SessionSendEnvelopeRef::Own(envelope));
-  }
-
-  /// Move an owned pre-encoded application body into the runtime send path.
-  ///
-  /// \param message Owned pre-encoded application message.
-  /// \param envelope Optional `50/57` header overrides.
-  /// \return `Ok()` when accepted, otherwise an error status.
-  auto SendEncodedTake(EncodedApplicationMessage&& message, SessionSendEnvelopeView envelope = {}) const -> base::Status
-  {
-    return SubmitOwnedEncodedMessage(EncodedApplicationMessageRef::Take(std::move(message)),
-                                     SessionSendEnvelopeRef::Own(envelope));
-  }
-
-  /// Attempt the inline borrowed pre-encoded fast path.
-  ///
-  /// This path is valid only from direct runtime inline callbacks.
-  ///
-  /// \param message Borrowed pre-encoded application message.
-  /// \param envelope Optional `50/57` header overrides.
-  /// \return `Ok()` when the runtime consumed the borrow inline, otherwise an error status.
-  auto SendEncodedInlineBorrowed(EncodedApplicationMessageView message, SessionSendEnvelopeView envelope = {}) const
-    -> base::Status
-  {
-    return SubmitInlineBorrowedEncodedMessage(EncodedApplicationMessageRef::Borrow(message), envelope);
+    if (message.borrows_view()) {
+      return SubmitInlineBorrowedEncodedMessage(message, envelope);
+    }
+    return SubmitOwnedEncodedMessage(std::move(message), SessionSendEnvelopeRef::Own(envelope));
   }
 
 private:

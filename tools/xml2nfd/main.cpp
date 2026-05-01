@@ -20,10 +20,9 @@ PrintUsage() -> void
 {
   std::cerr << "usage:\n"
             << "  nimblefix-xml2nfd --xml <FIX44.xml> --output <output.nfd> "
-               "--profile-id <uint64> [--cpp-builders <output.h>] [--cpp-readers "
-               "<output.h>]\n"
+               "--profile-id <uint64> [--cpp-api <output.h>]\n"
             << "  nimblefix-xml2nfd --input <baseline.nfd> [--input <overlay.nfd> ...] "
-               "--cpp-builders <output.h> [--cpp-readers <output.h>]\n";
+               "--cpp-api <output.h>\n";
 }
 
 auto
@@ -55,8 +54,7 @@ main(int argc, char** argv)
 {
   std::filesystem::path xml_path;
   std::filesystem::path output_path;
-  std::filesystem::path builder_output_path;
-  std::filesystem::path reader_output_path;
+  std::filesystem::path api_output_path;
   std::vector<std::filesystem::path> input_paths;
   std::uint64_t profile_id = 0;
 
@@ -78,12 +76,8 @@ main(int argc, char** argv)
       input_paths.emplace_back(argv[++index]);
       continue;
     }
-    if (arg == "--cpp-builders" && index + 1 < argc) {
-      builder_output_path = argv[++index];
-      continue;
-    }
-    if (arg == "--cpp-readers" && index + 1 < argc) {
-      reader_output_path = argv[++index];
+    if (arg == "--cpp-api" && index + 1 < argc) {
+      api_output_path = argv[++index];
       continue;
     }
     PrintUsage();
@@ -109,8 +103,8 @@ main(int argc, char** argv)
     return 1;
   }
 
-  if (input_mode && builder_output_path.empty() && reader_output_path.empty()) {
-    std::cerr << "error: --input mode requires --cpp-builders or --cpp-readers\n";
+  if (input_mode && api_output_path.empty()) {
+    std::cerr << "error: --input mode requires --cpp-api\n";
     return 1;
   }
 
@@ -144,7 +138,7 @@ main(int argc, char** argv)
 
   // Phase 2: Build normalized dictionary (if codegen is requested)
   nimble::profile::NormalizedDictionary dictionary;
-  const bool need_dictionary = !builder_output_path.empty() || !reader_output_path.empty();
+  const bool need_dictionary = !api_output_path.empty();
 
   if (need_dictionary) {
     if (xml_mode) {
@@ -184,36 +178,20 @@ main(int argc, char** argv)
     }
   }
 
-  // Phase 3: Generate C++ builder header (if requested)
-  if (!builder_output_path.empty()) {
-    builder_output_path = ResolveProjectPath(builder_output_path);
+  // Phase 3: Generate C++ API header (if requested)
+  if (!api_output_path.empty()) {
+    api_output_path = ResolveProjectPath(api_output_path);
 
-    if (const auto parent = builder_output_path.parent_path(); !parent.empty()) {
+    if (const auto parent = api_output_path.parent_path(); !parent.empty()) {
       std::filesystem::create_directories(parent);
     }
 
-    const auto status = nimble::profile::WriteCppBuildersHeader(builder_output_path, dictionary);
+    const auto status = nimble::profile::WriteCppApiHeader(api_output_path, dictionary);
     if (!status.ok()) {
       std::cerr << "error: " << status.message() << '\n';
       return 1;
     }
-    std::cout << "generated builder header '" << builder_output_path.string() << "'\n";
-  }
-
-  // Phase 4: Generate C++ reader header (if requested)
-  if (!reader_output_path.empty()) {
-    reader_output_path = ResolveProjectPath(reader_output_path);
-
-    if (const auto parent = reader_output_path.parent_path(); !parent.empty()) {
-      std::filesystem::create_directories(parent);
-    }
-
-    const auto status = nimble::profile::WriteCppReadersHeader(reader_output_path, dictionary);
-    if (!status.ok()) {
-      std::cerr << "error: " << status.message() << '\n';
-      return 1;
-    }
-    std::cout << "generated reader header '" << reader_output_path.string() << "'\n";
+    std::cout << "generated api header '" << api_output_path.string() << "'\n";
   }
 
   return 0;

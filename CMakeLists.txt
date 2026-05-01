@@ -46,11 +46,9 @@ set(NIMBLEFIX_BENCH_OUTPUT_DIR "${NIMBLEFIX_OUTPUT_ROOT}/bench")
 set(NIMBLEFIX_FIX44_XML "${NIMBLEFIX_QUICKFIX_ROOT}/spec/FIX44.xml")
 set(NIMBLEFIX_FIX44_NFD "${NIMBLEFIX_BENCH_OUTPUT_DIR}/quickfix_FIX44.nfd")
 set(NIMBLEFIX_FIX44_NFA "${NIMBLEFIX_BENCH_OUTPUT_DIR}/quickfix_FIX44.nfa")
-set(NIMBLEFIX_FIX44_BUILDERS "${NIMBLEFIX_GENERATED_DIR}/fix44_builders.h")
-set(NIMBLEFIX_FIX44_READERS "${NIMBLEFIX_GENERATED_DIR}/fix44_readers.h")
+set(NIMBLEFIX_FIX44_API "${NIMBLEFIX_GENERATED_DIR}/fix44_api.h")
 set(NIMBLEFIX_SAMPLE_NFA "${NIMBLEFIX_OUTPUT_ROOT}/sample-basic.nfa")
-set(NIMBLEFIX_SAMPLE_BUILDERS "${NIMBLEFIX_GENERATED_DIR}/sample_basic_builders.h")
-set(NIMBLEFIX_SAMPLE_READERS "${NIMBLEFIX_GENERATED_DIR}/sample_basic_readers.h")
+set(NIMBLEFIX_SAMPLE_API "${NIMBLEFIX_GENERATED_DIR}/sample_basic_api.h")
 
 file(MAKE_DIRECTORY "${NIMBLEFIX_GENERATED_DIR}")
 file(MAKE_DIRECTORY "${NIMBLEFIX_BENCH_OUTPUT_DIR}")
@@ -237,8 +235,7 @@ add_custom_command(
     OUTPUT
         "${NIMBLEFIX_FIX44_NFD}"
         "${NIMBLEFIX_FIX44_NFA}"
-        "${NIMBLEFIX_FIX44_BUILDERS}"
-        "${NIMBLEFIX_FIX44_READERS}"
+        "${NIMBLEFIX_FIX44_API}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${NIMBLEFIX_BENCH_OUTPUT_DIR}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${NIMBLEFIX_GENERATED_DIR}"
     COMMAND $<TARGET_FILE:nimblefix-xml2nfd>
@@ -248,8 +245,7 @@ add_custom_command(
     COMMAND $<TARGET_FILE:nimblefix-dictgen>
         --input "${NIMBLEFIX_FIX44_NFD}"
         --output "${NIMBLEFIX_FIX44_NFA}"
-        --cpp-builders "${NIMBLEFIX_FIX44_BUILDERS}"
-        --cpp-readers "${NIMBLEFIX_FIX44_READERS}"
+        --cpp-api "${NIMBLEFIX_FIX44_API}"
     DEPENDS
         nimblefix-xml2nfd
         nimblefix-dictgen
@@ -260,23 +256,20 @@ add_custom_target(nimblefix-fix44-assets
     DEPENDS
         "${NIMBLEFIX_FIX44_NFD}"
         "${NIMBLEFIX_FIX44_NFA}"
-        "${NIMBLEFIX_FIX44_BUILDERS}"
-        "${NIMBLEFIX_FIX44_READERS}"
+        "${NIMBLEFIX_FIX44_API}"
 )
 
 add_custom_command(
     OUTPUT
         "${NIMBLEFIX_SAMPLE_NFA}"
-        "${NIMBLEFIX_SAMPLE_BUILDERS}"
-        "${NIMBLEFIX_SAMPLE_READERS}"
+        "${NIMBLEFIX_SAMPLE_API}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${NIMBLEFIX_OUTPUT_ROOT}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${NIMBLEFIX_GENERATED_DIR}"
     COMMAND $<TARGET_FILE:nimblefix-dictgen>
         --input "${PROJECT_SOURCE_DIR}/samples/basic_profile.nfd"
         --merge "${PROJECT_SOURCE_DIR}/samples/basic_overlay.nfd"
         --output "${NIMBLEFIX_SAMPLE_NFA}"
-        --cpp-builders "${NIMBLEFIX_SAMPLE_BUILDERS}"
-        --cpp-readers "${NIMBLEFIX_SAMPLE_READERS}"
+        --cpp-api "${NIMBLEFIX_SAMPLE_API}"
     DEPENDS
         nimblefix-dictgen
         "${PROJECT_SOURCE_DIR}/samples/basic_profile.nfd"
@@ -286,8 +279,7 @@ add_custom_command(
 add_custom_target(nimblefix-sample-assets
     DEPENDS
         "${NIMBLEFIX_SAMPLE_NFA}"
-        "${NIMBLEFIX_SAMPLE_BUILDERS}"
-        "${NIMBLEFIX_SAMPLE_READERS}"
+        "${NIMBLEFIX_SAMPLE_API}"
 )
 
 add_custom_target(nimblefix-generated-assets

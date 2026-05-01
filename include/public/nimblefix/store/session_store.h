@@ -268,6 +268,19 @@ public:
     return base::Status::Ok();
   }
 
+  /// Load owned inbound frames for an inclusive range.
+  ///
+  /// Default implementation returns an empty vector. Concrete stores that
+  /// persist inbound payloads should override this.
+  virtual auto LoadInboundRange(std::uint64_t session_id, std::uint32_t begin_seq, std::uint32_t end_seq) const
+    -> base::Result<std::vector<MessageRecord>>
+  {
+    (void)session_id;
+    (void)begin_seq;
+    (void)end_seq;
+    return std::vector<MessageRecord>{};
+  }
+
   /// Persist recovery state for one session.
   ///
   /// \param state Recovery snapshot to store.

@@ -211,23 +211,19 @@ External consumers should include only the exported headers under `include/publi
 
 Most applications only need these direct includes:
 
-- `nimblefix/runtime/application.h`
+- generated profile header such as `fix44_api.h`
 - `nimblefix/runtime/config.h`
 - `nimblefix/runtime/engine.h`
-- `nimblefix/runtime/live_acceptor.h`
-- `nimblefix/runtime/live_initiator.h`
-- `nimblefix/message/message_builder.h`
+- `nimblefix/runtime/initiator.h` or `nimblefix/runtime/acceptor.h`
+- `nimblefix/runtime/profile_binding.h`
 - `nimblefix/message/message_view.h`
-- `nimblefix/message/fixed_layout_writer.h`
 - `nimblefix/codec/fix_codec.h`
-- `nimblefix/codec/fix_tags.h`
 - `nimblefix/profile/profile_loader.h`
 - `nimblefix/store/memory_store.h`
 - `nimblefix/store/mmap_store.h`
 - `nimblefix/store/durable_batch_store.h`
-- `nimblefix/session/session_handle.h`
 
-Advanced consumers can add `nimblefix/session/admin_protocol.h`, `nimblefix/session/resend_recovery.h`, `nimblefix/runtime/sharded_runtime.h`, `nimblefix/runtime/metrics.h`, and `nimblefix/runtime/trace.h` as needed. The complete exported header policy is documented in [docs/public-api.md](docs/public-api.md).
+Advanced consumers can add `nimblefix/advanced/runtime_application.h`, `nimblefix/advanced/engine.h`, `nimblefix/advanced/message_builder.h`, `nimblefix/advanced/fixed_layout_writer.h`, `nimblefix/advanced/encoded_application_message.h`, `nimblefix/advanced/session_handle.h`, `nimblefix/session/admin_protocol.h`, `nimblefix/session/resend_recovery.h`, `nimblefix/runtime/sharded_runtime.h`, `nimblefix/runtime/metrics.h`, and `nimblefix/runtime/trace.h` as needed. The complete exported header policy is documented in [docs/public-api.md](docs/public-api.md).
 
 ---
 
@@ -275,16 +271,18 @@ field|5002|VenueAccount|string|1
 message|D|NewOrderSingle|0|5001:r,5002:o
 ```
 
-### MessageBuilder vs FixedLayoutWriter
+### Generated API and Advanced Raw Surfaces
 
-NimbleFIX provides two ways to construct outbound messages:
+For normal business flows, use generated `--cpp-api` message objects together with `runtime::Session<Profile>` and `runtime::InlineSession<Profile>`.
 
-- **`MessageBuilder`** — Generic, flexible API. Works with any message type. No upfront setup. Good for infrequent messages or prototyping.
-- **`FixedLayoutWriter`** — Hot-path optimized. Requires a `FixedLayout` built once from the dictionary. Pre-computes tag-to-slot mapping for O(1) writes. Significantly faster for high-frequency message types.
+Lower-level escape hatches remain available, but they are not the primary business API:
 
-### MessageView
+- **Dynamic/raw message construction** — For tooling, protocol bridges, or schema-agnostic flows under `nimblefix/advanced/`.
+- **Manual fixed-layout encode control** — For integrations that intentionally manage dictionary/layout details themselves under `nimblefix/advanced/`.
 
-Zero-copy read-only accessor over a parsed FIX message. References the original byte buffer — no copies, no allocations. Accessors return `std::optional` (absent if field not present).
+### Raw MessageView
+
+Generated inbound views are the default business read path. `MessageView` remains the zero-copy raw accessor for schema-agnostic inspection and protocol tooling.
 
 ### ValidationPolicy
 
@@ -303,11 +301,11 @@ Controls how strict the codec is during decode:
 
 | Tool | Purpose |
 |------|---------|
-| `nimblefix-dictgen` | Compile `.nfd` dictionaries into binary `.nfa` profiles (supports merging multiple `.nfd` files and generating C++ builder headers) |
-| `nimblefix-xml2nfd` | Convert QuickFIX XML data dictionaries to `.nfd` format; also generates C++ builder headers from `.nfd` |
+| `nimblefix-dictgen` | Compile `.nfd` dictionaries into binary `.nfa` profiles (supports merging multiple `.nfd` files and generating C++ typed API headers) |
+| `nimblefix-xml2nfd` | Convert QuickFIX XML data dictionaries to `.nfd` format; also generates C++ typed API headers from `.nfd` |
 | `nimblefix-orchestra-import` | Convert FIX Orchestra XML into structural `.nfd` input plus `.nfct` contract sidecars; can also dump, render markdown, and emit interop augmentations from an existing sidecar |
-| `nimblefix-initiator` | CLI FIX initiator for testing and interop |
-| `nimblefix-acceptor` | CLI FIX acceptor (echo server) |
+| `nimblefix-initiator` | CLI FIX initiator for testing and interop; operational/advanced tool, not the primary generated-first app example |
+| `nimblefix-acceptor` | CLI FIX acceptor (echo server); operational/advanced tool, not the primary generated-first app example |
 | `nimblefix-soak` | Stress test with fault injection (gaps, duplicates, reorders, disconnects) |
 | `nimblefix-bench` | Latency/throughput benchmark with allocation and CPU counter tracking |
 | `nimblefix-fuzz-codec` | libFuzzer harness for codec and admin protocol |
@@ -322,7 +320,7 @@ Controls how strict the codec is during decode:
     --input samples/basic_profile.nfd \
     --merge samples/basic_overlay.nfd \
     --output build/sample-basic.nfa \
-    --cpp-builders build/generated/sample_basic_builders.h
+    --cpp-api build/generated/sample_basic_api.h
 ```
 
 | Flag | Required | Description |
@@ -330,7 +328,7 @@ Controls how strict the codec is during decode:
 | `--input` | yes | Base dictionary file (`.nfd`) |
 | `--merge` | no | Additional `.nfd` file(s) to merge (repeatable) |
 | `--output` | yes | Output artifact path (`.nfa`) |
-| `--cpp-builders` | no | Generate C++ header with profile constants |
+| `--cpp-api` | no | Generate C++ header with generated typed API |
 
 ### Convert from QuickFIX XML
 
@@ -339,7 +337,7 @@ Controls how strict the codec is during decode:
     --xml FIX44.xml \
     --output my_profile.nfd \
     --profile-id 1001 \
-    --cpp-builders generated_builders.h
+    --cpp-api generated_api.h
 ```
 
 Components are inlined, groups are extracted, XML types are mapped to NimbleFIX types, and `schema_hash` is auto-computed.
@@ -367,32 +365,36 @@ Use `--contract <file> --dump`, `--markdown <file>`, or `--interop-dir <dir>` to
 ### Standard Initiator
 
 ```cpp
-#include "nimblefix/runtime/engine.h"
-#include "nimblefix/runtime/live_initiator.h"
+#include "fix44_api.h"
 #include "nimblefix/runtime/config.h"
-#include "nimblefix/runtime/application.h"
+#include "nimblefix/runtime/engine.h"
+#include "nimblefix/runtime/initiator.h"
+#include "nimblefix/runtime/profile_binding.h"
 
-class MyApp : public nimble::runtime::ApplicationCallbacks {
-    auto OnSessionEvent(const nimble::runtime::RuntimeEvent& event)
+using namespace nimble::generated::profile_4400;
+
+class MyApp final : public Handler {
+public:
+    auto OnSessionActive(nimble::runtime::Session<Profile>& session)
         -> nimble::base::Status override {
-        if (event.session_event == nimble::runtime::SessionEventKind::kActive) {
-            // Session is live — start sending orders
-            auto msg = nimble::message::MessageBuilder{"D"}
-                .set_string(11, "ORD-001")
-                .set_char(54, '1')       // Side=Buy
-                .set_float(44, 150.25)   // Price
-                .set_int(38, 100)        // OrderQty
-                .build();
-            event.handle.SendTake(std::move(msg));
-        }
-        return nimble::base::Status::Ok();
+        NewOrderSingle order;
+        order.cl_ord_id("ORD-001")
+            .symbol("AAPL")
+            .side(Side::Buy)
+            .transact_time("20260429-09:30:00.000")
+            .order_qty(100)
+            .ord_type(OrdType::Limit)
+            .price(150.25);
+        return session.send(std::move(order));
     }
 
-    auto OnAppMessage(const nimble::runtime::RuntimeEvent& event)
+    auto OnExecutionReport(nimble::runtime::InlineSession<Profile>&,
+                           ExecutionReportView exec)
         -> nimble::base::Status override {
-        auto view = event.message_view();
-        auto msg_type = view.msg_type();      // "8" for ExecutionReport
-        auto exec_id = view.get_string(17);   // ExecID
+        auto exec_id = exec.exec_id_raw();
+        auto ord_status = exec.ord_status();
+        (void)exec_id;
+        (void)ord_status;
         return nimble::base::Status::Ok();
     }
 };
@@ -400,104 +402,46 @@ class MyApp : public nimble::runtime::ApplicationCallbacks {
 int main() {
     nimble::runtime::EngineConfig config;
     config.worker_count = 1;
-    config.profile_artifacts = {"build/sample-basic.nfa"};
-    // Or load .nfd directly:
-    // config.profile_dictionaries = {{"samples/basic_profile.nfd"}};
-    config.counterparties = {{
+    config.profile_artifacts = {"build/bench/quickfix_FIX44.nfa"};
+    config.counterparties.push_back(nimble::runtime::CounterpartyConfig{
         .name = "venue-a",
         .session = {
-            .session_id = 1,
-            .key = {"FIX.4.4", "MY_FIRM", "VENUE_A"},
-            .profile_id = 1001,
-            .heartbeat_interval_seconds = 30,
+            .session_id = 1U,
+            .key = nimble::session::SessionKey::ForInitiator("MY_FIRM", "VENUE_A"),
+            .profile_id = Profile::kProfileId,
+            .heartbeat_interval_seconds = 30U,
             .is_initiator = true,
         },
+        .transport_profile = nimble::session::TransportSessionProfile::Fix44(),
         .reconnect_enabled = true,
-        .reconnect_initial_ms = 1000,
-        .reconnect_max_ms = 30000,
-    }};
-
-    nimble::runtime::Engine engine;
-    engine.LoadProfiles(config);
-    engine.Boot(config);
-
-    auto app = std::make_shared<MyApp>();
-    nimble::runtime::LiveInitiator initiator(&engine, {
-        .application = app,
+        .reconnect_initial_ms = nimble::runtime::kDefaultReconnectInitialMs,
+        .reconnect_max_ms = nimble::runtime::kDefaultReconnectMaxMs,
+        .reconnect_max_retries = nimble::runtime::kUnlimitedReconnectRetries,
     });
 
-    initiator.OpenSession(1, "exchange.example.com", 9876);
-    initiator.Run();
+    nimble::runtime::Engine engine;
+    auto boot = engine.Boot(config);
+    if (!boot.ok()) {
+        return 1;
+    }
+
+    auto binding = engine.Bind<Profile>();
+    if (!binding.ok()) {
+        return 1;
+    }
+
+    auto app = std::make_shared<MyApp>();
+    nimble::runtime::Initiator<Profile> initiator(&engine, &binding.value(), { .application = app });
+
+    auto open = initiator.OpenSession(1U, "exchange.example.com", 9876);
+    if (!open.ok()) {
+        return 1;
+    }
+    return initiator.Run().ok() ? 0 : 1;
 }
 ```
 
-### Hot-Path Initiator with FixedLayoutWriter
-
-For latency-critical order submission, use `FixedLayoutWriter` with a pre-built `FixedLayout`:
-
-```cpp
-#include "nimblefix/message/fixed_layout_writer.h"
-#include "nimblefix/codec/fix_codec.h"
-
-// Build once at startup:
-auto layout = nimble::message::FixedLayout::Build(dictionary, "D").value();
-auto templates = nimble::codec::PrecompiledTemplateTable{};
-
-// ... inside OnSessionEvent when session becomes active:
-
-class HotPathApp : public nimble::runtime::ApplicationCallbacks {
-    nimble::message::FixedLayout layout_;
-    nimble::codec::EncodeBuffer encode_buffer_;   // reuse across calls
-    nimble::codec::EncodeOptions encode_options_;
-
-    auto OnSessionEvent(const nimble::runtime::RuntimeEvent& event)
-        -> nimble::base::Status override {
-        if (event.session_event == nimble::runtime::SessionEventKind::kActive) {
-            SendOrder(event.handle);
-        }
-        return nimble::base::Status::Ok();
-    }
-
-    void SendOrder(nimble::session::SessionHandle handle) {
-        nimble::message::FixedLayoutWriter writer(layout_);
-        writer.set_string(11, "ORD-001");    // ClOrdID
-        writer.set_char(54, '1');             // Side=Buy
-        writer.set_int(38, 100);             // OrderQty
-        writer.set_float(44, 150.25);        // Price
-        writer.set_string(55, "AAPL");       // Symbol
-
-        // Add repeating group
-        writer.add_group_entry(453)
-            .set_string(448, "PARTY-A")
-            .set_char(447, 'D')
-            .set_int(452, 3);
-
-        // Encode directly to reusable buffer — zero allocation
-        auto status = writer.encode_to_buffer(dictionary_, encode_options_, &encode_buffer_);
-        // ... send encoded bytes via handle
-    }
-};
-```
-
-The `FixedLayoutWriter` path is the lowest-allocation encode path in the library and is the same hot path measured as `encode` in the side-by-side benchmark section later in this README.
-
-### Hybrid Path — FixedLayout + Extra Fields
-
-When most fields are known at compile time but some are dynamic (e.g., venue-specific extensions):
-
-```cpp
-nimble::message::FixedLayoutWriter writer(layout_);
-// Known fields via O(1) slot writes
-writer.set_string(11, "ORD-001");
-writer.set_char(54, '1');
-writer.set_int(38, 100);
-
-// Dynamic/extension fields not in the layout
-writer.set_extra_string(5001, "LIMIT");      // VenueOrderType
-writer.set_extra_string(5002, "ACCT-XYZ");   // VenueAccount
-
-auto status = writer.encode_to_buffer(dictionary, options, &buffer);
-```
+Advanced raw encode and dynamic-message escape hatches still exist under `nimblefix/advanced/`, but they are intentionally outside the main walkthrough. See [docs/public-api.md](docs/public-api.md) when you explicitly need raw builders, pre-encoded outbound payloads, or direct raw send-handle access.
 
 ---
 
@@ -506,113 +450,154 @@ auto status = writer.encode_to_buffer(dictionary, options, &buffer);
 ### Standard Acceptor with Dynamic Session Factory
 
 ```cpp
-#include "nimblefix/runtime/engine.h"
-#include "nimblefix/runtime/live_acceptor.h"
+#include "fix44_api.h"
 #include "nimblefix/runtime/config.h"
+#include "nimblefix/runtime/acceptor.h"
+#include "nimblefix/runtime/engine.h"
+#include "nimblefix/runtime/profile_binding.h"
+
+using namespace nimble::generated::profile_4400;
+
+class MyApp final : public Handler {
+public:
+    auto OnNewOrderSingle(nimble::runtime::InlineSession<Profile>& session,
+                          NewOrderSingleView order) -> nimble::base::Status override {
+        ExecutionReport report;
+        report.order_id("ORD-001")
+            .exec_id("EXEC-001")
+            .exec_type(ExecType::New)
+            .ord_status(OrdStatus::New)
+            .side(order.side().value())
+            .leaves_qty(order.order_qty().value_or(0))
+            .cum_qty(0)
+            .avg_px(0.0);
+        if (auto cl_ord_id = order.cl_ord_id(); cl_ord_id.has_value()) {
+            report.cl_ord_id(*cl_ord_id);
+        }
+        if (auto symbol = order.symbol(); symbol.has_value()) {
+            report.symbol(*symbol);
+        }
+        return session.send(std::move(report));
+    }
+};
 
 nimble::runtime::EngineConfig config;
 config.worker_count = 2;
-config.profile_artifacts = {"build/sample-basic.nfa"};
-config.listeners = {{
+config.profile_artifacts = {"build/bench/quickfix_FIX44.nfa"};
+config.listeners.push_back(nimble::runtime::ListenerConfig{
     .name = "main",
     .host = "0.0.0.0",
     .port = 9876,
-}};
+});
 config.accept_unknown_sessions = true;
 
 nimble::runtime::Engine engine;
-engine.Boot(config);
+auto boot = engine.Boot(config);
+if (!boot.ok()) {
+    return 1;
+}
 
 // Accept sessions dynamically based on inbound Logon:
 engine.SetSessionFactory([](const nimble::session::SessionKey& key)
     -> nimble::base::Result<nimble::runtime::CounterpartyConfig> {
-    return nimble::runtime::CounterpartyConfig{
-        .name = key.sender_comp_id,
-        .session = {
-            .profile_id = 1001,
-            .key = key,
-            .heartbeat_interval_seconds = 30,
-        },
-    };
+        return nimble::runtime::CounterpartyConfig{
+            .name = key.sender_comp_id,
+            .session = {
+                .profile_id = Profile::kProfileId,
+                .key = key,
+                .heartbeat_interval_seconds = 30,
+            },
+        };
 });
 
+auto binding = engine.Bind<Profile>();
+if (!binding.ok()) {
+    return 1;
+}
+
 auto app = std::make_shared<MyApp>();
-nimble::runtime::LiveAcceptor acceptor(&engine, {
-    .application = app,
-});
-acceptor.OpenListeners("main");
-acceptor.Run();
+nimble::runtime::Acceptor<Profile> acceptor(&engine, &binding.value(), { .application = app });
+auto open = acceptor.OpenListeners("main");
+if (!open.ok()) {
+    return 1;
+}
+return acceptor.Run().ok() ? 0 : 1;
 ```
 
 ### Acceptor with Pre-Configured Counterparties
 
 ```cpp
+using namespace nimble::generated::profile_4400;
+
 nimble::runtime::EngineConfig config;
 config.worker_count = 1;
-config.profile_artifacts = {"build/sample-basic.nfa"};
-config.listeners = {{
+config.profile_artifacts = {"build/bench/quickfix_FIX44.nfa"};
+config.listeners.push_back(nimble::runtime::ListenerConfig{
     .name = "main",
     .host = "0.0.0.0",
     .port = 9876,
-}};
-config.counterparties = {{
+});
+config.counterparties.push_back(nimble::runtime::CounterpartyConfig{
     .name = "client-a",
     .session = {
         .session_id = 1,
-        .key = {"FIX.4.4", "SERVER", "CLIENT_A"},
-        .profile_id = 1001,
+        .key = nimble::session::SessionKey::ForAcceptor("SERVER", "CLIENT_A"),
+        .profile_id = Profile::kProfileId,
         .heartbeat_interval_seconds = 30,
         .is_initiator = false,
     },
+    .transport_profile = nimble::session::TransportSessionProfile::Fix44(),
     .store_mode = nimble::runtime::StoreMode::kDurableBatch,
     .store_path = "/var/lib/nimblefix/client-a",
-}};
+});
 
 nimble::runtime::Engine engine;
-engine.LoadProfiles(config);
-engine.Boot(config);
+auto boot = engine.Boot(config);
+if (!boot.ok()) {
+    return 1;
+}
+
+auto binding = engine.Bind<Profile>();
+if (!binding.ok()) {
+    return 1;
+}
 
 auto app = std::make_shared<MyApp>();
-nimble::runtime::LiveAcceptor acceptor(&engine, {
-    .application = app,
-});
-acceptor.OpenListeners("main");
-acceptor.Run();
+nimble::runtime::Acceptor<Profile> acceptor(&engine, &binding.value(), { .application = app });
+auto open = acceptor.OpenListeners("main");
+if (!open.ok()) {
+    return 1;
+}
+return acceptor.Run().ok() ? 0 : 1;
 ```
 
 ### Hot-Path Acceptor: Reading Inbound Messages
 
-In the `OnAppMessage` callback, use zero-copy `MessageView` for minimal overhead:
+In the typed handler path, use generated inbound views for normal business logic. Drop to raw `MessageView` only for advanced protocol tooling:
 
 ```cpp
-auto OnAppMessage(const nimble::runtime::RuntimeEvent& event)
+auto OnNewOrderSingle(nimble::runtime::InlineSession<Profile>& session,
+                      NewOrderSingleView order)
     -> nimble::base::Status override {
-    auto view = event.message_view();
-
-    // Zero-copy field access — no allocations
-    auto cl_ord_id = view.get_string(11);   // → optional<string_view>
-    auto side = view.get_char(54);           // → optional<char>
-    auto qty = view.get_int(38);            // → optional<int64_t>
-    auto price = view.get_float(44);        // → optional<double>
-
-    // Repeating group access
-    if (auto group = view.group(453)) {
-        for (std::size_t i = 0; i < group->size(); ++i) {
-            auto entry = group->entry(i);
-            auto party_id = entry.get_string(448);
+    if (auto parties = order.parties(); parties.has_value()) {
+        for (const auto party : *parties) {
+            auto party_id = party.party_id();
+            auto party_role = party.party_role();
+            (void)party_id;
+            (void)party_role;
         }
     }
 
-    // Build and send a response
-    auto response = nimble::message::MessageBuilder{"8"}
-        .set_string(17, "EXEC-001")        // ExecID
-        .set_string(11, cl_ord_id.value_or(""))
-        .set_char(150, '0')                // ExecType=New
-        .set_int(14, 0)                    // CumQty
-        .build();
-    event.handle.SendTake(std::move(response));
-
-    return nimble::base::Status::Ok();
+    ExecutionReport report;
+    report.order_id("ORD-001")
+        .exec_id("EXEC-001")
+        .exec_type(ExecType::New)
+        .ord_status(OrdStatus::New)
+        .side(order.side().value())
+        .leaves_qty(order.order_qty().value_or(0))
+        .cum_qty(0)
+        .avg_px(0.0);
+    return session.send(std::move(report));
 }
 ```
 
@@ -705,10 +690,12 @@ server_tls.verify_peer = true;
 server_tls.require_client_certificate = true;
 
 config.listeners.push_back(
-    nimble::runtime::ListenerConfigBuilder::Named("tls-main")
-        .bind("0.0.0.0", 9877)
-        .tls_server(std::move(server_tls))
-        .build());
+    nimble::runtime::ListenerConfig{
+        .name = "tls-main",
+        .host = "0.0.0.0",
+        .port = 9877,
+        .tls_server = std::move(server_tls),
+    });
 
 nimble::runtime::TlsClientConfig client_tls;
 client_tls.enabled = true;
@@ -717,13 +704,18 @@ client_tls.expected_peer_name = "fix.example.com";
 client_tls.ca_file = "/etc/nimblefix/ca.pem";
 client_tls.min_version = nimble::runtime::TlsProtocolVersion::kTls12;
 
-config.counterparties.push_back(
-    nimble::runtime::CounterpartyConfigBuilder::Initiator(
-        "buy-side-tls", 1001U,
-        nimble::session::SessionKey{ .sender_comp_id = "BUY1", .target_comp_id = "SELL1" },
-        4400U)
-        .tls_client(std::move(client_tls))
-        .build());
+config.counterparties.push_back(nimble::runtime::CounterpartyConfig{
+    .name = "buy-side-tls",
+    .session = {
+        .session_id = 1001U,
+        .key = nimble::session::SessionKey::ForInitiator("BUY1", "SELL1"),
+        .profile_id = 4400U,
+        .heartbeat_interval_seconds = 30U,
+        .is_initiator = true,
+    },
+    .transport_profile = nimble::session::TransportSessionProfile::Fix44(),
+    .tls_client = std::move(client_tls),
+});
 ```
 
 For acceptors, use `acceptor_transport_security(kTlsOnly)` when a sensitive session must not bind on a plain listener. `verify_peer=false` is intended only for controlled tests; production deployments should keep peer verification enabled and provide CA files or paths.
@@ -769,21 +761,13 @@ When `worker_count=1`, the single worker runs on the caller's thread — no extr
 
 Each session belongs to exactly one worker thread. That worker alone handles all protocol state: decode, sequence numbers, timers, store persistence, encode, and write. **No locks on the hot path.**
 
-Cross-thread session access still goes through `SessionHandle`, but the command path behind `SendCopy()` / `SendTake()` / `SendEncodedCopy()` / `SendEncodedTake()` is one SPSC queue per worker. `Snapshot()` and `Subscribe()` are safe query/stream APIs from any thread. Send paths are single-producer: the runtime binds each handle's send queue to the first producer thread that uses it, and later producers fast-fail with `kInvalidArgument` instead of silently corrupting the SPSC queue.
+Ordinary application code should use typed `runtime::Session<Profile>` / `runtime::InlineSession<Profile>`. Their `send()` and `snapshot()` helpers are the only recommended business path.
+
+Underneath, the same single-producer command bridge still applies. Advanced raw-handle rules only matter when you intentionally drop to `advanced/` APIs: query paths are safe from any thread, owned send refs use one SPSC queue per worker, and borrowed refs remain callback-only escape hatches. Treat one typed session or raw handle send path as single-producer.
 
 ```cpp
-// Safe query paths from any thread:
-session_handle.Snapshot();
-session_handle.Subscribe();
-
-// Cross-thread send path:
-// one producer thread per SessionHandle send queue.
-session_handle.SendTake(std::move(msg));
-
-// Owning-worker / inline-callback only.
-// Outside inline callbacks this returns kInvalidArgument.
-session_handle.SendInlineBorrowed(view);
-message_view.get_string(11);
+session.snapshot();
+session.send(std::move(order));
 ```
 
 ### Application Callback Modes
@@ -794,7 +778,7 @@ message_view.get_string(11);
 | `kQueueDecoupled` + `kCoScheduled` | On session worker thread, during explicit poll call | Must not block |
 | `kQueueDecoupled` + `kThreaded` | On dedicated app worker thread (`nf-app-wN`) | May block (within reason) |
 
-**Inline mode** gives the lowest latency — your `OnAppMessage()` callback receives a zero-copy `MessageView` directly from the decode buffer. But it must return quickly; any blocking will stall all sessions on that worker.
+**Inline mode** gives the lowest latency. On the generated-first path, the runtime dispatches typed inbound views on the session worker thread. Advanced raw integrations may still consume zero-copy `MessageView` directly. In either case, callbacks must return quickly; any blocking will stall all sessions on that worker.
 
 **Queue-decoupled / threaded mode** adds one SPSC queue hop but fully isolates I/O from business logic. Queue overflow policies: `kCloseSession`, `kBackpressure`, `kDropNewest`.
 

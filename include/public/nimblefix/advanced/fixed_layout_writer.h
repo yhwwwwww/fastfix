@@ -17,7 +17,12 @@ namespace nimble::message {
 
 class FixedLayoutWriter;
 
-/// Pre-computed layout for a message profile, built once and shared.
+/// Advanced fixed-layout encode plan for one raw message type.
+///
+/// Prefer generated outbound message objects plus typed runtime sessions for
+/// normal business flows. Use `FixedLayout` when you intentionally manage raw
+/// dictionary/layout details for a hot path.
+///
 /// Maps each field tag to a contiguous slot index for O(1) write access.
 class FixedLayout
 {
@@ -118,7 +123,10 @@ private:
   std::string* buffer_;
 };
 
-/// Writer that uses pre-allocated slots for O(1) field writes.
+/// Advanced writer that uses pre-allocated slots for O(1) raw field writes.
+///
+/// Prefer generated outbound message objects for normal business code. This is
+/// the lower-level encode backend for hot-path or schema-agnostic integrations.
 /// Construct from a `FixedLayout`, populate fields, then `encode_to_buffer()`.
 /// Supports reuse via `clear()` and session-constant pre-baking via
 /// `bind_session()`.

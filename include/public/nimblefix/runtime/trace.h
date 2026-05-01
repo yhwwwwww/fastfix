@@ -20,6 +20,7 @@ enum class TraceEventKind : std::uint32_t
   kPendingConnectionRegistered,
   kSessionEvent,
   kStoreEvent,
+  kScheduleEvent,
 };
 
 struct TraceEvent

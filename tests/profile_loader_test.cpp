@@ -1,10 +1,43 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
+#include <memory>
 
+#include "fix44_api.h"
+#include "nimblefix/base/status.h"
 #include "nimblefix/profile/artifact.h"
 #include "nimblefix/profile/profile_loader.h"
+#include "nimblefix/runtime/acceptor.h"
 #include "nimblefix/runtime/engine.h"
+#include "nimblefix/runtime/initiator.h"
+
+namespace {
+
+class TypedRuntimeSmokeApp final : public nimble::generated::profile_4400::Handler
+{
+};
+
+struct StubDispatcher
+{
+};
+
+struct SchemaMismatchProfile
+{
+  using Application = TypedRuntimeSmokeApp;
+  using Dispatcher = StubDispatcher;
+  static constexpr std::uint64_t kProfileId = nimble::generated::profile_4400::Profile::kProfileId;
+  static constexpr std::uint64_t kSchemaHash = nimble::generated::profile_4400::Profile::kSchemaHash ^ 0x1ULL;
+};
+
+struct MissingProfile
+{
+  using Application = TypedRuntimeSmokeApp;
+  using Dispatcher = StubDispatcher;
+  static constexpr std::uint64_t kProfileId = 0xDEAD'BEEF'0000'4400ULL;
+  static constexpr std::uint64_t kSchemaHash = 1ULL;
+};
+
+} // namespace
 
 TEST_CASE("profile-loader", "[profile-loader]")
 {
@@ -124,4 +157,90 @@ TEST_CASE("schema_hash validation invalid profile", "[profile-loader]")
   auto status = nimble::profile::ValidateSchemaHash(empty_profile, 42ULL);
   REQUIRE_FALSE(status.ok());
   REQUIRE(status.code() == nimble::base::ErrorCode::kInvalidArgument);
+}
+
+TEST_CASE("engine bind returns typed profile binding", "[profile-loader][typed-runtime]")
+{
+  const auto artifact_path = std::filesystem::path(NIMBLEFIX_PROJECT_DIR) / "build" / "bench" / "quickfix_FIX44.nfa";
+  if (!std::filesystem::exists(artifact_path)) {
+    SKIP("FIX44 artifact not available at: " << artifact_path.string());
+  }
+
+  nimble::runtime::Engine engine;
+  nimble::runtime::EngineConfig config;
+  config.profile_artifacts.push_back(artifact_path);
+
+  REQUIRE(engine.LoadProfiles(config).ok());
+
+  auto binding = engine.Bind<nimble::generated::profile_4400::Profile>();
+  REQUIRE(binding.ok());
+  REQUIRE(binding.value().profile_id() == nimble::generated::profile_4400::Profile::kProfileId);
+  REQUIRE(binding.value().schema_hash() == nimble::generated::profile_4400::Profile::kSchemaHash);
+  REQUIRE(binding.value().dictionary().profile().profile_id() == nimble::generated::profile_4400::Profile::kProfileId);
+}
+
+TEST_CASE("typed runtime wrappers instantiate against generated profile", "[profile-loader][typed-runtime]")
+{
+  const auto artifact_path = std::filesystem::path(NIMBLEFIX_PROJECT_DIR) / "build" / "bench" / "quickfix_FIX44.nfa";
+  if (!std::filesystem::exists(artifact_path)) {
+    SKIP("FIX44 artifact not available at: " << artifact_path.string());
+  }
+
+  nimble::runtime::Engine engine;
+  nimble::runtime::EngineConfig config;
+  config.profile_artifacts.push_back(artifact_path);
+
+  REQUIRE(engine.LoadProfiles(config).ok());
+
+  auto binding = engine.Bind<nimble::generated::profile_4400::Profile>();
+  REQUIRE(binding.ok());
+
+  auto app = std::make_shared<TypedRuntimeSmokeApp>();
+  nimble::runtime::Initiator<nimble::generated::profile_4400::Profile> initiator(
+    &engine, &binding.value(), { .application = app });
+  nimble::runtime::Acceptor<nimble::generated::profile_4400::Profile> acceptor(
+    &engine, &binding.value(), { .application = app });
+
+  CHECK(initiator.active_connection_count() == 0U);
+  CHECK(initiator.completed_session_count() == 0U);
+  CHECK(initiator.pending_reconnect_count() == 0U);
+  CHECK(acceptor.active_connection_count() == 0U);
+  CHECK(acceptor.completed_session_count() == 0U);
+}
+
+TEST_CASE("engine bind rejects schema hash mismatch", "[profile-loader][typed-runtime]")
+{
+  const auto artifact_path = std::filesystem::path(NIMBLEFIX_PROJECT_DIR) / "build" / "bench" / "quickfix_FIX44.nfa";
+  if (!std::filesystem::exists(artifact_path)) {
+    SKIP("FIX44 artifact not available at: " << artifact_path.string());
+  }
+
+  nimble::runtime::Engine engine;
+  nimble::runtime::EngineConfig config;
+  config.profile_artifacts.push_back(artifact_path);
+
+  REQUIRE(engine.LoadProfiles(config).ok());
+
+  auto binding = engine.Bind<SchemaMismatchProfile>();
+  REQUIRE_FALSE(binding.ok());
+  REQUIRE(binding.status().code() == nimble::base::ErrorCode::kVersionMismatch);
+  REQUIRE(binding.status().message().find("schema_hash mismatch") != std::string_view::npos);
+}
+
+TEST_CASE("engine bind rejects missing profile", "[profile-loader][typed-runtime]")
+{
+  const auto artifact_path = std::filesystem::path(NIMBLEFIX_PROJECT_DIR) / "build" / "bench" / "quickfix_FIX44.nfa";
+  if (!std::filesystem::exists(artifact_path)) {
+    SKIP("FIX44 artifact not available at: " << artifact_path.string());
+  }
+
+  nimble::runtime::Engine engine;
+  nimble::runtime::EngineConfig config;
+  config.profile_artifacts.push_back(artifact_path);
+
+  REQUIRE(engine.LoadProfiles(config).ok());
+
+  auto binding = engine.Bind<MissingProfile>();
+  REQUIRE_FALSE(binding.ok());
+  REQUIRE(binding.status().code() == nimble::base::ErrorCode::kNotFound);
 }

@@ -44,6 +44,8 @@ public:
                               std::uint32_t begin_seq,
                               std::uint32_t end_seq,
                               MessageRecordViewRange* range) const -> base::Status override;
+  auto LoadInboundRange(std::uint64_t session_id, std::uint32_t begin_seq, std::uint32_t end_seq) const
+    -> base::Result<std::vector<MessageRecord>> override;
 
   /// Pre-reserve storage for one session.
   ///

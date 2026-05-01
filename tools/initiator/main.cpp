@@ -8,12 +8,12 @@
 #include <vector>
 
 #include "nimblefix/codec/fix_tags.h"
-#include "nimblefix/message/message_builder.h"
+#include "nimblefix/advanced/message_builder.h"
 #include "nimblefix/message/message_view.h"
 #include "nimblefix/profile/profile_loader.h"
-#include "nimblefix/runtime/application.h"
+#include "nimblefix/advanced/runtime_application.h"
 #include "nimblefix/runtime/engine.h"
-#include "nimblefix/runtime/live_initiator.h"
+#include "nimblefix/advanced/live_initiator.h"
 
 namespace {
 
@@ -154,7 +154,7 @@ public:
         sent_application_.exchange(true)) {
       return nimble::base::Status::Ok();
     }
-    return event.handle.SendTake(BuildInitiatorMessage());
+    return event.handle.Send(nimble::message::MessageRef::Take(BuildInitiatorMessage()));
   }
 
   auto OnAppMessage(const nimble::runtime::RuntimeEvent& event) -> nimble::base::Status override
@@ -256,7 +256,7 @@ public:
 
     if (event.kind == nimble::runtime::RuntimeEventKind::kSession &&
         event.session_event == nimble::runtime::SessionEventKind::kActive && !state_->sent_application.exchange(true)) {
-      return event.handle.SendTake(BuildInitiatorMessage());
+      return event.handle.Send(nimble::message::MessageRef::Take(BuildInitiatorMessage()));
     }
 
     if (event.kind != nimble::runtime::RuntimeEventKind::kApplicationMessage) {

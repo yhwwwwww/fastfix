@@ -1,14 +1,21 @@
 #include "nimblefix/runtime/engine.h"
 
+#include "nimblefix/advanced/engine.h"
+
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "nimblefix/codec/fix_codec.h"
 #include "nimblefix/profile/profile_loader.h"
 #include "nimblefix/runtime/contract_binding.h"
+#include "nimblefix/runtime/diagnostics.h"
+#include "nimblefix/runtime/dynamic_config.h"
 #include "nimblefix/runtime/metrics.h"
 #include "nimblefix/runtime/profile_registry.h"
 #include "nimblefix/runtime/sharded_runtime.h"
@@ -67,6 +74,113 @@ ValidateManagedQueueRunnerOptions(const EngineConfig* config,
   return base::Status::Ok();
 }
 
+auto
+FindCounterpartyBySessionId(const EngineConfig& config, std::uint64_t session_id) -> const CounterpartyConfig*
+{
+  const auto it = std::find_if(config.counterparties.begin(),
+                               config.counterparties.end(),
+                               [&](const auto& counterparty) { return counterparty.session.session_id == session_id; });
+  return it == config.counterparties.end() ? nullptr : &*it;
+}
+
+auto
+ReplaceCounterpartyBySessionId(EngineConfig& config, const CounterpartyConfig& replacement) -> void
+{
+  const auto it =
+    std::find_if(config.counterparties.begin(), config.counterparties.end(), [&](const auto& counterparty) {
+      return counterparty.session.session_id == replacement.session.session_id;
+    });
+  if (it != config.counterparties.end()) {
+    *it = replacement;
+  }
+}
+
+auto
+HasProfileLoadChange(const EngineConfig& current, const EngineConfig& proposed) -> bool
+{
+  return current.profile_artifacts != proposed.profile_artifacts ||
+         current.profile_dictionaries != proposed.profile_dictionaries ||
+         current.profile_contracts != proposed.profile_contracts ||
+         current.profile_madvise != proposed.profile_madvise || current.profile_mlock != proposed.profile_mlock;
+}
+
+auto
+ChangeIsRestartRequired(const ConfigChange& change) -> bool
+{
+  if (change.kind != ConfigChangeKind::kEngineFieldChanged) {
+    return false;
+  }
+  return change.name == "worker_count" || change.name == "io_backend" || change.name == "poll_mode" ||
+         change.name == "queue_app_mode";
+}
+
+auto
+ChangeRequiresRemoveAdd(const ConfigChange& change) -> bool
+{
+  return change.kind == ConfigChangeKind::kModifyCounterparty &&
+         change.description.find("requires remove+add") != std::string::npos;
+}
+
+auto
+ApplyStoredEngineConfig(const EngineConfig& current, const EngineConfig& proposed) -> EngineConfig
+{
+  auto stored = proposed;
+  stored.worker_count = current.worker_count;
+  stored.io_backend = current.io_backend;
+  stored.poll_mode = current.poll_mode;
+  stored.queue_app_mode = current.queue_app_mode;
+  return stored;
+}
+
+auto
+ReloadProfilesForConfig(const EngineConfig& config) -> base::Result<std::pair<ProfileRegistry, LoadedContractMap>>
+{
+  ProfileRegistry loaded_profiles;
+  const profile::ProfileLoadOptions load_options{
+    .madvise = config.profile_madvise,
+    .mlock = config.profile_mlock,
+  };
+
+  for (const auto& artifact_path : config.profile_artifacts) {
+    auto loaded = profile::LoadProfileArtifact(artifact_path, load_options);
+    if (!loaded.ok()) {
+      return loaded.status();
+    }
+    auto status = loaded_profiles.Register(std::move(loaded).value());
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  for (const auto& dict_paths : config.profile_dictionaries) {
+    auto loaded = profile::LoadProfileFromDictionaryFiles(dict_paths);
+    if (!loaded.ok()) {
+      return loaded.status();
+    }
+    auto status = loaded_profiles.Register(std::move(loaded).value());
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  auto loaded_contracts = LoadContractMap(config.profile_contracts);
+  if (!loaded_contracts.ok()) {
+    return loaded_contracts.status();
+  }
+  for (const auto& [profile_id, contract] : loaded_contracts.value()) {
+    const auto* loaded_profile = loaded_profiles.Find(profile_id);
+    if (loaded_profile == nullptr) {
+      return base::Status::NotFound("contract sidecar references an unloaded profile_id");
+    }
+    if (contract.schema_hash != 0U && contract.schema_hash != loaded_profile->schema_hash()) {
+      return base::Status::VersionMismatch("contract sidecar schema_hash does not match the loaded profile");
+    }
+  }
+
+  return std::pair<ProfileRegistry, LoadedContractMap>{ std::move(loaded_profiles),
+                                                        std::move(loaded_contracts).value() };
+}
+
 } // namespace
 
 struct Engine::Impl
@@ -91,6 +205,7 @@ struct Engine::Impl
   ProfileRegistry profiles_;
   MetricsRegistry metrics_;
   TraceRecorder trace_;
+  DiagnosticsMonitor diagnostics_;
   std::atomic<std::uint64_t> next_dynamic_session_id_{ kFirstDynamicSessionId };
 };
 
@@ -104,6 +219,7 @@ struct Engine::Impl
 #define profiles_ impl_->profiles_
 #define metrics_ impl_->metrics_
 #define trace_ impl_->trace_
+#define diagnostics_ impl_->diagnostics_
 #define next_dynamic_session_id_ impl_->next_dynamic_session_id_
 
 Engine::Engine()
@@ -111,7 +227,10 @@ Engine::Engine()
 {
 }
 
-Engine::~Engine() = default;
+Engine::~Engine()
+{
+  diagnostics_.Stop();
+}
 
 auto
 Engine::profiles() const -> const ProfileRegistry&
@@ -153,6 +272,18 @@ auto
 Engine::mutable_trace() -> TraceRecorder*
 {
   return &trace_;
+}
+
+auto
+Engine::diagnostics() -> DiagnosticsMonitor&
+{
+  return diagnostics_;
+}
+
+auto
+Engine::diagnostics() const -> const DiagnosticsMonitor&
+{
+  return diagnostics_;
 }
 
 auto
@@ -240,6 +371,7 @@ Engine::Boot(const EngineConfig& config) -> base::Status
   runtime_.emplace(config.worker_count);
   metrics_.Reset(config.worker_count);
   trace_.Configure(config.trace_mode, config.trace_capacity, config.worker_count);
+  diagnostics_.Bind(&metrics_, &trace_);
   trace_.Record(
     TraceEventKind::kConfigLoaded, 0U, 0U, 0U, config.worker_count, config.counterparties.size(), "engine boot");
 
@@ -289,17 +421,166 @@ Engine::Boot(const EngineConfig& config) -> base::Status
 }
 
 auto
-Engine::EnsureManagedQueueRunnerStarted(const void* owner,
-                                        ApplicationCallbacks* application,
-                                        std::optional<ManagedQueueApplicationRunnerOptions>* options) -> base::Status
+Engine::ApplyConfig(const EngineConfig& new_config) -> base::Result<ApplyConfigResult>
+{
+  if (!config_.has_value() || !runtime_.has_value()) {
+    return base::Status::InvalidArgument("engine must be booted before ApplyConfig");
+  }
+
+  auto validation = ValidateEngineConfig(new_config);
+  if (!validation.ok()) {
+    return validation;
+  }
+
+  const auto current_config = *config_;
+  const auto delta = ComputeConfigDelta(current_config, new_config);
+  ApplyConfigResult result;
+  if (delta.empty()) {
+    return result;
+  }
+
+  auto stored_config = ApplyStoredEngineConfig(current_config, new_config);
+
+  if (HasProfileLoadChange(current_config, new_config)) {
+    auto loaded = ReloadProfilesForConfig(new_config);
+    if (!loaded.ok()) {
+      return loaded.status();
+    }
+    profiles_ = std::move(loaded.value().first);
+    contracts_ = std::move(loaded.value().second);
+  }
+
+  for (const auto& change : delta.changes) {
+    if (ChangeIsRestartRequired(change)) {
+      result.skipped.push_back(change);
+      continue;
+    }
+
+    if (ChangeRequiresRemoveAdd(change)) {
+      if (const auto* current = FindCounterpartyBySessionId(current_config, change.session_id); current != nullptr) {
+        ReplaceCounterpartyBySessionId(stored_config, *current);
+      }
+      result.skipped.push_back(change);
+      continue;
+    }
+
+    switch (change.kind) {
+      case ConfigChangeKind::kAddCounterparty: {
+        const auto* proposed = FindCounterpartyBySessionId(new_config, change.session_id);
+        if (proposed == nullptr) {
+          return base::Status::NotFound("added counterparty was not found in proposed config");
+        }
+        auto effective = ResolveEffectiveCounterpartyConfig(*proposed, contracts_);
+        if (!effective.ok()) {
+          return effective.status();
+        }
+        if (profiles_.Find(effective.value().session.profile_id) == nullptr) {
+          return base::Status::NotFound("counterparty references an unloaded profile");
+        }
+
+        session::SessionCore session(effective.value().session);
+        auto status = runtime_->RegisterSession(session);
+        if (!status.ok()) {
+          return status;
+        }
+
+        const auto worker_id = runtime_->RouteSession(session.key());
+        if (new_config.enable_metrics) {
+          status = metrics_.RegisterSession(session.session_id(), worker_id);
+          if (!status.ok() && metrics_.FindSession(session.session_id()) == nullptr) {
+            (void)runtime_->UnregisterSession(session.session_id());
+            return status;
+          }
+        }
+
+        auto counterparty = std::move(effective).value();
+        ReplaceCounterpartyBySessionId(stored_config, counterparty);
+        counterparties_[session.session_id()] = counterparty;
+        trace_.Record(TraceEventKind::kSessionRegistered,
+                      session.session_id(),
+                      worker_id,
+                      0U,
+                      session.profile_id(),
+                      static_cast<std::uint64_t>(counterparty.store_mode),
+                      counterparty.name);
+        result.applied.push_back(change);
+        break;
+      }
+      case ConfigChangeKind::kRemoveCounterparty: {
+        const auto* shard = runtime_->FindSessionShard(change.session_id);
+        const auto worker_id = shard == nullptr ? 0U : shard->worker_id;
+        auto status = runtime_->UnregisterSession(change.session_id);
+        if (!status.ok()) {
+          return status;
+        }
+        counterparties_.erase(change.session_id);
+        trace_.Record(TraceEventKind::kSessionEvent, change.session_id, worker_id, 0U, 0U, 0U, "session unregistered");
+        result.applied.push_back(change);
+        break;
+      }
+      case ConfigChangeKind::kModifyCounterparty: {
+        const auto* proposed = FindCounterpartyBySessionId(new_config, change.session_id);
+        if (proposed == nullptr) {
+          return base::Status::NotFound("modified counterparty was not found in proposed config");
+        }
+        auto effective = ResolveEffectiveCounterpartyConfig(*proposed, contracts_);
+        if (!effective.ok()) {
+          return effective.status();
+        }
+        if (profiles_.Find(effective.value().session.profile_id) == nullptr) {
+          return base::Status::NotFound("counterparty references an unloaded profile");
+        }
+        auto counterparty = std::move(effective).value();
+        ReplaceCounterpartyBySessionId(stored_config, counterparty);
+        counterparties_[change.session_id] = counterparty;
+        const auto* shard = runtime_->FindSessionShard(change.session_id);
+        trace_.Record(TraceEventKind::kSessionEvent,
+                      change.session_id,
+                      shard == nullptr ? 0U : shard->worker_id,
+                      0U,
+                      counterparty.session.profile_id,
+                      static_cast<std::uint64_t>(counterparty.store_mode),
+                      counterparty.name);
+        result.applied.push_back(change);
+        break;
+      }
+      case ConfigChangeKind::kAddListener:
+      case ConfigChangeKind::kRemoveListener:
+      case ConfigChangeKind::kModifyListener:
+        trace_.Record(TraceEventKind::kConfigLoaded, 0U, 0U, 0U, 0U, 0U, change.name);
+        result.applied.push_back(change);
+        break;
+      case ConfigChangeKind::kEngineFieldChanged:
+        if (change.name == "trace") {
+          trace_.Configure(new_config.trace_mode, new_config.trace_capacity, current_config.worker_count);
+        }
+        trace_.Record(TraceEventKind::kConfigLoaded, 0U, 0U, 0U, current_config.worker_count, 0U, change.name);
+        result.applied.push_back(change);
+        break;
+    }
+  }
+
+  config_ = std::move(stored_config);
+  return result;
+}
+
+#undef managed_queue_runner_mutex_
+#undef managed_queue_runners_
+
+auto
+EnsureManagedQueueRunnerStarted(Engine& engine,
+                                const void* owner,
+                                ApplicationCallbacks* application,
+                                std::optional<ManagedQueueApplicationRunnerOptions>* options) -> base::Status
 {
   if (owner == nullptr) {
     return base::Status::InvalidArgument("managed queue runner requires an owner token");
   }
 
-  std::lock_guard lock(managed_queue_runner_mutex_);
-  const auto existing = managed_queue_runners_.find(owner);
-  if (existing != managed_queue_runners_.end()) {
+  auto* engine_impl = engine.impl_.get();
+  std::lock_guard lock(engine_impl->managed_queue_runner_mutex_);
+  const auto existing = engine_impl->managed_queue_runners_.find(owner);
+  if (existing != engine_impl->managed_queue_runners_.end()) {
     if (existing->second.mode == ManagedQueueApplicationRunnerMode::kThreaded) {
       if (existing->second.runner->running()) {
         return base::Status::Ok();
@@ -320,12 +601,12 @@ Engine::EnsureManagedQueueRunnerStarted(const void* owner,
     return queue_application.status();
   }
 
-  auto status = ValidateManagedQueueRunnerOptions(config(), queue_application.value(), options->value());
+  auto status = ValidateManagedQueueRunnerOptions(engine.config(), queue_application.value(), options->value());
   if (!status.ok()) {
     return status;
   }
 
-  Impl::ManagedQueueRunnerSlot slot{
+  Engine::Impl::ManagedQueueRunnerSlot slot{
     .mode = options->value().mode,
     .application = queue_application.value(),
     .handlers = {},
@@ -344,25 +625,26 @@ Engine::EnsureManagedQueueRunnerStarted(const void* owner,
       return status;
     }
     slot.runner = std::move(runner);
-    managed_queue_runners_.emplace(owner, std::move(slot));
+    engine_impl->managed_queue_runners_.emplace(owner, std::move(slot));
     return base::Status::Ok();
   }
 
   slot.handlers = std::move(options->value().handlers);
-  managed_queue_runners_.emplace(owner, std::move(slot));
+  engine_impl->managed_queue_runners_.emplace(owner, std::move(slot));
   return base::Status::Ok();
 }
 
 auto
-Engine::PollManagedQueueWorkerOnce(const void* owner, std::uint32_t worker_id) -> base::Result<std::size_t>
+PollManagedQueueWorkerOnce(Engine& engine, const void* owner, std::uint32_t worker_id) -> base::Result<std::size_t>
 {
   if (owner == nullptr) {
     return base::Status::InvalidArgument("managed queue runner requires an owner token");
   }
 
-  std::lock_guard lock(managed_queue_runner_mutex_);
-  const auto it = managed_queue_runners_.find(owner);
-  if (it == managed_queue_runners_.end()) {
+  auto* engine_impl = engine.impl_.get();
+  std::lock_guard lock(engine_impl->managed_queue_runner_mutex_);
+  const auto it = engine_impl->managed_queue_runners_.find(owner);
+  if (it == engine_impl->managed_queue_runners_.end()) {
     return std::size_t{ 0U };
   }
 
@@ -395,15 +677,16 @@ Engine::PollManagedQueueWorkerOnce(const void* owner, std::uint32_t worker_id) -
 }
 
 auto
-Engine::StopManagedQueueRunner(const void* owner) -> base::Status
+StopManagedQueueRunner(Engine& engine, const void* owner) -> base::Status
 {
   if (owner == nullptr) {
     return base::Status::InvalidArgument("managed queue runner requires an owner token");
   }
 
-  std::lock_guard lock(managed_queue_runner_mutex_);
-  const auto it = managed_queue_runners_.find(owner);
-  if (it == managed_queue_runners_.end()) {
+  auto* engine_impl = engine.impl_.get();
+  std::lock_guard lock(engine_impl->managed_queue_runner_mutex_);
+  const auto it = engine_impl->managed_queue_runners_.find(owner);
+  if (it == engine_impl->managed_queue_runners_.end()) {
     return base::Status::Ok();
   }
   if (it->second.mode != ManagedQueueApplicationRunnerMode::kThreaded) {
@@ -414,7 +697,7 @@ Engine::StopManagedQueueRunner(const void* owner) -> base::Status
 }
 
 auto
-Engine::ReleaseManagedQueueRunner(const void* owner) -> base::Status
+ReleaseManagedQueueRunner(Engine& engine, const void* owner) -> base::Status
 {
   if (owner == nullptr) {
     return base::Status::InvalidArgument("managed queue runner requires an owner token");
@@ -422,15 +705,16 @@ Engine::ReleaseManagedQueueRunner(const void* owner) -> base::Status
 
   std::unique_ptr<QueueApplicationRunner> runner;
   {
-    std::lock_guard lock(managed_queue_runner_mutex_);
-    const auto it = managed_queue_runners_.find(owner);
-    if (it == managed_queue_runners_.end()) {
+    auto* engine_impl = engine.impl_.get();
+    std::lock_guard lock(engine_impl->managed_queue_runner_mutex_);
+    const auto it = engine_impl->managed_queue_runners_.find(owner);
+    if (it == engine_impl->managed_queue_runners_.end()) {
       return base::Status::Ok();
     }
     if (it->second.mode == ManagedQueueApplicationRunnerMode::kThreaded) {
       runner = std::move(it->second.runner);
     }
-    managed_queue_runners_.erase(it);
+    engine_impl->managed_queue_runners_.erase(it);
   }
   return runner == nullptr ? base::Status::Ok() : runner->Stop();
 }
@@ -443,6 +727,25 @@ Engine::FindCounterpartyConfig(std::uint64_t session_id) const -> const Counterp
     return nullptr;
   }
   return &it->second;
+}
+
+auto
+Engine::QueryScheduleStatus(std::uint64_t session_id, std::uint64_t unix_time_ns) const
+  -> base::Result<SessionScheduleStatus>
+{
+  const auto* counterparty = FindCounterpartyConfig(session_id);
+  if (counterparty == nullptr) {
+    return base::Status::NotFound("counterparty session not found");
+  }
+  auto status = runtime::QueryScheduleStatus(*counterparty, unix_time_ns);
+  trace_.Record(TraceEventKind::kScheduleEvent,
+                session_id,
+                0U,
+                unix_time_ns,
+                status.in_session_window ? 1U : 0U,
+                status.in_logon_window ? 1U : 0U,
+                "schedule status queried");
+  return status;
 }
 
 auto
@@ -639,6 +942,7 @@ WhitelistSessionFactory::operator()(const session::SessionKey& key) const -> bas
 #undef profiles_
 #undef metrics_
 #undef trace_
+#undef diagnostics_
 #undef next_dynamic_session_id_
 
 } // namespace nimble::runtime

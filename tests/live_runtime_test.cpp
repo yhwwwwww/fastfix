@@ -11,10 +11,11 @@
 #include <vector>
 
 #include "nimblefix/codec/fix_tags.h"
-#include "nimblefix/message/message_builder.h"
-#include "nimblefix/runtime/application.h"
+#include "nimblefix/advanced/engine.h"
+#include "nimblefix/advanced/message_builder.h"
+#include "nimblefix/advanced/runtime_application.h"
 #include "nimblefix/runtime/engine.h"
-#include "nimblefix/runtime/live_acceptor.h"
+#include "nimblefix/advanced/live_acceptor.h"
 #include "nimblefix/session/admin_protocol.h"
 #include "nimblefix/store/memory_store.h"
 #include "nimblefix/transport/tcp_transport.h"
@@ -67,7 +68,7 @@ public:
     }
 
     ++inline_application_events_;
-    return event.handle.SendInlineBorrowed(event.message_view());
+    return event.handle.Send(nimble::message::MessageRef::Borrow(event.message_view()));
   }
 
   [[nodiscard]] auto worker_count() const -> std::uint32_t { return queue_.worker_count(); }
@@ -252,7 +253,7 @@ public:
       return nimble::base::Status::InvalidArgument("queue-decoupled application observed an unexpected session");
     }
 
-    auto status = event.handle.SendCopy(event.message_view());
+    auto status = event.handle.Send(nimble::message::MessageRef::Copy(event.message_view()));
     if (!status.ok()) {
       return status;
     }
@@ -280,7 +281,7 @@ public:
       return nimble::base::Status::Ok();
     }
 
-    auto status = event.handle.SendCopy(event.message_view());
+    auto status = event.handle.Send(nimble::message::MessageRef::Copy(event.message_view()));
     if (!status.ok()) {
       return status;
     }
@@ -604,16 +605,15 @@ TEST_CASE("live-runtime", "[live-runtime]")
     engine_managed_queue_runner->handlers.push_back(std::make_unique<QueueReplyHandler>(3102U));
   }
   int managed_runner_owner = 0;
-  REQUIRE(engine
-            .EnsureManagedQueueRunnerStarted(
-              &managed_runner_owner, managed_runner_application.get(), &engine_managed_queue_runner)
+  REQUIRE(EnsureManagedQueueRunnerStarted(
+            engine, &managed_runner_owner, managed_runner_application.get(), &engine_managed_queue_runner)
             .ok());
-  REQUIRE(engine.StopManagedQueueRunner(&managed_runner_owner).ok());
+  REQUIRE(StopManagedQueueRunner(engine, &managed_runner_owner).ok());
   REQUIRE(
-    engine.EnsureManagedQueueRunnerStarted(&managed_runner_owner, managed_runner_application.get(), nullptr).ok());
-  REQUIRE(engine.ReleaseManagedQueueRunner(&managed_runner_owner).ok());
+    EnsureManagedQueueRunnerStarted(engine, &managed_runner_owner, managed_runner_application.get(), nullptr).ok());
+  REQUIRE(ReleaseManagedQueueRunner(engine, &managed_runner_owner).ok());
   REQUIRE(
-    !engine.EnsureManagedQueueRunnerStarted(&managed_runner_owner, managed_runner_application.get(), nullptr).ok());
+    !EnsureManagedQueueRunnerStarted(engine, &managed_runner_owner, managed_runner_application.get(), nullptr).ok());
 
   auto application = std::make_shared<MixedApplication>(config.worker_count);
   nimble::runtime::ManagedQueueApplicationRunnerOptions managed_queue_runner;

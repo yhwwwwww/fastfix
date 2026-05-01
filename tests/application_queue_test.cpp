@@ -4,8 +4,8 @@
 #include <thread>
 
 #include "nimblefix/codec/fix_tags.h"
-#include "nimblefix/message/message_builder.h"
-#include "nimblefix/runtime/application.h"
+#include "nimblefix/advanced/message_builder.h"
+#include "nimblefix/advanced/runtime_application.h"
 #include "nimblefix/runtime/live_runtime_support.h"
 
 #include "test_support.h"
@@ -318,11 +318,11 @@ TEST_CASE("application-queue", "[application-queue]")
     builder.set_string(nimble::codec::tags::kTargetCompID, "SELL");
     auto message = std::move(builder).build();
 
-    const auto borrowed = handle.SendInlineBorrowed(message.view());
+    const auto borrowed = handle.Send(nimble::message::MessageRef::Borrow(message.view()));
     REQUIRE(borrowed.code() == nimble::base::ErrorCode::kInvalidArgument);
     REQUIRE(sink->enqueued() == 0U);
 
-    REQUIRE(handle.SendCopy(message.view()).ok());
+    REQUIRE(handle.Send(nimble::message::MessageRef::Copy(message.view())).ok());
     REQUIRE(sink->enqueued() == 1U);
   }
 
@@ -336,7 +336,9 @@ TEST_CASE("application-queue", "[application-queue]")
     plain_builder.set_string(nimble::codec::tags::kClOrdID, "ORD-PLAIN");
     auto plain_message = std::move(plain_builder).build();
 
-    REQUIRE(handle.SendCopy(plain_message.view(), { .sender_sub_id = "DESK-1", .target_sub_id = "ROUTE-1" }).ok());
+    REQUIRE(handle.Send(nimble::message::MessageRef::Copy(plain_message.view()),
+                        { .sender_sub_id = "DESK-1", .target_sub_id = "ROUTE-1" })
+              .ok());
     REQUIRE(sink->plain_enqueued() == 1U);
     REQUIRE(sink->last_plain_envelope().sender_sub_id == "DESK-1");
     REQUIRE(sink->last_plain_envelope().target_sub_id == "ROUTE-1");
@@ -346,7 +348,9 @@ TEST_CASE("application-queue", "[application-queue]")
     nimble::session::EncodedApplicationMessage encoded(
       "D", std::span<const std::byte>(encoded_body.data(), encoded_body.size()));
 
-    REQUIRE(handle.SendEncodedTake(std::move(encoded), { .sender_sub_id = "DESK-9", .target_sub_id = "ROUTE-7" }).ok());
+    REQUIRE(handle.SendEncoded(nimble::session::EncodedApplicationMessageRef::Take(std::move(encoded)),
+                               { .sender_sub_id = "DESK-9", .target_sub_id = "ROUTE-7" })
+              .ok());
     REQUIRE(sink->plain_enqueued() == 1U);
     REQUIRE(sink->encoded_enqueued() == 1U);
     REQUIRE(sink->last_encoded_view().msg_type == "D");
@@ -354,11 +358,12 @@ TEST_CASE("application-queue", "[application-queue]")
     REQUIRE(sink->last_encoded_envelope().sender_sub_id == "DESK-9");
     REQUIRE(sink->last_encoded_envelope().target_sub_id == "ROUTE-7");
 
-    const auto borrowed = handle.SendEncodedInlineBorrowed(
-      nimble::session::EncodedApplicationMessageView{
-        .msg_type = "D",
-        .body = std::span<const std::byte>(encoded_body.data(), encoded_body.size()),
-      },
+    const auto borrowed = handle.SendEncoded(
+      nimble::session::EncodedApplicationMessageRef::Borrow(
+        nimble::session::EncodedApplicationMessageView{
+          .msg_type = "D",
+          .body = std::span<const std::byte>(encoded_body.data(), encoded_body.size()),
+        }),
       { .sender_sub_id = "DESK-2" });
     REQUIRE(borrowed.code() == nimble::base::ErrorCode::kInvalidArgument);
     REQUIRE(sink->encoded_enqueued() == 1U);
@@ -374,11 +379,12 @@ TEST_CASE("application-queue", "[application-queue]")
     builder.set_string(nimble::codec::tags::kClOrdID, "ORD-SP");
     const auto message = std::move(builder).build();
 
-    REQUIRE(handle.SendCopy(message.view()).ok());
-    REQUIRE(handle.SendCopy(message.view()).ok());
+    REQUIRE(handle.Send(nimble::message::MessageRef::Copy(message.view())).ok());
+    REQUIRE(handle.Send(nimble::message::MessageRef::Copy(message.view())).ok());
 
     nimble::base::Status cross_thread_status = nimble::base::Status::Ok();
-    std::jthread other_thread([&]() { cross_thread_status = handle.SendCopy(message.view()); });
+    std::jthread other_thread(
+      [&]() { cross_thread_status = handle.Send(nimble::message::MessageRef::Copy(message.view())); });
     other_thread.join();
 
     REQUIRE(cross_thread_status.code() == nimble::base::ErrorCode::kInvalidArgument);

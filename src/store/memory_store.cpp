@@ -219,6 +219,32 @@ MemorySessionStore::LoadOutboundRangeViews(std::uint64_t session_id,
 }
 
 auto
+MemorySessionStore::LoadInboundRange(std::uint64_t session_id, std::uint32_t begin_seq, std::uint32_t end_seq) const
+  -> base::Result<std::vector<MessageRecord>>
+{
+  if (begin_seq == 0 || end_seq == 0 || begin_seq > end_seq) {
+    return base::Status::InvalidArgument("invalid inbound load range");
+  }
+
+  std::vector<MessageRecord> result;
+  const auto it = sessions_.find(session_id);
+  if (it == sessions_.end()) {
+    return result;
+  }
+
+  for (const auto& record : it->second.inbound) {
+    if (record.seq_num >= begin_seq && record.seq_num <= end_seq) {
+      result.push_back(MaterializeRecord(session_id, it->second.payload_arena, record));
+    }
+  }
+
+  std::stable_sort(result.begin(), result.end(), [](const MessageRecord& lhs, const MessageRecord& rhs) {
+    return lhs.seq_num < rhs.seq_num;
+  });
+  return result;
+}
+
+auto
 MemorySessionStore::ReserveAdditionalSessionStorage(std::uint64_t session_id,
                                                     std::size_t inbound_records,
                                                     std::size_t outbound_records,

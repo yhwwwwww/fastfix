@@ -37,6 +37,19 @@ ShardedRuntime::RegisterSession(const session::SessionCore& session) -> base::St
 }
 
 auto
+ShardedRuntime::UnregisterSession(std::uint64_t session_id) -> base::Status
+{
+  const auto it = session_to_worker_.find(session_id);
+  if (it == session_to_worker_.end()) {
+    return base::Status::NotFound("session is not registered with a worker shard");
+  }
+  auto& ids = shards_[it->second].session_ids;
+  ids.erase(std::remove(ids.begin(), ids.end(), session_id), ids.end());
+  session_to_worker_.erase(it);
+  return base::Status::Ok();
+}
+
+auto
 ShardedRuntime::RegisterPendingConnection(const PendingConnection& pending) -> base::Status
 {
   if (pending_to_worker_.contains(pending.connection_id)) {

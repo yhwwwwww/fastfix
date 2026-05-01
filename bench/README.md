@@ -59,7 +59,7 @@ Each diagram below shows a complete benchmark flow. `START` and `END` mark timin
 
 ```mermaid
 flowchart LR
-	BO["START encode:<br/>before writer.clear and field assignment"] -->|encode| WF["END encode / START peek, parse, session-inbound:<br/>wire frame bytes in EncodeBuffer"]
+BO["START encode:<br/>before filling generated NewOrderSingle business object"] -->|encode| WF["END encode / START peek, parse, session-inbound:<br/>wire frame bytes in EncodeBuffer"]
 	WF -->|peek| PH["END peek:<br/>session header view"]
 	WF -->|parse| MV["END parse / START session-outbound:<br/>decoded MessageView + validation"]
 	MV -->|session-outbound| OF["END session-outbound:<br/>session-managed outbound wire frame"]
@@ -93,11 +93,11 @@ Encode comparisons start from the same neutral business object. Both engines pin
 
 | Metric | Timing starts at | Timing ends at | What is included |
 |--------|------------------|----------------|------------------|
-| `encode` | immediately before `writer.clear()` and field assignment on the generated `NewOrderSingleWriter` | after `writer.encode_to_buffer(...)` completes | field population, repeating-group population, frame serialization, BodyLength backfill, checksum append |
+| `encode` | immediately before clearing/filling the generated `NewOrderSingle` business object | after `EncodeFixMessageToBuffer(...)` completes | field population, repeating-group population, `ToMessage()` materialization, frame serialization, BodyLength backfill, checksum append |
 | `peek` | immediately before `PeekSessionHeaderView(sample_frame)` | when the header view is returned | raw-frame header extraction only |
 | `parse` | immediately before `DecodeFixMessageView(sample_frame)` | when decoded `MessageView` + validation are available | full wire decode, validation, group handling |
-| `session-outbound` | immediately before `initiator.SendApplication(sample, ts, envelope)` | when `AdminProtocol` returns the encoded outbound frame | outbound seq allocation, full business-field serialization, session header/trailer assembly, store write |
-| `session-outbound-pre-encoded` | immediately before `initiator.SendEncodedApplication(encoded_body, ts, envelope)` | when `AdminProtocol` returns the encoded outbound frame | outbound seq allocation, session-managed header/trailer finalization, store write; excludes business-field serialization because the application body is pre-encoded |
+| `session-outbound` | immediately before the benchmark submits the prepared application `Message` into the initiator session path | when `AdminProtocol` returns the encoded outbound frame | outbound seq allocation, full business-field serialization, session header/trailer assembly, store write |
+| `session-outbound-pre-encoded` | immediately before the benchmark submits the pre-encoded application body into the initiator session path | when `AdminProtocol` returns the encoded outbound frame | outbound seq allocation, session-managed header/trailer finalization, store write; excludes business-field serialization because the application body is pre-encoded |
 | `session-inbound` | immediately before `acceptor.OnInbound(std::move(frame), NowNs())` | when `ProtocolEvent` returns | full inbound decode, sequence validation, admin/session handling, store write, app-message extraction |
 | `replay` | immediately before `acceptor.OnInbound(std::move(resend_request), NowNs())` | when `ProtocolEvent.outbound_frames` returns | ResendRequest handling, store-backed replay generation for `replay_span` messages |
 | `loopback-roundtrip` | immediately before the live initiator submits the `NewOrderSingle` | when the initiator receives the `ExecutionReport` ack | full TCP round-trip, both runtimes, both protocol stacks |

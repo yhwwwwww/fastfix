@@ -8,7 +8,7 @@
 #include <thread>
 #include <vector>
 
-#include "nimblefix/runtime/application.h"
+#include "nimblefix/advanced/runtime_application.h"
 
 namespace {
 

@@ -40,8 +40,8 @@ The repository is split between the reusable engine surface, executable entrypoi
 |------|------|
 | `include/public/nimblefix/` + `src/` | Exported headers and implementation |
 | `include/internal/nimblefix/` | Repository-private headers used by NimbleFIX itself, tests, and internal tools |
-| `tools/acceptor/` | Live acceptor binary that wires config into `Engine` + `LiveAcceptor` |
-| `tools/initiator/` | Live initiator binary that wires config into `Engine` + `LiveInitiator` |
+| `tools/acceptor/` | Live acceptor operational binary that wires config into `Engine` + `LiveAcceptor`; advanced/raw-oriented tool rather than the primary generated-first example |
+| `tools/initiator/` | Live initiator operational binary that wires config into `Engine` + `LiveInitiator`; advanced/raw-oriented tool rather than the primary generated-first example |
 | `bench/` | Benchmark drivers plus the side-by-side QuickFIX comparison harness |
 | `tests/` | Regression, runtime, soak, and integration coverage |
 | `scripts/` | Helper entrypoints used by developers and CI for offline build/test/bench flows |
@@ -126,22 +126,34 @@ group|453|448|Parties|0|448:r,447:r,452:r
 
 ### 3. Message (public include: `nimblefix/message/`)
 
-Two representations of a FIX message:
+The main application representation is now generated-first:
 
-**`Message`** — Owned, heap-allocated, writable:
+**Generated outbound object** — Business-facing writable message:
 
 ```cpp
-auto msg = MessageBuilder{"D"}
-    .set_string(11, "ORD-001")
-    .set_int(38, 100)
-    .add_group_entry(453)
-        .set_string(448, "PARTY-A")
-        .set_char(447, 'D')
-        .set_int(452, 3);
-auto message = std::move(builder).build();
+fix44::NewOrderSingle order;
+order.cl_ord_id("ORD-001")
+    .symbol("AAPL")
+    .side(fix44::Side::Buy)
+    .order_qty(100)
+    .ord_type(fix44::OrdType::Limit);
+order.add_party()
+    .party_id("PARTY-A")
+    .party_id_source(fix44::PartyIdSource::Proprietary)
+    .party_role(fix44::PartyRole::ClientId);
+auto message = order.ToMessage();
 ```
 
-**`MessageView`** — Zero-copy, read-only, references original buffer:
+**Generated inbound view** — Business-facing typed read path:
+
+```cpp
+auto order = fix44::NewOrderSingleView::Bind(view).value();
+auto cl_ord_id = order.cl_ord_id();
+auto side = order.side();
+auto parties = order.parties();
+```
+
+**`MessageView`** — Zero-copy, read-only raw accessor for tooling and schema-agnostic flows:
 
 ```cpp
 auto field = view.get_string(11);       // → optional<string_view>
@@ -151,14 +163,7 @@ auto entry = group->entry(0);           // → GroupEntryView
 auto party_id = entry.get_string(448);  // → optional<string_view>
 ```
 
-**`TypedMessageView`** — MessageView bound to a dictionary for validation:
-
-```cpp
-auto typed = TypedMessageView::Bind(dictionary, view);
-typed.validate_required_fields(&missing_tag);  // Check required fields present
-```
-
-**`FixedLayoutWriter`** — Hot-path encoder with pre-computed O(1) slot mapping:
+**`FixedLayoutWriter`** — Advanced/internal hot-path encoder with pre-computed O(1) slot mapping:
 
 ```cpp
 // Build layout once at startup
@@ -173,7 +178,7 @@ writer.add_group_entry(453)
 writer.encode_to_buffer(dictionary, options, &buffer);
 ```
 
-`FixedLayout::Build()` pre-computes tag → slot index mappings. `FixedLayoutWriter` writes directly to pre-allocated slots at known offsets — no hash map lookups, no field-list scanning. The hybrid path (`set_extra_string()` etc.) appends extension fields outside the fixed layout for venue-specific custom tags.
+`FixedLayout::Build()` pre-computes tag → slot index mappings. `FixedLayoutWriter` writes directly to pre-allocated slots at known offsets — no hash map lookups, no field-list scanning. The runtime and generated `ToMessage()` path can still reuse that backend internally; applications only need it when they intentionally choose the advanced raw surface.
 
 **Internal storage**: Fields use a `FieldSlot` linked-list structure within a flat buffer. Groups track entry boundaries via a small frame stack matched against dictionary group definitions.
 
@@ -434,7 +439,7 @@ Metrics track plain connection count, TLS connection count, TLS handshake succes
 
 ### 8. Runtime (public include: `nimblefix/runtime/`)
 
-The runtime layer is where the library becomes a process. It loads profiles, builds worker shards, binds sockets, owns timer wheels and wakeups, routes connections, exposes `SessionHandle`s, and turns configuration knobs into a concrete topology.
+The runtime layer is where the library becomes a process. It loads profiles, builds worker shards, binds sockets, owns timer wheels and wakeups, routes connections, exposes typed `Session<Profile>` / `InlineSession<Profile>` handles, and turns configuration knobs into a concrete topology.
 
 #### Engine
 
@@ -454,7 +459,7 @@ Primary responsibilities:
 - Load `.nfa` and/or `.nfd` profiles into `ProfileRegistry`
 - Materialize shared runtime services: metrics, trace, managed queues, store factories
 - Build the worker-shard inventory consumed by `LiveAcceptor` and `LiveInitiator`
-- Provide lifecycle (`Boot()`, `Run()`, `Stop()`) and `SessionHandle` surfaces for non-owner threads
+- Provide lifecycle (`Boot()`, `Run()`, `Stop()`) and typed session surfaces for non-owner threads
 
 #### LiveInitiator / LiveAcceptor
 
@@ -503,7 +508,7 @@ flowchart LR
     W --> TW["Poller + TimerWheel + wakeup"]
     TW --> AP["AdminProtocol + SessionCore"]
     AP --> DISP{"dispatch_mode"}
-    DISP -->|inline| APP["ApplicationCallbacks"]
+    DISP -->|inline| APP["typed Application<Profile>"]
     DISP -->|queue-decoupled| Q["QueueApplication<br/>per-worker SPSC"] --> QR["managed queue runner"] --> APP
     AP --> STORE["SessionStore"]
     AP --> NET
@@ -563,7 +568,7 @@ flowchart LR
     DEC --> CORE["SessionCore + admin rules"]
     CORE --> STORE["SessionStore::SaveInbound()"]
     CORE --> DISP{"dispatch_mode"}
-    DISP -->|inline| APP["ApplicationCallbacks"]
+    DISP -->|inline| APP["typed Application<Profile>"]
     DISP -->|queue| QUEUE["QueueApplication event"]
     CORE --> OUT["ProtocolEvent.outbound_frames"] --> TX["TcpConnection::Send*()"]
 ```
@@ -583,7 +588,7 @@ Step-by-step:
 
 ```mermaid
 flowchart LR
-    APP["application code / SessionHandle"] --> CMD["per-worker command queue"]
+    APP["application code / Session<Profile>"] --> CMD["per-worker command queue"]
     CMD --> WORKER["owning session worker"]
     WORKER --> SEQ["SessionCore::AllocateOutboundSeq()"]
     SEQ --> SEND["AdminProtocol::SendApplication()"]
@@ -595,7 +600,7 @@ flowchart LR
 
 Step-by-step:
 
-1. Application code builds a `Message` or uses a typed writer and calls into `SessionHandle`.
+1. Application code typically builds a generated outbound object and sends it through `Session<Profile>`. Advanced/raw integrations can still send `Message` through `SessionHandle`.
 2. If the caller is not already on the owner thread, the send request is pushed into the worker's command queue and the worker is woken up.
 3. The owning worker allocates the next outbound sequence number through `SessionCore`.
 4. `AdminProtocol::SendApplication()` applies FIX-session fields, chooses the encode path, and materializes the outbound frame.
@@ -697,7 +702,7 @@ All threads are `std::jthread` — calling `Stop()` or destroying the runtime jo
 
 When the front-door accepts a connection, it routes the connection to a worker via an inbox (mutex-protected push, then pipe-based wakeup). Once the worker adopts the connection, the front-door never touches it again.
 
-Cross-thread session access goes through `SessionHandle`. Query paths (`Snapshot()`, `Subscribe()`) are safe from any thread. Send paths (`SendCopy()` / `SendTake()` / `SendEncodedCopy()` / `SendEncodedTake()`) enqueue onto a per-worker SPSC queue and wake the target worker via its pipe fd. Each queue is single-producer: the first sending thread claims it, and later producer threads receive `kInvalidArgument` instead of silently violating the queue contract:
+Cross-thread business send access normally goes through typed `Session<Profile>`. Underneath, the advanced `SessionHandle` command bridge is still what owns cross-thread queueing. Query paths (`Snapshot()`, `Subscribe()`) are safe from any thread. Owned `Send(message::MessageRef::Copy/Take(...))` and `SendEncoded(EncodedApplicationMessageRef::Take(...))` calls enqueue onto a per-worker SPSC queue and wake the target worker via its pipe fd. Each queue is single-producer: the first sending thread claims it, and later producer threads receive `kInvalidArgument` instead of silently violating the queue contract:
 
 ```cpp
 // Safe query paths from any thread:
@@ -706,11 +711,11 @@ session_handle.Subscribe();
 
 // Cross-thread send path:
 // one producer thread per SessionHandle send queue.
-session_handle.SendTake(std::move(msg));
+session_handle.Send(message::MessageRef::Take(std::move(msg)));
 
 // Owning-worker / inline-callback only.
 // Outside inline callbacks this fast-fails.
-session_handle.SendInlineBorrowed(view);
+session_handle.Send(message::MessageRef::Borrow(view));
 message_view.get_string(11);             // Only within callback scope
 ```
 
@@ -742,7 +747,7 @@ Two sub-modes:
 
 | Sub-mode | Where app callback runs | Thread |
 |----------|------------------------|--------|
-| `kCoScheduled` | On session worker thread, during explicit `PollManagedQueueWorkerOnce()` call | Same as session worker |
+| `kCoScheduled` | On session worker thread, during explicit `advanced/engine.h` `PollManagedQueueWorkerOnce(...)` call | Same as session worker |
 | `kThreaded` | On dedicated app worker thread (`nf-app-wN`) | Separate thread |
 
 `kCoScheduled` is useful when you want queue ownership semantics without increasing thread count. `kThreaded` is the runtime shape to choose when application code may block or when you want clean CPU isolation between protocol work and business logic.

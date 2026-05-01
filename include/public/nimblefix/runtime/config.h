@@ -330,10 +330,10 @@ struct EngineConfig
   bool accept_unknown_sessions{ false };
 };
 
-/// Small builder for ListenerConfig.
+/// Optional convenience helper for ListenerConfig.
 ///
-/// Design intent: cover the common acceptor bring-up path without making users
-/// spell out aggregate initialization details.
+/// Prefer aggregate initialization in new code. This builder remains available
+/// for transitional call sites that still want chained setup.
 class ListenerConfigBuilder
 {
 public:
@@ -377,10 +377,11 @@ private:
   ListenerConfig config_{};
 };
 
-/// Builder for common initiator and acceptor counterparty setups.
+/// Optional convenience helper for CounterpartyConfig.
 ///
-/// Design intent: make the public bring-up path explicit about session role,
-/// transport version, persistence choice, and reconnect behavior.
+/// Prefer aggregate initialization plus SessionKey::ForInitiator() /
+/// SessionKey::ForAcceptor() in new code. This builder remains available for
+/// transitional or lower-level call sites that still want chained setup.
 class CounterpartyConfigBuilder
 {
 public:
@@ -536,6 +537,45 @@ private:
   CounterpartyConfig config_{};
 };
 
+/// Severity of a configuration validation diagnostic.
+enum class ConfigErrorSeverity : std::uint32_t
+{
+  /// Configuration is invalid; engine will not boot.
+  kError = 0,
+  /// Configuration is suboptimal or potentially risky but not blocking.
+  kWarning,
+};
+
+/// One structured validation diagnostic from config validation.
+struct ConfigError
+{
+  /// Dot-separated field path, e.g. "counterparties[0].store_path"
+  std::string field_path;
+  /// Severity level.
+  ConfigErrorSeverity severity{ ConfigErrorSeverity::kError };
+  /// Underlying error code classification.
+  base::ErrorCode code{ base::ErrorCode::kInvalidArgument };
+  /// Human-readable description.
+  std::string message;
+};
+
+/// Result of structured config validation that collects ALL diagnostics.
+struct ConfigValidationResult
+{
+  std::vector<ConfigError> errors;
+
+  /// True when no error-severity diagnostics exist.
+  [[nodiscard]] auto ok() const noexcept -> bool;
+  /// True when at least one kError diagnostic exists.
+  [[nodiscard]] auto has_errors() const noexcept -> bool;
+  /// True when at least one kWarning diagnostic exists.
+  [[nodiscard]] auto has_warnings() const noexcept -> bool;
+  /// Human-readable multi-line summary of all diagnostics.
+  [[nodiscard]] auto summary() const -> std::string;
+  /// First error as a base::Status for backwards-compat callers.
+  [[nodiscard]] auto first_error_status() const -> base::Status;
+};
+
 /// Validate one session schedule.
 ///
 /// \param schedule Schedule to validate.
@@ -584,5 +624,14 @@ TlsTransportEnabledAtBuild() noexcept -> bool;
 /// \return Ok on success, otherwise an error describing the first violated public contract.
 auto
 ValidateEngineConfig(const EngineConfig& config) -> base::Status;
+
+/// Validate a full engine config and collect ALL diagnostics (errors + warnings).
+[[nodiscard]] auto
+ValidateEngineConfigFull(const EngineConfig& config) -> ConfigValidationResult;
+
+/// Serialize an EngineConfig to .nfcfg text format.
+/// The output is parseable by LoadEngineConfigText().
+[[nodiscard]] auto
+ConfigToText(const EngineConfig& config) -> std::string;
 
 } // namespace nimble::runtime

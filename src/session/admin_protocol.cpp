@@ -12,8 +12,8 @@
 #include "nimblefix/codec/fix_tags.h"
 #include "nimblefix/codec/raw_passthrough.h"
 #include "nimblefix/codec/simd_scan.h"
-#include "nimblefix/message/message_builder.h"
-#include "nimblefix/message/typed_message_view.h"
+#include "nimblefix/advanced/message_builder.h"
+#include "nimblefix/advanced/typed_message_view.h"
 #include "nimblefix/profile/normalized_dictionary.h"
 #include "nimblefix/store/session_store.h"
 

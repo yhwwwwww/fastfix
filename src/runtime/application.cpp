@@ -1,4 +1,4 @@
-#include "nimblefix/runtime/application.h"
+#include "nimblefix/advanced/runtime_application.h"
 
 #include <atomic>
 #include <limits>
@@ -93,7 +93,7 @@ ApplicationCallbacks::OnAppMessage(const RuntimeEvent& event) -> base::Status
 auto
 EchoApplication::OnAppMessage(const RuntimeEvent& event) -> base::Status
 {
-  return event.handle.SendInlineBorrowed(event.message_view());
+  return event.handle.Send(message::MessageRef::Borrow(event.message_view()));
 }
 
 struct QueueApplication::Impl

@@ -116,7 +116,7 @@ local function enqueue_fix44_assets(batchcmds)
     local fix44_xml = path.join(quickfix_root, "spec", "FIX44.xml")
     local fix44_nfd = path.join("build", "bench", "quickfix_FIX44.nfd")
     local fix44_nfa = path.join("build", "bench", "quickfix_FIX44.nfa")
-    local fix44_builders = path.join("build", "generated", "fix44_builders.h")
+    local fix44_api = path.join("build", "generated", "fix44_api.h")
 
     if not os.isfile(xml2nfd_bin) then
         xmake_raise("missing build tool: %s", xml2nfd_bin)
@@ -141,12 +141,12 @@ local function enqueue_fix44_assets(batchcmds)
         })
     end
 
-    if needs_fix44_nfd or any_output_is_stale({fix44_nfa, fix44_builders}, {fix44_nfd, dictgen_bin}) then
-        batchcmds_show(batchcmds, "[nimblefix] regenerating %s and %s", fix44_nfa, fix44_builders)
+    if needs_fix44_nfd or any_output_is_stale({fix44_nfa, fix44_api}, {fix44_nfd, dictgen_bin}) then
+        batchcmds_show(batchcmds, "[nimblefix] regenerating %s and %s", fix44_nfa, fix44_api)
         batchcmds:vrunv(dictgen_bin, {
             "--input", fix44_nfd,
             "--output", fix44_nfa,
-            "--cpp-builders", fix44_builders
+            "--cpp-api", fix44_api
         })
     end
 end
@@ -205,7 +205,7 @@ local function enqueue_sample_assets(batchcmds)
     local sample_profile = path.join("samples", "basic_profile.nfd")
     local sample_overlay = path.join("samples", "basic_overlay.nfd")
     local sample_nfa = path.join("build", "sample-basic.nfa")
-    local sample_builders = path.join("build", "generated", "sample_basic_builders.h")
+    local sample_api = path.join("build", "generated", "sample_basic_api.h")
 
     if not os.isfile(dictgen_bin) then
         xmake_raise("missing build tool: %s", dictgen_bin)
@@ -220,13 +220,13 @@ local function enqueue_sample_assets(batchcmds)
     batchcmds:mkdir("build")
     batchcmds:mkdir(path.join("build", "generated"))
 
-    if any_output_is_stale({sample_nfa, sample_builders}, {sample_profile, sample_overlay, dictgen_bin}) then
-        batchcmds_show(batchcmds, "[nimblefix] regenerating %s and %s", sample_nfa, sample_builders)
+    if any_output_is_stale({sample_nfa, sample_api}, {sample_profile, sample_overlay, dictgen_bin}) then
+        batchcmds_show(batchcmds, "[nimblefix] regenerating %s and %s", sample_nfa, sample_api)
         batchcmds:vrunv(dictgen_bin, {
             "--input", sample_profile,
             "--merge", sample_overlay,
             "--output", sample_nfa,
-            "--cpp-builders", sample_builders
+            "--cpp-api", sample_api
         })
     end
 end

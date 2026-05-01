@@ -6,7 +6,7 @@
 
 #include "nimblefix/base/result.h"
 #include "nimblefix/base/status.h"
-#include "nimblefix/session/session_handle.h"
+#include "nimblefix/advanced/session_handle.h"
 #include "nimblefix/session/session_key.h"
 #include "nimblefix/session/session_snapshot.h"
 #include "nimblefix/session/transport_profile.h"

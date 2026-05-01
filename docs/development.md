@@ -212,7 +212,7 @@ auto EncodeFixFrame(std::string_view body_fields,
 
 ### Generated Test Fixtures
 
-`tests/generated/sample_basic_builders_fixture.h` — auto-generated from the sample profile. Provides profile constants (profile ID, schema hash) for test usage.
+`tests/generated/sample_basic_api_fixture.h` — auto-generated from the sample profile. Re-exports the generated profile API for test usage.
 
 ---
 
@@ -331,7 +331,7 @@ $BIN_DIR/nimblefix-dictgen \
     --input samples/basic_profile.nfd \
     --merge samples/basic_overlay.nfd \
     --output build/sample-basic.nfa \
-    --cpp-builders build/generated/sample_basic_builders.h
+    --cpp-api build/generated/sample_basic_api.h
 ```
 
 **Flags:**
@@ -341,7 +341,7 @@ $BIN_DIR/nimblefix-dictgen \
 | `--input` | yes | Base dictionary file (`.nfd`) |
 | `--merge` | no | Additional `.nfd` file(s) to merge, can specify multiple (also accepts `--overlay` for backwards compatibility) |
 | `--output` | yes | Output artifact path (`.nfa`) |
-| `--cpp-builders` | no | Generate C++ header with typed writer classes and profile constants |
+| `--cpp-api` | no | Generate C++ header with the generated typed API |
 
 **Note:** `.nfa` precompilation is optional. The Engine can load `.nfd` files directly at runtime via the `dictionary=` config line or `config.profile_dictionaries`.
 
@@ -371,11 +371,11 @@ Use `--contract <file> --dump`, `--markdown <file>`, or `--interop-dir <dir>` to
 1. Obtain the QuickFIX XML data dictionary for your FIX version (e.g. `FIX44.xml` from the [QuickFIX repository](https://github.com/quickfix/quickfix/tree/master/spec)).
 2. Convert it to `.nfd` format:
    ```bash
-    $BIN_DIR/nimblefix-xml2nfd \
-       --xml FIX44.xml \
-       --output my_fix44.nfd \
-       --profile-id 1001 \
-       --cpp-builders generated_builders.h
+     $BIN_DIR/nimblefix-xml2nfd \
+        --xml FIX44.xml \
+        --output my_fix44.nfd \
+        --profile-id 1001 \
+        --cpp-api generated_api.h
    ```
 3. (Optional) Write additional `.nfd` files for venue-specific custom fields and pass them with `--merge`.
 4. Compile with `nimblefix-dictgen`.
@@ -385,27 +385,26 @@ You can also write `.nfd` files by hand for full control.
 
 ### Generated Profile Header
 
-The `--cpp-builders` flag produces a header with typed writer classes and profile constants:
+The `--cpp-api` flag produces a header with generated outbound message objects, inbound typed views, handler/dispatcher types, and profile constants:
 
 ```cpp
-#include "build/generated/sample_basic_builders.h"
+#include "build/generated/sample_basic_api.h"
 
 using namespace nimble::generated::profile_1001;
 
-// Build a FixedLayout for the message type, then use the generated writer.
-auto layout = message::FixedLayout::Build(dictionary_view, NewOrderSingleWriter::kMsgType);
-NewOrderSingleWriter writer(layout.value());
-writer.bind_session("FIX.4.4", "SENDER", "TARGET");
+NewOrderSingle order;
+order.venue_order_type("LIT")
+     .venue_account("ACC-1");
+order.add_party()
+     .party_id("PTY1")
+     .party_id_source(PartyIdSource::Proprietary)
+     .party_role(PartyRole::ExecutingFirm);
 
-// Hot loop — clear + fill + encode.
-writer.clear();
-writer.set_venue_order_type("LIT")
-      .set_venue_account("ACC-1");
-writer.add_parties()
-      .set_party_id("PTY1")
-      .set_party_id_source('D')
-      .set_party_role(1);
-writer.encode_to_buffer(dictionary_view, options, &buf);
+auto message = order.ToMessage();
+if (!message.ok()) {
+  return message.status();
+}
+auto status = codec::EncodeFixMessageToBuffer(message.value(), dictionary_view, options, &buf);
 ```
 
 ---
@@ -605,7 +604,7 @@ counterparty|name|session_id|profile_id|begin_string|sender|target|store_mode|st
 
 `dispatch_mode` is per-counterparty (`inline` or `queue`). `engine.queue_app_mode` is engine-wide (`co-scheduled` or `threaded`) and only affects counterparties that use queue dispatch. When every counterparty uses `inline`, `engine.queue_app_mode` has no effect.
 
-`SessionHandle::Snapshot()` / `Subscribe()` may be called from any thread. `SessionHandle::SendCopy()` / `SendTake()` / `SendEncodedCopy()` / `SendEncodedTake()` use a single-producer SPSC command queue per worker, so one producer thread must own a given handle's send path; a second producer thread will now get `kInvalidArgument`. `SendInlineBorrowed()` / `SendEncodedInlineBorrowed()` are narrower still: they are only valid inside inline runtime callbacks where the borrowed message/view lifetime is tied to the callback scope.
+`SessionHandle::Snapshot()` / `Subscribe()` may be called from any thread. `SessionHandle::Send(message::MessageRef::Copy/Take(...))` and `SendEncoded(EncodedApplicationMessageRef::Take(...))` use a single-producer SPSC command queue per worker, so one producer thread must own a given handle's send path; a second producer thread will now get `kInvalidArgument`. Borrowed `Send(...)` / `SendEncoded(...)` are narrower still: they are only valid inside inline runtime callbacks where the borrowed message/view lifetime is tied to the callback scope.
 
 Ready-to-run examples live in:
 

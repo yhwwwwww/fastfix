@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "nimblefix/base/spsc_queue.h"
+#include "nimblefix/advanced/engine.h"
 #include "nimblefix/codec/fix_tags.h"
 #include "nimblefix/runtime/live_runtime_support.h"
 #include "nimblefix/store/durable_batch_store.h"
@@ -578,7 +579,7 @@ LiveSessionWorker::PollManagedApplicationWorker(std::uint32_t worker_id) -> base
   if (engine_ == nullptr || !options_.managed_queue_runner.has_value()) {
     return base::Status::Ok();
   }
-  auto drained = engine_->PollManagedQueueWorkerOnce(this, worker_id);
+  auto drained = PollManagedQueueWorkerOnce(*engine_, this, worker_id);
   if (!drained.ok()) {
     return drained.status();
   }
@@ -696,7 +697,8 @@ LiveSessionWorker::EnsureManagedQueueRunnerStarted() -> base::Status
   if (engine_ == nullptr) {
     return base::Status::InvalidArgument("live session worker requires a booted engine");
   }
-  return engine_->EnsureManagedQueueRunnerStarted(this, options_.application.get(), &options_.managed_queue_runner);
+  return ::nimble::runtime::EnsureManagedQueueRunnerStarted(
+    *engine_, this, options_.application.get(), &options_.managed_queue_runner);
 }
 
 auto
@@ -705,7 +707,7 @@ LiveSessionWorker::StopManagedQueueRunner() -> base::Status
   if (!options_.managed_queue_runner.has_value() || engine_ == nullptr) {
     return base::Status::Ok();
   }
-  return engine_->StopManagedQueueRunner(this);
+  return ::nimble::runtime::StopManagedQueueRunner(*engine_, this);
 }
 
 auto

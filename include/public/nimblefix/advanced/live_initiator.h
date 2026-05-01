@@ -13,7 +13,7 @@
 #include "nimblefix/base/result.h" // IWYU pragma: keep
 #include "nimblefix/base/status.h"
 #include "nimblefix/profile/normalized_dictionary.h" // IWYU pragma: keep
-#include "nimblefix/runtime/application.h"
+#include "nimblefix/advanced/runtime_application.h"
 #include "nimblefix/runtime/config.h" // IWYU pragma: keep
 
 namespace nimble::codec {
@@ -45,20 +45,33 @@ class SessionStore;
 
 namespace nimble::runtime {
 
+// Advanced untyped initiator runtime.
+//
+// Prefer runtime::Initiator<Profile> for generated-first business flows. Use
+// LiveInitiator directly when you intentionally need the untyped callback
+// surface or other lower-level runtime control.
+//
 // Minimal initiator bring-up:
 //
 //   auto app = std::make_shared<MyApp>();
 //   EngineConfig config;
 //   config.profile_artifacts.push_back("fix44.nfa");
 //   config.counterparties.push_back(
-//     CounterpartyConfigBuilder::Initiator(
-//       "buy-side",
-//       1001U,
-//       session::SessionKey{ .sender_comp_id = "BUY1", .target_comp_id = "SELL1" },
-//       4400U,
-//       session::TransportVersion::kFix44)
-//       .reconnect()
-//       .build());
+//     CounterpartyConfig{
+//       .name = "buy-side",
+//       .session = {
+//         .session_id = 1001U,
+//         .key = session::SessionKey::ForInitiator("BUY1", "SELL1"),
+//         .profile_id = 4400U,
+//         .heartbeat_interval_seconds = 30U,
+//         .is_initiator = true,
+//       },
+//       .transport_profile = session::TransportSessionProfile::Fix44(),
+//       .reconnect_enabled = true,
+//       .reconnect_initial_ms = kDefaultReconnectInitialMs,
+//       .reconnect_max_ms = kDefaultReconnectMaxMs,
+//       .reconnect_max_retries = kUnlimitedReconnectRetries,
+//     });
 //
 //   Engine engine;
 //   auto status = engine.Boot(config);

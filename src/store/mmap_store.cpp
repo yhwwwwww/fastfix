@@ -1,5 +1,6 @@
 #include "nimblefix/store/mmap_store.h"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstring>
@@ -613,6 +614,72 @@ MmapSessionStore::LoadOutboundRangeViews(std::uint64_t session_id, std::uint32_t
     });
   }
 
+  return records;
+}
+
+auto
+MmapSessionStore::LoadInboundRange(std::uint64_t session_id, std::uint32_t begin_seq, std::uint32_t end_seq) const
+  -> base::Result<std::vector<MessageRecord>>
+{
+  if (begin_seq == 0 || end_seq == 0 || begin_seq > end_seq) {
+    return base::Status::InvalidArgument("invalid inbound load range");
+  }
+
+  auto status = const_cast<MmapSessionStore*>(this)->EnsureMapping();
+  if (!status.ok()) {
+    return status;
+  }
+
+  std::vector<MessageRecord> records;
+  const auto scan_end = std::min<std::uint64_t>(Header(*impl_->mapping)->file_size, impl_->mapping->size);
+  std::uint64_t offset = kStoreFileHeaderSize;
+  while (offset < scan_end) {
+    if (offset + kStoreRecordHeaderSize > scan_end) {
+      return base::Status::FormatError("mmap store contains a truncated record header");
+    }
+
+    const auto* header = RecordAt(*impl_->mapping, offset);
+    if (header->header_size != kStoreRecordHeaderSize) {
+      return base::Status::FormatError("mmap store contains a record with an unexpected header size");
+    }
+    if (header->body_start_offset > header->payload_size) {
+      return base::Status::FormatError("mmap store contains an invalid body_start_offset");
+    }
+
+    const auto record_end = offset + kStoreRecordHeaderSize + header->payload_size;
+    if (record_end > scan_end) {
+      return base::Status::FormatError("mmap store contains a truncated record payload");
+    }
+
+    switch (static_cast<StoreRecordType>(header->record_type)) {
+      case StoreRecordType::kInbound:
+        if (header->session_id == session_id && header->seq_num >= begin_seq && header->seq_num <= end_seq) {
+          MessageRecord record;
+          record.session_id = header->session_id;
+          record.seq_num = header->seq_num;
+          record.timestamp_ns = header->timestamp_ns;
+          record.flags = header->flags;
+          record.body_start_offset = header->body_start_offset;
+          record.payload.resize(header->payload_size);
+          if (header->payload_size != 0U) {
+            std::memcpy(record.payload.data(), PayloadAt(*impl_->mapping, offset), header->payload_size);
+          }
+          records.push_back(std::move(record));
+        }
+        break;
+      case StoreRecordType::kOutbound:
+      case StoreRecordType::kRecoveryState:
+        break;
+      default:
+        return base::Status::FormatError("mmap store contains an unknown record type");
+    }
+
+    offset = record_end;
+  }
+
+  std::stable_sort(records.begin(), records.end(), [](const MessageRecord& lhs, const MessageRecord& rhs) {
+    return lhs.seq_num < rhs.seq_num;
+  });
   return records;
 }
 

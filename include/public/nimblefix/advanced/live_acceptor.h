@@ -13,7 +13,7 @@
 #include "nimblefix/base/result.h"
 #include "nimblefix/base/status.h"
 #include "nimblefix/profile/normalized_dictionary.h" // IWYU pragma: keep
-#include "nimblefix/runtime/application.h"
+#include "nimblefix/advanced/runtime_application.h"
 #include "nimblefix/runtime/config.h" // IWYU pragma: keep
 
 namespace nimble::codec {
@@ -45,22 +45,37 @@ class SessionStore;
 
 namespace nimble::runtime {
 
+// Advanced untyped acceptor runtime.
+//
+// Prefer runtime::Acceptor<Profile> for generated-first typed dispatch. Use
+// LiveAcceptor directly when you intentionally need the untyped callback
+// surface or lower-level listener/runtime control.
+//
 // Minimal acceptor bring-up:
 //
 //   auto app = std::make_shared<MyApp>();
 //   EngineConfig config;
 //   config.profile_artifacts.push_back("fix44.nfa");
 //   config.listeners.push_back(
-//     ListenerConfigBuilder::Named("main").bind("0.0.0.0", 9876).build());
+//     ListenerConfig{
+//       .name = "main",
+//       .host = "0.0.0.0",
+//       .port = 9876,
+//     });
 //   config.counterparties.push_back(
-//     CounterpartyConfigBuilder::Acceptor(
-//       "sell-side",
-//       2001U,
-//       session::SessionKey{ .sender_comp_id = "SELL1", .target_comp_id = "BUY1" },
-//       4400U,
-//       session::TransportVersion::kFix44)
-//       .store(StoreMode::kDurableBatch, "/var/lib/nimblefix/sell-side")
-//       .build());
+//     CounterpartyConfig{
+//       .name = "sell-side",
+//       .session = {
+//         .session_id = 2001U,
+//         .key = session::SessionKey::ForAcceptor("SELL1", "BUY1"),
+//         .profile_id = 4400U,
+//         .heartbeat_interval_seconds = 30U,
+//         .is_initiator = false,
+//       },
+//       .transport_profile = session::TransportSessionProfile::Fix44(),
+//       .store_mode = StoreMode::kDurableBatch,
+//       .store_path = "/var/lib/nimblefix/sell-side",
+//     });
 //
 //   Engine engine;
 //   auto status = engine.Boot(config);

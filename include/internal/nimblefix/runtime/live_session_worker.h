@@ -19,7 +19,7 @@
 #include "nimblefix/base/status.h"
 #include "nimblefix/message/message_ref.h"
 #include "nimblefix/profile/normalized_dictionary.h"
-#include "nimblefix/runtime/application.h"
+#include "nimblefix/advanced/runtime_application.h"
 #include "nimblefix/runtime/config.h"
 #include "nimblefix/runtime/engine.h"
 #include "nimblefix/runtime/live_session_registry.h"

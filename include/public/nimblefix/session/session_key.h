@@ -8,6 +8,28 @@ namespace nimble::session {
 
 struct SessionKey
 {
+  [[nodiscard]] static auto ForInitiator(std::string local_sender_comp_id,
+                                         std::string remote_target_comp_id,
+                                         std::string begin_string = "FIX.4.4") -> SessionKey
+  {
+    SessionKey key;
+    key.begin_string = std::move(begin_string);
+    key.sender_comp_id = std::move(local_sender_comp_id);
+    key.target_comp_id = std::move(remote_target_comp_id);
+    return key;
+  }
+
+  [[nodiscard]] static auto ForAcceptor(std::string local_sender_comp_id,
+                                        std::string remote_target_comp_id,
+                                        std::string begin_string = "FIX.4.4") -> SessionKey
+  {
+    SessionKey key;
+    key.begin_string = std::move(begin_string);
+    key.sender_comp_id = std::move(local_sender_comp_id);
+    key.target_comp_id = std::move(remote_target_comp_id);
+    return key;
+  }
+
   // Transport BeginString(8). For initiators this is the outbound value; for
   // acceptor matching and SessionFactory callbacks it is normalized to the
   // local engine's perspective.

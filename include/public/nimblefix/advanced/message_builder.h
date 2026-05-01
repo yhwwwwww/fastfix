@@ -21,7 +21,10 @@ class PrecompiledTemplateTable;
 
 namespace nimble::message {
 
-/// Mutable builder for one repeating-group entry.
+/// Advanced raw builder for one repeating-group entry.
+///
+/// Prefer generated group-entry APIs when a profile-specific generated message
+/// type is available.
 ///
 /// Design intent: let callers populate nested groups incrementally without
 /// exposing `MessageData` internals. The builder stores a stable path of group
@@ -29,8 +32,9 @@ namespace nimble::message {
 /// parent vectors reallocate.
 ///
 /// Performance: this is a convenience API. Field and group lookups are linear,
-/// and string setters copy into owned storage. For fixed-layout hot paths,
-/// prefer `FixedLayoutWriter`.
+/// and string setters copy into owned storage. For generated business flows,
+/// prefer generated message objects. For raw fixed-layout hot paths, prefer
+/// `FixedLayoutWriter`.
 ///
 /// Lifetime: the builder is valid only while the root `MessageBuilder` remains
 /// alive. It is not thread-safe.
@@ -126,7 +130,11 @@ private:
   std::vector<PathSegment> path_;
 };
 
-/// Convenience builder for one owned FIX application message.
+/// Advanced raw builder for one owned FIX application message.
+///
+/// Prefer generated outbound message objects from `--cpp-api` for normal
+/// profile-aware business code. Use `MessageBuilder` when the message shape is
+/// dynamic, schema-agnostic, or tooling-oriented.
 ///
 /// Design intent: make it easy to assemble a message in application code,
 /// queue payloads across threads, and hand the result to `SessionHandle` or
@@ -134,8 +142,8 @@ private:
 ///
 /// Performance: field/group upserts are linear scans and string setters copy
 /// into owned storage. `reset()` preserves capacity and group shells for reuse,
-/// which is efficient for medium-rate paths. For the tightest send loops with a
-/// stable schema, prefer `FixedLayoutWriter`.
+/// which is efficient for medium-rate paths. For raw hot loops with a stable
+/// schema, prefer `FixedLayoutWriter`.
 ///
 /// Lifetime: `view()` and any `GroupEntryBuilder` returned from this object
 /// borrow `data_` and become invalid after `build()` or destruction.

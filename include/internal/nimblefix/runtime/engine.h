@@ -14,7 +14,7 @@
 #include "nimblefix/base/status.h"
 #include "nimblefix/codec/fix_codec.h"
 #include "nimblefix/profile/normalized_dictionary.h"
-#include "nimblefix/runtime/application.h"
+#include "nimblefix/advanced/runtime_application.h"
 #include "nimblefix/runtime/config.h"
 #include "nimblefix/runtime/metrics.h"
 #include "nimblefix/runtime/profile_registry.h"

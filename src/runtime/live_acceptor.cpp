@@ -1,4 +1,4 @@
-#include "nimblefix/runtime/live_acceptor.h"
+#include "nimblefix/advanced/live_acceptor.h"
 
 #include <atomic>
 #include <cerrno>
@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "nimblefix/base/spsc_queue.h"
+#include "nimblefix/advanced/engine.h"
 #include "nimblefix/codec/fix_tags.h"
 #include "nimblefix/runtime/engine.h"
 #include "nimblefix/runtime/shard_poller.h"
@@ -528,7 +529,7 @@ LiveAcceptor::~LiveAcceptor()
 {
   Stop();
   if (impl_->engine != nullptr) {
-    static_cast<void>(impl_->engine->ReleaseManagedQueueRunner(this));
+    static_cast<void>(ReleaseManagedQueueRunner(*impl_->engine, this));
   }
 }
 
@@ -576,7 +577,8 @@ LiveAcceptor::EnsureManagedQueueRunnerStarted() -> base::Status
     return base::Status::InvalidArgument("live acceptor requires a booted engine");
   }
 
-  return engine_->EnsureManagedQueueRunnerStarted(this, options_.application.get(), &options_.managed_queue_runner);
+  return ::nimble::runtime::EnsureManagedQueueRunnerStarted(
+    *engine_, this, options_.application.get(), &options_.managed_queue_runner);
 }
 
 auto
@@ -585,7 +587,7 @@ LiveAcceptor::StopManagedQueueRunner() -> base::Status
   if (!options_.managed_queue_runner.has_value() || engine_ == nullptr) {
     return base::Status::Ok();
   }
-  return engine_->StopManagedQueueRunner(this);
+  return ::nimble::runtime::StopManagedQueueRunner(*engine_, this);
 }
 
 auto
@@ -2414,7 +2416,7 @@ LiveAcceptor::PollManagedApplicationWorker(std::uint32_t worker_id) -> base::Sta
     return base::Status::Ok();
   }
 
-  auto drained = engine_->PollManagedQueueWorkerOnce(this, worker_id);
+  auto drained = PollManagedQueueWorkerOnce(*engine_, this, worker_id);
   if (!drained.ok()) {
     return drained.status();
   }

@@ -9,19 +9,22 @@ External applications should add only `include/public/` to the include path.
 
 ## First Includes
 
-Most applications start with these headers:
+The main application path is generated-first:
 
-- `nimblefix/runtime/application.h`
+- your generated profile header such as `fix44_api.h`
 - `nimblefix/runtime/config.h`
 - `nimblefix/runtime/engine.h`
-- `nimblefix/runtime/live_initiator.h`
-- `nimblefix/runtime/live_acceptor.h`
+- `nimblefix/runtime/profile_binding.h`
+- `nimblefix/runtime/initiator.h` or `nimblefix/runtime/acceptor.h`
 
 Bring in these additional headers only when you need them:
 
-- `nimblefix/session/session_handle.h`
+- `nimblefix/runtime/application.h`
+- `nimblefix/advanced/runtime_application.h`
+- `nimblefix/advanced/engine.h`
+- `nimblefix/advanced/session_handle.h`
 - `nimblefix/session/session_send_envelope.h`
-- `nimblefix/message/message_builder.h`
+- `nimblefix/advanced/message_builder.h`
 - `nimblefix/message/message_view.h`
 - `nimblefix/profile/profile_loader.h`
 - `nimblefix/store/memory_store.h`
@@ -32,74 +35,88 @@ Bring in these additional headers only when you need them:
 
 `Engine::Boot()` is the normal entry point. It validates `EngineConfig`, loads profiles from `profile_artifacts` and `profile_dictionaries`, optionally loads matching contract sidecars from `profile_contracts`, registers static counterparties, and makes `config()`, `profiles()`, `runtime()`, `FindCounterpartyConfig()`, and `FindListenerConfig()` available on success.
 
-`Engine::LoadProfiles()` exists for tooling and tests that need profile loading without a booted runtime. Typical applications do not need to call it directly because `Boot()` already does.
+`Engine::LoadProfiles()` exists for tooling and tests that need profile loading without a booted runtime. Typed `Engine::Bind<Profile>()` works after either `LoadProfiles()` or `Boot()`, but normal applications should still prefer `Boot()`.
 
 The expected startup order is:
 
 1. Fill `EngineConfig`.
 2. Call `ValidateEngineConfig()` if you want an explicit preflight step.
 3. Call `Engine::Boot()`.
-4. Construct `LiveInitiator` or `LiveAcceptor` with the booted `Engine`.
-5. Open sessions or listeners.
-6. Call `Run()`.
+4. Call `engine.Bind<GeneratedProfile>()`.
+5. Construct typed `runtime::Initiator<Profile>` or `runtime::Acceptor<Profile>`.
+6. Open sessions or listeners.
+7. Call `Run()`.
 
 ## Minimal Initiator Walkthrough
 
-This is the shortest normal path from config to a running initiator:
+This is the shortest normal path from config to a running initiator on the typed generated API:
 
 ```cpp
-#include "nimblefix/codec/fix_tags.h"
-#include "nimblefix/message/message_builder.h"
-#include "nimblefix/runtime/application.h"
+#include "fix44_api.h"
 #include "nimblefix/runtime/config.h"
 #include "nimblefix/runtime/engine.h"
-#include "nimblefix/runtime/live_initiator.h"
+#include "nimblefix/runtime/initiator.h"
+#include "nimblefix/runtime/profile_binding.h"
 
-class BuySideApp final : public nimble::runtime::ApplicationCallbacks {
+class BuySideApp final : public nimble::generated::profile_4400::Handler {
 public:
-	auto OnSessionEvent(const nimble::runtime::RuntimeEvent& event) -> nimble::base::Status override {
-		if (event.session_event != nimble::runtime::SessionEventKind::kActive) {
-			return nimble::base::Status::Ok();
-		}
+  auto OnSessionActive(nimble::runtime::Session<Profile>& session) -> nimble::base::Status override {
+    NewOrderSingle order;
+    order.cl_ord_id("ORD-001")
+      .symbol("AAPL")
+      .side(Side::Buy)
+      .transact_time("20260429-09:30:00.000")
+      .order_qty(100)
+      .ord_type(OrdType::Limit)
+      .price(150.25);
+    return session.send(std::move(order));
+  }
 
-		auto startup_probe = nimble::message::MessageBuilder{nimble::codec::msg_types::kTestRequest}
-										 .set_string(nimble::codec::tags::kTestReqID, "startup-probe")
-										 .build();
-		return event.handle.SendTake(std::move(startup_probe));
-	}
+  auto OnExecutionReport(nimble::runtime::InlineSession<Profile>&,
+                         ExecutionReportView exec) -> nimble::base::Status override {
+    auto exec_id = exec.exec_id_raw();
+    auto ord_status = exec.ord_status();
+    (void)exec_id;
+    (void)ord_status;
+    return nimble::base::Status::Ok();
+  }
 };
 
 nimble::runtime::EngineConfig config;
 config.profile_artifacts.push_back("fix44.nfa");
-config.profile_contracts.push_back("fix44-contract.nfct");
-config.counterparties.push_back(
-	nimble::runtime::CounterpartyConfigBuilder::Initiator(
-		"buy-side",
-		1001U,
-		nimble::session::SessionKey{ .sender_comp_id = "BUY1", .target_comp_id = "SELL1" },
-		4400U,
-		nimble::session::TransportVersion::kFix44)
-		.contract_service_subsets({"order-entry"})
-		.reconnect()
-		.build());
-
-auto validation = nimble::runtime::ValidateEngineConfig(config);
-if (!validation.ok()) {
-	return validation;
-}
+config.counterparties.push_back(nimble::runtime::CounterpartyConfig{
+  .name = "buy-side",
+  .session = {
+    .session_id = 1001U,
+    .key = nimble::session::SessionKey::ForInitiator("BUY1", "SELL1"),
+    .profile_id = Profile::kProfileId,
+    .heartbeat_interval_seconds = 30U,
+    .is_initiator = true,
+  },
+  .transport_profile = nimble::session::TransportSessionProfile::Fix44(),
+  .reconnect_enabled = true,
+  .reconnect_initial_ms = nimble::runtime::kDefaultReconnectInitialMs,
+  .reconnect_max_ms = nimble::runtime::kDefaultReconnectMaxMs,
+  .reconnect_max_retries = nimble::runtime::kUnlimitedReconnectRetries,
+});
 
 nimble::runtime::Engine engine;
 auto boot = engine.Boot(config);
 if (!boot.ok()) {
-	return boot;
+  return boot;
+}
+
+auto binding = engine.Bind<Profile>();
+if (!binding.ok()) {
+  return binding.status();
 }
 
 auto app = std::make_shared<BuySideApp>();
-nimble::runtime::LiveInitiator initiator(&engine, { .application = app });
+nimble::runtime::Initiator<Profile> initiator(&engine, &binding.value(), { .application = app });
 
 auto open = initiator.OpenSession(1001U, "127.0.0.1", 9876);
 if (!open.ok()) {
-	return open;
+  return open;
 }
 
 return initiator.Run();
@@ -107,28 +124,118 @@ return initiator.Run();
 
 Notes:
 
+- `Engine::Bind<Profile>()` validates both `profile_id` and `schema_hash` against the loaded artifact.
+- `runtime::Session<Profile>` is the ordinary-thread send surface.
+- `runtime::InlineSession<Profile>` is the inline callback surface for typed inbound dispatch.
 - `OpenSession()` may block until the TCP dial succeeds or times out.
 - `OpenSessionAsync()` defers the dial onto the runtime worker loop if the caller cannot block.
-- `SessionKey` is always written from the local engine's perspective. For initiators, `sender_comp_id` is your local `49` and `target_comp_id` is the remote `56`.
-- `profile_contracts` is optional. Use it only for Orchestra-derived `.nfct` sidecars; `.nfa` remains the structural dictionary artifact and `.nfct` remains cold-path behavior metadata.
-- `contract_service_subsets` is also optional. If you set it, the named subsets must exist in the loaded contract sidecar for the selected `profile_id`.
-- `nimblefix/codec/fix_tags.h` exposes named FIX tag constants and common `MsgType` constants; public examples should prefer those names over raw values such as `35`, `112`, or `"1"`.
 
-## Session Events And Send Boundaries
+## Typed Session Boundaries
 
-`ApplicationCallbacks` uses three session lifecycle events:
+The generated-first runtime surface expresses send context with types:
 
-- `kBound`: Logon matched and the session is attached to a runtime worker, but replay or recovery may still be in progress.
-- `kActive`: Recovery is complete and business traffic may start.
-- `kClosed`: Transport is closed. Do not send from this event.
+- `runtime::Session<Profile>`: ordinary application-thread handle, owning send only.
+- `runtime::InlineSession<Profile>`: direct runtime callback handle for typed inbound dispatch.
 
-For first-time integrations, treat `kActive` as the safe point to send the first application message.
+For first-time integrations, treat `OnSessionActive()` as the safe point to send the first application message.
 
-Send API rules:
+Managed queue-runner control is also an advanced surface: include `nimblefix/advanced/engine.h` when untyped live runtimes or tests need `EnsureManagedQueueRunnerStarted(...)`, `StopManagedQueueRunner(...)`, `ReleaseManagedQueueRunner(...)`, or `PollManagedQueueWorkerOnce(...)`.
 
-- `SessionHandle::SendCopy()` / `SendTake()` / encoded owned variants use the session command queue and require a single producer thread per handle.
-- `SessionHandle::SendInlineBorrowed()` / encoded inline-borrowed variants are valid only from direct runtime inline callbacks such as `OnSessionEvent`, `OnAdminMessage`, and `OnAppMessage`.
+Advanced/raw send rules still matter only when you intentionally drop below the typed runtime surface:
+
+- `SessionHandle::Send(message::MessageRef::Copy/Take(...))` and `SendEncoded(EncodedApplicationMessageRef::Take(...))` use the session command queue and require a single producer thread per handle.
+- Borrowed `SessionHandle::Send(...)` / `SendEncoded(...)` variants remain advanced APIs; the typed surface intentionally does not expose them as the main business send contract.
 - Queue-drained application threads must use owned send variants, not inline-borrowed sends.
+
+## Minimal Acceptor Walkthrough
+
+```cpp
+#include "fix44_api.h"
+#include "nimblefix/runtime/config.h"
+#include "nimblefix/runtime/acceptor.h"
+#include "nimblefix/runtime/engine.h"
+#include "nimblefix/runtime/profile_binding.h"
+
+class SellSideApp final : public nimble::generated::profile_4400::Handler {
+public:
+  auto OnNewOrderSingle(nimble::runtime::InlineSession<Profile>& session,
+                        NewOrderSingleView order) -> nimble::base::Status override {
+    ExecutionReport report;
+    report.order_id("ORD-001")
+      .exec_id("EXEC-001")
+      .exec_type(ExecType::New)
+      .ord_status(OrdStatus::New)
+      .side(order.side().value())
+      .leaves_qty(order.order_qty().value_or(0))
+      .cum_qty(0)
+      .avg_px(0.0);
+    if (auto cl_ord_id = order.cl_ord_id(); cl_ord_id.has_value()) {
+      report.cl_ord_id(*cl_ord_id);
+    }
+    if (auto symbol = order.symbol(); symbol.has_value()) {
+      report.symbol(*symbol);
+    }
+    return session.send(std::move(report));
+  }
+};
+
+nimble::runtime::EngineConfig config;
+config.profile_artifacts.push_back("fix44.nfa");
+config.listeners.push_back(nimble::runtime::ListenerConfig{
+  .name = "main",
+  .host = "0.0.0.0",
+  .port = 9876,
+});
+config.counterparties.push_back(nimble::runtime::CounterpartyConfig{
+  .name = "sell-side",
+  .session = {
+    .session_id = 2001U,
+    .key = nimble::session::SessionKey::ForAcceptor("SELL1", "BUY1"),
+    .profile_id = Profile::kProfileId,
+    .heartbeat_interval_seconds = 30U,
+    .is_initiator = false,
+  },
+  .transport_profile = nimble::session::TransportSessionProfile::Fix44(),
+});
+
+nimble::runtime::Engine engine;
+auto boot = engine.Boot(config);
+if (!boot.ok()) {
+  return boot;
+}
+
+auto binding = engine.Bind<Profile>();
+if (!binding.ok()) {
+  return binding.status();
+}
+
+auto app = std::make_shared<SellSideApp>();
+nimble::runtime::Acceptor<Profile> acceptor(&engine, &binding.value(), { .application = app });
+
+auto open = acceptor.OpenListeners("main");
+if (!open.ok()) {
+  return open;
+}
+
+return acceptor.Run();
+```
+
+## Dynamic Acceptor Walkthrough
+
+Unknown inbound Logons are not dynamic by default. The rules are:
+
+- `accept_unknown_sessions = false`: unknown Logons are rejected and `SessionFactory` is ignored.
+- `accept_unknown_sessions = true` and no factory installed: unknown Logons are still rejected.
+- `accept_unknown_sessions = true` and a factory installed: static counterparties match first, then the factory is called for unknown Logons.
+
+Dynamic onboarding contract:
+
+- The factory input `SessionKey` is normalized to the local engine's perspective.
+- `key.sender_comp_id` is the local acceptor CompID from inbound `TargetCompID(56)`.
+- `key.target_comp_id` is the remote initiator CompID from inbound `SenderCompID(49)`.
+- `listener` name, local port, and remote address are not part of the callback.
+- Returning `session.session_id == 0` asks `Engine` to auto-assign a dynamic id from `kFirstDynamicSessionId` upward.
+- `WhitelistSessionFactory::Allow(begin_string, local_sender_comp_id, template)` matches the same local-perspective key.
 
 ## Minimum Required Config
 
@@ -139,7 +246,7 @@ For a static initiator counterparty, the minimum meaningful fields are:
 - `session.key.sender_comp_id`
 - `session.key.target_comp_id`
 - `session.profile_id`
-- `transport_profile` / builder transport version
+- `transport_profile`
 - `session.is_initiator = true`
 
 For a static acceptor counterparty, the minimum meaningful fields are:
@@ -156,187 +263,7 @@ Additional conditional requirements:
 - FIXT.1.1 sessions require `default_appl_ver_id`.
 - `StoreMode::kMmap` and `StoreMode::kDurableBatch` require `store_path`.
 - `RecoveryMode::kWarmRestart` requires a persistent store mode.
-- `EngineConfig::listeners` is required before `LiveAcceptor::OpenListeners()`.
-
-`CounterpartyConfigBuilder` and `ListenerConfigBuilder` exist to reduce boilerplate for the common cases above.
-
-## Orchestra Contract Sidecars
-
-When you import FIX Orchestra, keep the layering explicit:
-
-- `.nfa` or `.nfd` still define only structure: fields, messages, groups, and validation tables used by the codec.
-- `.nfct` sidecars define only behavior: conditional field rules, enum/code constraints, role-direction restrictions, service subsets, flow edges, and importer warnings.
-- `EngineConfig::profile_contracts` loads sidecars on cold paths.
-- `CounterpartyConfig::contract_service_subsets` selects which sidecar service subsets apply to one deployed session.
-
-Unsupported Orchestra semantics are surfaced as importer warnings and contract introspection output. NimbleFIX does not parse Orchestra XML or interpret unsupported rules on the steady-state per-message hot path.
-
-## Optional TLS Transport
-
-TLS support has two separate switches:
-
-- Build support: compile with `NIMBLEFIX_ENABLE_TLS=ON` in CMake or `--nimblefix_enable_tls=true` in xmake. This links OpenSSL and makes TLS code available.
-- Runtime enablement: set `TlsClientConfig::enabled` or `TlsServerConfig::enabled`. Leaving those flags false keeps the connection on plain TCP even in a TLS-capable binary.
-
-If the binary was built without TLS support, `ValidateEngineConfig()` rejects any runtime config with `enabled=true`, and direct TLS connection creation returns a clear error. It never silently falls back to plain TCP.
-
-Initiator TLS is configured on the counterparty:
-
-```cpp
-nimble::runtime::TlsClientConfig tls;
-tls.enabled = true;
-tls.server_name = "fix.example.com";       // SNI
-tls.expected_peer_name = "fix.example.com";
-tls.ca_file = "/etc/nimblefix/ca.pem";
-tls.min_version = nimble::runtime::TlsProtocolVersion::kTls12;
-
-config.counterparties.push_back(
-	nimble::runtime::CounterpartyConfigBuilder::Initiator(
-		"buy-side-tls",
-		1001U,
-		nimble::session::SessionKey{ .sender_comp_id = "BUY1", .target_comp_id = "SELL1" },
-		4400U)
-		.tls_client(std::move(tls))
-		.build());
-```
-
-Acceptor TLS is configured on the listener because TLS is negotiated before FIX Logon identifies a session:
-
-```cpp
-nimble::runtime::TlsServerConfig tls;
-tls.enabled = true;
-tls.certificate_chain_file = "/etc/nimblefix/server-chain.pem";
-tls.private_key_file = "/etc/nimblefix/server-key.pem";
-tls.ca_file = "/etc/nimblefix/client-ca.pem";       // Required for mTLS verification.
-tls.verify_peer = true;
-tls.require_client_certificate = true;
-
-config.listeners.push_back(
-	nimble::runtime::ListenerConfigBuilder::Named("tls-main")
-		.bind("0.0.0.0", 9877)
-		.tls_server(std::move(tls))
-		.build());
-```
-
-For acceptor sessions, `CounterpartyConfig::acceptor_transport_security` can require a session to bind only over TLS or only over plain TCP. The runtime checks this against the actual accepted connection after Logon matching:
-
-```cpp
-config.counterparties.push_back(
-	nimble::runtime::CounterpartyConfigBuilder::Acceptor(
-		"sell-side-sensitive",
-		2001U,
-		nimble::session::SessionKey{ .sender_comp_id = "SELL1", .target_comp_id = "BUY1" },
-		4400U)
-		.acceptor_transport_security(nimble::runtime::TransportSecurityRequirement::kTlsOnly)
-		.build());
-```
-
-TLS does not participate in `SessionKey`, worker routing, store keys, FIX sequence numbers, or profile selection. `verify_peer=false` is available for controlled test environments, but production configurations should keep peer verification enabled and provide CA material.
-
-## Minimal Static Acceptor Walkthrough
-
-```cpp
-#include "nimblefix/runtime/application.h"
-#include "nimblefix/runtime/config.h"
-#include "nimblefix/runtime/engine.h"
-#include "nimblefix/runtime/live_acceptor.h"
-
-class SellSideApp final : public nimble::runtime::ApplicationCallbacks {
-public:
-	auto OnSessionEvent(const nimble::runtime::RuntimeEvent& event) -> nimble::base::Status override {
-		if (event.session_event == nimble::runtime::SessionEventKind::kActive) {
-			// Session is live; start any business-level initialization here.
-		}
-		return nimble::base::Status::Ok();
-	}
-};
-
-nimble::runtime::EngineConfig config;
-config.profile_artifacts.push_back("fix44.nfa");
-config.listeners.push_back(
-	nimble::runtime::ListenerConfigBuilder::Named("main").bind("0.0.0.0", 9876).build());
-config.counterparties.push_back(
-	nimble::runtime::CounterpartyConfigBuilder::Acceptor(
-		"sell-side",
-		2001U,
-		nimble::session::SessionKey{ .sender_comp_id = "SELL1", .target_comp_id = "BUY1" },
-		4400U,
-		nimble::session::TransportVersion::kFix44)
-		.store(nimble::runtime::StoreMode::kDurableBatch, "/var/lib/nimblefix/sell-side")
-		.build());
-
-nimble::runtime::Engine engine;
-auto boot = engine.Boot(config);
-if (!boot.ok()) {
-	return boot;
-}
-
-auto app = std::make_shared<SellSideApp>();
-nimble::runtime::LiveAcceptor acceptor(&engine, { .application = app });
-
-auto open = acceptor.OpenListeners("main");
-if (!open.ok()) {
-	return open;
-}
-
-return acceptor.Run();
-```
-
-## Dynamic Acceptor Walkthrough
-
-Unknown inbound Logons are not dynamic by default. The rules are:
-
-- `accept_unknown_sessions = false`: unknown Logons are rejected and `SessionFactory` is ignored.
-- `accept_unknown_sessions = true` and no factory installed: unknown Logons are still rejected.
-- `accept_unknown_sessions = true` and a factory installed: static counterparties match first, then the factory is called for unknown Logons.
-
-Example:
-
-```cpp
-nimble::runtime::EngineConfig config;
-config.profile_artifacts.push_back("fix44.nfa");
-config.listeners.push_back(
-	nimble::runtime::ListenerConfigBuilder::Named("main").bind("0.0.0.0", 9876).build());
-config.accept_unknown_sessions = true;
-
-nimble::runtime::Engine engine;
-auto boot = engine.Boot(config);
-if (!boot.ok()) {
-	return boot;
-}
-
-engine.SetSessionFactory(
-	[](const nimble::session::SessionKey& key) -> nimble::base::Result<nimble::runtime::CounterpartyConfig> {
-		return nimble::runtime::CounterpartyConfigBuilder::Acceptor(
-						 "dynamic-" + key.target_comp_id,
-						 0U,
-						 key,
-						 4400U,
-						 nimble::session::TransportVersion::kFix44)
-			.validation_policy(nimble::session::ValidationPolicy::Permissive())
-			.build();
-	});
-```
-
-Dynamic onboarding contract:
-
-- The factory input `SessionKey` is normalized to the local engine's perspective.
-- `key.sender_comp_id` is the local acceptor CompID from inbound `TargetCompID(56)`.
-- `key.target_comp_id` is the remote initiator CompID from inbound `SenderCompID(49)`.
-- `listener` name, local port, and remote address are not part of the callback.
-- Returning `session.session_id == 0` asks `Engine` to auto-assign a dynamic id from `kFirstDynamicSessionId` upward.
-- `WhitelistSessionFactory::Allow(begin_string, local_sender_comp_id, template)` matches the same local-perspective key.
-
-If you need routing decisions based on listener name, bound port, or remote address, the current public `SessionFactory` API does not expose that context. Use static counterparties or an external routing layer.
-
-## SessionSendEnvelope And Header Tags
-
-`SessionSendEnvelope` carries per-message session-managed header fields:
-
-- `sender_sub_id` -> `SenderSubID(50)`
-- `target_sub_id` -> `TargetSubID(57)`
-
-Use the envelope when those values belong in the FIX session header. Do not rely on message body fields to populate `50/57` in the session header path.
+- `EngineConfig::listeners` is required before `runtime::Acceptor<Profile>::OpenListeners()`.
 
 ## Support Headers
 
@@ -344,11 +271,17 @@ These headers remain public because public signatures depend on them or advanced
 
 - `nimblefix/base/result.h`
 - `nimblefix/base/status.h`
+- `nimblefix/runtime/application.h`
+- `nimblefix/advanced/runtime_application.h`
+- `nimblefix/runtime/acceptor.h`
+- `nimblefix/runtime/initiator.h`
 - `nimblefix/runtime/metrics.h`
 - `nimblefix/runtime/profile_registry.h`
+- `nimblefix/runtime/session.h`
+- `nimblefix/runtime/profile_binding.h`
 - `nimblefix/runtime/sharded_runtime.h`
 - `nimblefix/runtime/trace.h`
-- `nimblefix/session/encoded_application_message.h`
+- `nimblefix/advanced/encoded_application_message.h`
 - `nimblefix/session/session_snapshot.h`
 - `nimblefix/session/transport_profile.h`
 - `nimblefix/session/validation_policy.h`
@@ -357,10 +290,10 @@ Everything under `include/internal/nimblefix/` remains repository-private.
 
 ## Do Not Do This
 
-- Do not share one `SessionHandle` across multiple producer threads for sends. The runtime send path is single-producer.
-- Do not default to `SendInlineBorrowed()` unless you are in a direct runtime inline callback and the borrowed payload lifetime is unquestionably safe.
-- Do not assume `kBound` means the session is ready for business traffic. Wait for `kActive` unless you intentionally need pre-activation behavior.
+- Do not write new primary examples around `RuntimeEvent.message_view()` or `ApplicationCallbacks` when a generated typed handler is available.
+- Do not skip `Engine::Bind<Profile>()`; it is the schema-match guard between generated code and loaded runtime artifacts.
+- Do not share one `Session<Profile>` or raw `SessionHandle` send path across multiple producer threads. The runtime send path is single-producer.
+- Do not default to inline-borrowed raw send variants unless you are intentionally using the advanced low-level surface.
+- Do not assume `kBound` means the session is ready for business traffic. Wait for `OnSessionActive()` unless you intentionally need pre-activation behavior.
 - Do not call `Engine::LoadProfiles()` and then treat `Boot()` as a no-op. `Boot()` reloads profiles and resets runtime state.
 - Do not assume `accept_unknown_sessions = true` is enough by itself. Unknown Logons still need a `SessionFactory`.
-- Do not assume queue-decoupled handlers can use inline-borrowed sends. They cannot.
-- Do not assume multi-listener dynamic routing can branch on listener name or port from `SessionFactory`; that context is not exposed today.

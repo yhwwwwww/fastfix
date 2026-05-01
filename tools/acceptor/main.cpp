@@ -7,11 +7,11 @@
 #include <vector>
 
 #include "nimblefix/profile/profile_loader.h"
-#include "nimblefix/runtime/application.h"
+#include "nimblefix/advanced/runtime_application.h"
 #include "nimblefix/runtime/config.h"
 #include "nimblefix/runtime/engine.h"
 #include "nimblefix/runtime/internal_config_parser.h"
-#include "nimblefix/runtime/live_acceptor.h"
+#include "nimblefix/advanced/live_acceptor.h"
 
 namespace {
 
@@ -203,7 +203,7 @@ public:
     if (queue_sessions_.contains(event.handle.session_id())) {
       return queue_.OnAppMessage(event);
     }
-    return event.handle.SendInlineBorrowed(event.message_view());
+    return event.handle.Send(nimble::message::MessageRef::Borrow(event.message_view()));
   }
 
   auto queue_application() -> nimble::runtime::QueueApplication& override { return queue_; }
@@ -221,7 +221,7 @@ public:
     if (event.kind != nimble::runtime::RuntimeEventKind::kApplicationMessage) {
       return nimble::base::Status::Ok();
     }
-    return event.handle.SendInlineBorrowed(event.message_view());
+    return event.handle.Send(nimble::message::MessageRef::Borrow(event.message_view()));
   }
 };
 

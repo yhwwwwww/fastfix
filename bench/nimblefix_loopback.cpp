@@ -57,8 +57,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "fix44_api.h"
 #include "nimblefix/codec/fix_codec.h"
-#include "nimblefix/message/message_builder.h"
 #include "nimblefix/message/message_view.h"
 #include "nimblefix/profile/normalized_dictionary.h"
 #include "nimblefix/profile/profile_loader.h"
@@ -69,6 +69,8 @@
 #include "bench_support.h"
 
 namespace {
+
+namespace fix44 = nimble::generated::profile_4400;
 
 // ---------------------------------------------------------------------------
 // CPU affinity (best-effort)
@@ -170,6 +172,54 @@ NowNs() -> std::uint64_t
     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+auto
+GeneratedExecInst(char wire) -> fix44::ExecInst
+{
+  return fix44::TryParseExecInst(std::string_view(&wire, 1)).value_or(fix44::ExecInst::AllOrNone);
+}
+
+auto
+GeneratedHandlInst(char wire) -> fix44::HandlInst
+{
+  return fix44::TryParseHandlInst(wire).value_or(fix44::HandlInst::AutomatedExecutionNoIntervention);
+}
+
+auto
+GeneratedSecurityIdSource(char wire) -> fix44::SecurityIdSource
+{
+  return fix44::TryParseSecurityIdSource(std::string_view(&wire, 1)).value_or(fix44::SecurityIdSource::IsinNumber);
+}
+
+auto
+GeneratedOrdType(char wire) -> fix44::OrdType
+{
+  return fix44::TryParseOrdType(wire).value_or(fix44::OrdType::Limit);
+}
+
+auto
+GeneratedSide(char wire) -> fix44::Side
+{
+  return fix44::TryParseSide(wire).value_or(fix44::Side::Buy);
+}
+
+auto
+GeneratedTimeInForce(char wire) -> fix44::TimeInForce
+{
+  return fix44::TryParseTimeInForce(wire).value_or(fix44::TimeInForce::Day);
+}
+
+auto
+GeneratedPartyIdSource(char wire) -> fix44::PartyIdSource
+{
+  return fix44::TryParsePartyIdSource(wire).value_or(fix44::PartyIdSource::Proprietary);
+}
+
+auto
+GeneratedPartyRole(std::int64_t wire) -> fix44::PartyRole
+{
+  return fix44::TryParsePartyRole(wire).value_or(fix44::PartyRole::ClientId);
+}
+
 // ---------------------------------------------------------------------------
 // FIX message builders – application struct → FIX library message
 // ---------------------------------------------------------------------------
@@ -177,52 +227,49 @@ NowNs() -> std::uint64_t
 auto
 BuildNewOrder(const NewOrderFields& req) -> nimble::message::Message
 {
-  nimble::message::MessageBuilder b{ "D" };
-  b.reserve_fields(17U).reserve_groups(1U).reserve_group_entries(453U, 1U);
-  b.set(1U, req.account)
-    .set(11U, req.cl_ord_id)
-    .set(15U, req.currency)
-    .set(18U, req.exec_inst)
-    .set(21U, req.hand_l_inst)
-    .set(22U, req.security_id_source)
-    .set(38U, req.order_qty)
-    .set(40U, req.ord_type)
-    .set(44U, req.price)
-    .set(48U, req.security_id)
-    .set(54U, req.side)
-    .set(55U, req.symbol)
-    .set(59U, req.time_in_force)
-    .set(60U, req.transact_time)
-    .set(100U, req.ex_destination)
-    .set(207U, req.security_exchange);
-  b.add_group_entry(453U)
-    .set(448U, req.party_id)
-    .set(447U, req.party_id_source)
-    .set(452U, static_cast<std::int64_t>(req.party_role));
-  return std::move(b).build();
+  fix44::NewOrderSingle order;
+  order.account(req.account)
+    .cl_ord_id(req.cl_ord_id)
+    .currency(req.currency)
+    .exec_inst(GeneratedExecInst(req.exec_inst))
+    .handl_inst(GeneratedHandlInst(req.hand_l_inst))
+    .security_id(req.security_id)
+    .security_id_source(GeneratedSecurityIdSource(req.security_id_source))
+    .order_qty(req.order_qty)
+    .ord_type(GeneratedOrdType(req.ord_type))
+    .price(req.price)
+    .side(GeneratedSide(req.side))
+    .symbol(req.symbol)
+    .time_in_force(GeneratedTimeInForce(req.time_in_force))
+    .transact_time(req.transact_time)
+    .ex_destination(req.ex_destination)
+    .security_exchange(req.security_exchange);
+  order.add_party()
+    .party_id(req.party_id)
+    .party_id_source(GeneratedPartyIdSource(req.party_id_source))
+    .party_role(GeneratedPartyRole(req.party_role));
+  return order.ToMessage().value();
 }
 
 auto
 BuildCancelOrder(const CancelOrderFields& req) -> nimble::message::Message
 {
-  nimble::message::MessageBuilder b{ "F" };
-  b.reserve_fields(12U).reserve_groups(1U).reserve_group_entries(453U, 1U);
-  b.set(1U, req.account)
-    .set(11U, req.cl_ord_id)
-    .set(22U, req.security_id_source)
-    .set(38U, req.order_qty)
-    .set(41U, req.orig_cl_ord_id)
-    .set(48U, req.security_id)
-    .set(54U, req.side)
-    .set(55U, req.symbol)
-    .set(60U, req.transact_time)
-    .set(100U, req.ex_destination)
-    .set(207U, req.security_exchange);
-  b.add_group_entry(453U)
-    .set(448U, req.party_id)
-    .set(447U, req.party_id_source)
-    .set(452U, static_cast<std::int64_t>(req.party_role));
-  return std::move(b).build();
+  fix44::OrderCancelRequest cancel;
+  cancel.account(req.account)
+    .cl_ord_id(req.cl_ord_id)
+    .orig_cl_ord_id(req.orig_cl_ord_id)
+    .security_id(req.security_id)
+    .security_id_source(GeneratedSecurityIdSource(req.security_id_source))
+    .order_qty(req.order_qty)
+    .side(GeneratedSide(req.side))
+    .symbol(req.symbol)
+    .transact_time(req.transact_time)
+    .security_exchange(req.security_exchange);
+  cancel.add_party()
+    .party_id(req.party_id)
+    .party_id_source(GeneratedPartyIdSource(req.party_id_source))
+    .party_role(GeneratedPartyRole(req.party_role));
+  return cancel.ToMessage().value();
 }
 
 // ---------------------------------------------------------------------------
@@ -232,57 +279,66 @@ BuildCancelOrder(const CancelOrderFields& req) -> nimble::message::Message
 auto
 BuildExecReportNew(nimble::message::MessageView order, std::uint32_t exec_id) -> nimble::message::Message
 {
-  const auto cl_ord_id = order.get_string(11U).value_or("UNKNOWN");
-  const auto side = order.get_char(54U).value_or('1');
-  const auto order_qty = order.get_float(38U).value_or(100.0);
-  const auto symbol = order.get_string(55U).value_or("");
-  const auto account = order.get_string(1U).value_or("");
+  const auto inbound = fix44::NewOrderSingleView::Bind(order).value();
 
-  nimble::message::MessageBuilder b{ "8" };
-  b.reserve_fields(13U);
-  b.set(1U, account)
-    .set(6U, 0.0)
-    .set(11U, cl_ord_id)
-    .set(14U, 0.0)
-    .set(17U, std::string("E") + std::to_string(exec_id))
-    .set(37U, std::string("O") + std::to_string(exec_id))
-    .set(38U, order_qty)
-    .set(39U, '0')
-    .set(54U, side)
-    .set(55U, symbol)
-    .set(60U, NowFixTimestamp())
-    .set(150U, '0')
-    .set(151U, order_qty);
-  return std::move(b).build();
+  fix44::ExecutionReport report;
+  report.order_id(std::string("O") + std::to_string(exec_id))
+    .exec_id(std::string("E") + std::to_string(exec_id))
+    .exec_type(fix44::ExecType::New)
+    .ord_status(fix44::OrdStatus::New)
+    .transact_time(NowFixTimestamp())
+    .cum_qty(0.0)
+    .avg_px(0.0);
+
+  if (auto account = inbound.account(); account.has_value()) {
+    report.account(account.value());
+  }
+  if (auto cl_ord_id = inbound.cl_ord_id(); cl_ord_id.has_value()) {
+    report.cl_ord_id(cl_ord_id.value());
+  }
+  if (auto side = inbound.side(); side.ok()) {
+    report.side(side.value());
+  }
+  if (auto symbol = inbound.symbol(); symbol.has_value()) {
+    report.symbol(symbol.value());
+  }
+  const auto order_qty = inbound.order_qty().value_or(100.0);
+  report.order_qty(order_qty).leaves_qty(order_qty);
+  return report.ToMessage().value();
 }
 
 auto
 BuildExecReportCanceled(nimble::message::MessageView cancel_req, std::uint32_t exec_id) -> nimble::message::Message
 {
-  const auto cl_ord_id = cancel_req.get_string(11U).value_or("UNKNOWN");
-  const auto orig_cl_ord_id = cancel_req.get_string(41U).value_or("");
-  const auto side = cancel_req.get_char(54U).value_or('1');
-  const auto order_qty = cancel_req.get_float(38U).value_or(100.0);
-  const auto symbol = cancel_req.get_string(55U).value_or("");
-  const auto account = cancel_req.get_string(1U).value_or("");
+  const auto inbound = fix44::OrderCancelRequestView::Bind(cancel_req).value();
 
-  nimble::message::MessageBuilder b{ "8" };
-  b.reserve_fields(14U);
-  b.set(1U, account)
-    .set(6U, 150.25)
-    .set(11U, cl_ord_id)
-    .set(14U, order_qty)
-    .set(17U, std::string("E") + std::to_string(exec_id))
-    .set(37U, std::string("O") + std::to_string(exec_id))
-    .set(38U, order_qty)
-    .set(39U, '4')
-    .set(41U, orig_cl_ord_id)
-    .set(54U, side)
-    .set(55U, symbol)
-    .set(60U, NowFixTimestamp())
-    .set(150U, '4')
-    .set(151U, 0.0);
-  return std::move(b).build();
+  fix44::ExecutionReport report;
+  report.order_id(std::string("O") + std::to_string(exec_id))
+    .exec_id(std::string("E") + std::to_string(exec_id))
+    .exec_type(fix44::ExecType::Canceled)
+    .ord_status(fix44::OrdStatus::Canceled)
+    .transact_time(NowFixTimestamp())
+    .avg_px(150.25)
+    .leaves_qty(0.0);
+
+  if (auto account = inbound.account(); account.has_value()) {
+    report.account(account.value());
+  }
+  if (auto cl_ord_id = inbound.cl_ord_id(); cl_ord_id.has_value()) {
+    report.cl_ord_id(cl_ord_id.value());
+  }
+  if (auto orig_cl_ord_id = inbound.orig_cl_ord_id(); orig_cl_ord_id.has_value()) {
+    report.orig_cl_ord_id(orig_cl_ord_id.value());
+  }
+  if (auto side = inbound.side(); side.ok()) {
+    report.side(side.value());
+  }
+  if (auto symbol = inbound.symbol(); symbol.has_value()) {
+    report.symbol(symbol.value());
+  }
+  const auto order_qty = inbound.order_qty().value_or(100.0);
+  report.order_qty(order_qty).cum_qty(order_qty);
+  return report.ToMessage().value();
 }
 
 // ---------------------------------------------------------------------------
@@ -292,23 +348,24 @@ BuildExecReportCanceled(nimble::message::MessageView cancel_req, std::uint32_t e
 auto
 ParseExecReport(nimble::message::MessageView view) -> ParsedAck
 {
+  const auto report = fix44::ExecutionReportView::Bind(view).value();
   ParsedAck ack;
-  if (auto v = view.get_string(11U)) {
+  if (auto v = report.cl_ord_id()) {
     ack.cl_ord_id = std::string(*v);
   }
-  if (auto v = view.get_char(150U)) {
-    ack.exec_type = *v;
+  if (auto v = report.exec_type(); v.ok()) {
+    ack.exec_type = fix44::ToWire(v.value());
   }
-  if (auto v = view.get_char(39U)) {
-    ack.ord_status = *v;
+  if (auto v = report.ord_status(); v.ok()) {
+    ack.ord_status = fix44::ToWire(v.value());
   }
-  if (auto v = view.get_float(151U)) {
+  if (auto v = report.leaves_qty()) {
     ack.leaves_qty = *v;
   }
-  if (auto v = view.get_float(14U)) {
+  if (auto v = report.cum_qty()) {
     ack.cum_qty = *v;
   }
-  if (auto v = view.get_float(6U)) {
+  if (auto v = report.avg_px()) {
     ack.avg_px = *v;
   }
   return ack;

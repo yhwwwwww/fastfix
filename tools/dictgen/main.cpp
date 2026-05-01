@@ -13,8 +13,8 @@ auto
 PrintUsage() -> void
 {
   std::cout << "usage: nimblefix-dictgen --input <dictionary.nfd> [--merge "
-               "<overlay.nfd> ...] --output <profile.nfa> [--cpp-builders "
-               "<generated.hpp>] [--cpp-readers <generated.hpp>]\n";
+               "<overlay.nfd> ...] --output <profile.nfa> [--cpp-api "
+               "<generated.hpp>]\n";
 }
 
 auto
@@ -34,8 +34,7 @@ main(int argc, char** argv)
 {
   std::filesystem::path input_path;
   std::filesystem::path output_path;
-  std::filesystem::path builder_output_path;
-  std::filesystem::path reader_output_path;
+  std::filesystem::path api_output_path;
   std::vector<std::filesystem::path> merge_paths;
 
   for (int index = 1; index < argc; ++index) {
@@ -52,12 +51,8 @@ main(int argc, char** argv)
       output_path = argv[++index];
       continue;
     }
-    if (arg == "--cpp-builders" && index + 1 < argc) {
-      builder_output_path = argv[++index];
-      continue;
-    }
-    if (arg == "--cpp-readers" && index + 1 < argc) {
-      reader_output_path = argv[++index];
+    if (arg == "--cpp-api" && index + 1 < argc) {
+      api_output_path = argv[++index];
       continue;
     }
     PrintUsage();
@@ -71,11 +66,8 @@ main(int argc, char** argv)
 
   input_path = ResolveProjectPath(input_path);
   output_path = ResolveProjectPath(output_path);
-  if (!builder_output_path.empty()) {
-    builder_output_path = ResolveProjectPath(builder_output_path);
-  }
-  if (!reader_output_path.empty()) {
-    reader_output_path = ResolveProjectPath(reader_output_path);
+  if (!api_output_path.empty()) {
+    api_output_path = ResolveProjectPath(api_output_path);
   }
   for (auto& merge_path : merge_paths) {
     merge_path = ResolveProjectPath(merge_path);
@@ -119,29 +111,18 @@ main(int argc, char** argv)
     return 1;
   }
 
-  if (!builder_output_path.empty()) {
-    const auto builder_status = nimble::profile::WriteCppBuildersHeader(builder_output_path, merged);
-    if (!builder_status.ok()) {
-      std::cerr << builder_status.message() << '\n';
-      return 1;
-    }
-  }
-
-  if (!reader_output_path.empty()) {
-    const auto reader_status = nimble::profile::WriteCppReadersHeader(reader_output_path, merged);
-    if (!reader_status.ok()) {
-      std::cerr << reader_status.message() << '\n';
+  if (!api_output_path.empty()) {
+    const auto api_status = nimble::profile::WriteCppApiHeader(api_output_path, merged);
+    if (!api_status.ok()) {
+      std::cerr << api_status.message() << '\n';
       return 1;
     }
   }
 
   std::cout << "generated artifact '" << output_path.string() << "' with " << merged.fields.size() << " fields, "
             << merged.messages.size() << " messages, and " << merged.groups.size() << " groups";
-  if (!builder_output_path.empty()) {
-    std::cout << "; generated builder header '" << builder_output_path.string() << "'";
-  }
-  if (!reader_output_path.empty()) {
-    std::cout << "; generated reader header '" << reader_output_path.string() << "'";
+  if (!api_output_path.empty()) {
+    std::cout << "; generated api header '" << api_output_path.string() << "'";
   }
   std::cout << '\n';
   return 0;

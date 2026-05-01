@@ -1,35 +1,21 @@
 #include "nimblefix/runtime/config.h"
 
+#include <algorithm>
 #include <ctime>
 #include <filesystem>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
 
 #include "nimblefix/runtime/contract_binding.h"
+#include "nimblefix/runtime/schedule_helpers.h"
 
 namespace nimble::runtime {
 
 namespace {
-
-constexpr int kSecondsPerDay = 24 * 60 * 60;
-
-struct SessionWindowSpec
-{
-  bool use_local_time{ false };
-  int start_second{ 0 };
-  int end_second{ 0 };
-  std::optional<int> start_day;
-  std::optional<int> end_day;
-};
-
-struct CalendarPoint
-{
-  std::tm civil_time{};
-  int weekday{ 0 };
-  int second_of_day{ 0 };
-};
 
 auto
 TransportProfileForVersion(session::TransportVersion version) -> session::TransportSessionProfile
@@ -83,6 +69,10 @@ SecondsOfDay(const SessionTimeOfDay& time) -> int
 {
   return static_cast<int>(time.hour) * 3600 + static_cast<int>(time.minute) * 60 + static_cast<int>(time.second);
 }
+
+} // namespace
+
+namespace detail {
 
 auto
 BuildWindowSpec(const SessionScheduleConfig& schedule, bool logon_window) -> std::optional<SessionWindowSpec>
@@ -204,7 +194,7 @@ NextWindowStart(const SessionWindowSpec& window, std::uint64_t unix_time_ns) -> 
   return candidate_ns;
 }
 
-} // namespace
+} // namespace detail
 
 auto
 ValidateSessionSchedule(const SessionScheduleConfig& schedule) -> base::Status
@@ -255,25 +245,25 @@ ValidateSessionSchedule(const SessionScheduleConfig& schedule) -> base::Status
 auto
 IsWithinSessionWindow(const SessionScheduleConfig& schedule, std::uint64_t unix_time_ns) -> bool
 {
-  const auto window = BuildWindowSpec(schedule, false);
-  return !window.has_value() || IsWithinWindow(*window, unix_time_ns);
+  const auto window = detail::BuildWindowSpec(schedule, false);
+  return !window.has_value() || detail::IsWithinWindow(*window, unix_time_ns);
 }
 
 auto
 IsWithinLogonWindow(const SessionScheduleConfig& schedule, std::uint64_t unix_time_ns) -> bool
 {
-  const auto window = BuildWindowSpec(schedule, true);
-  return !window.has_value() || IsWithinWindow(*window, unix_time_ns);
+  const auto window = detail::BuildWindowSpec(schedule, true);
+  return !window.has_value() || detail::IsWithinWindow(*window, unix_time_ns);
 }
 
 auto
 NextLogonWindowStart(const SessionScheduleConfig& schedule, std::uint64_t unix_time_ns) -> std::optional<std::uint64_t>
 {
-  const auto window = BuildWindowSpec(schedule, true);
+  const auto window = detail::BuildWindowSpec(schedule, true);
   if (!window.has_value()) {
     return unix_time_ns;
   }
-  return NextWindowStart(*window, unix_time_ns);
+  return detail::NextWindowStart(*window, unix_time_ns);
 }
 
 namespace {
@@ -297,6 +287,13 @@ TlsVersionRank(TlsProtocolVersion version) -> int
 }
 
 auto
+IsValidDayOfWeek(SessionDayOfWeek day) -> bool
+{
+  const auto value = static_cast<std::uint32_t>(day);
+  return value <= static_cast<std::uint32_t>(SessionDayOfWeek::kSaturday);
+}
+
+auto
 PathExists(const std::filesystem::path& path) -> bool
 {
   return path.empty() || std::filesystem::exists(path);
@@ -315,88 +312,541 @@ ValidateTlsVersionRange(TlsProtocolVersion min_version, TlsProtocolVersion max_v
 }
 
 auto
-ValidateTlsClientConfig(std::string_view counterparty_name, const TlsClientConfig& config) -> base::Status
+StatusFromCode(base::ErrorCode code, std::string message) -> base::Status
 {
-  if (!config.enabled) {
-    return base::Status::Ok();
+  switch (code) {
+    case base::ErrorCode::kInvalidArgument:
+      return base::Status::InvalidArgument(std::move(message));
+    case base::ErrorCode::kIoError:
+      return base::Status::IoError(std::move(message));
+    case base::ErrorCode::kBusy:
+      return base::Status::Busy(std::move(message));
+    case base::ErrorCode::kFormatError:
+      return base::Status::FormatError(std::move(message));
+    case base::ErrorCode::kVersionMismatch:
+      return base::Status::VersionMismatch(std::move(message));
+    case base::ErrorCode::kNotFound:
+      return base::Status::NotFound(std::move(message));
+    case base::ErrorCode::kAlreadyExists:
+      return base::Status::AlreadyExists(std::move(message));
+    case base::ErrorCode::kOk:
+      return base::Status::Ok();
   }
-
-  if (!TlsTransportEnabledAtBuild()) {
-    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
-                                         "' sets tls_client.enabled=true but this build was compiled without "
-                                         "optional TLS support");
-  }
-  if (config.certificate_chain_file.empty() != config.private_key_file.empty()) {
-    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
-                                         "' TLS client certificate_chain_file and private_key_file must be configured "
-                                         "together");
-  }
-  if (!PathExists(config.certificate_chain_file)) {
-    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
-                                         "' TLS client certificate_chain_file does not exist");
-  }
-  if (!PathExists(config.private_key_file)) {
-    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
-                                         "' TLS client private_key_file does not exist");
-  }
-  if (!PathExists(config.ca_file)) {
-    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
-                                         "' TLS client ca_file does not exist");
-  }
-  if (!PathExists(config.ca_path)) {
-    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
-                                         "' TLS client ca_path does not exist");
-  }
-  if (!config.expected_peer_name.empty() && !config.verify_peer) {
-    return base::Status::InvalidArgument("counterparty '" + std::string(counterparty_name) +
-                                         "' sets expected_peer_name while verify_peer is disabled");
-  }
-  return ValidateTlsVersionRange(
-    config.min_version, config.max_version, "counterparty '" + std::string(counterparty_name) + "' TLS client");
+  return base::Status::InvalidArgument(std::move(message));
 }
 
 auto
-ValidateTlsServerConfig(std::string_view listener_name, const TlsServerConfig& config) -> base::Status
+Plural(std::size_t count, std::string_view singular, std::string_view plural) -> std::string_view
 {
-  if (!config.enabled) {
-    return base::Status::Ok();
+  return count == 1U ? singular : plural;
+}
+
+auto
+DiagnosticPrefix(ConfigErrorSeverity severity) -> std::string_view
+{
+  return severity == ConfigErrorSeverity::kWarning ? "warning" : "error";
+}
+
+auto
+CounterpartyFieldPath(std::size_t index, std::string_view field) -> std::string
+{
+  return "counterparties[" + std::to_string(index) + "]." + std::string(field);
+}
+
+auto
+SessionFieldPath(std::size_t index, std::string_view field) -> std::string
+{
+  return CounterpartyFieldPath(index, "session.") + std::string(field);
+}
+
+auto
+SessionScheduleFieldPath(std::size_t index, std::string_view field) -> std::string
+{
+  return CounterpartyFieldPath(index, "session_schedule.") + std::string(field);
+}
+
+auto
+DayCutFieldPath(std::size_t index, std::string_view field) -> std::string
+{
+  return CounterpartyFieldPath(index, "day_cut.") + std::string(field);
+}
+
+auto
+ListenerFieldPath(std::size_t index, std::string_view field) -> std::string
+{
+  return "listeners[" + std::to_string(index) + "]." + std::string(field);
+}
+
+auto
+StatusMessage(const base::Status& status) -> std::string
+{
+  return std::string(status.message());
+}
+
+auto
+AddDiagnostic(ConfigValidationResult& result,
+              std::string field_path,
+              std::string message,
+              ConfigErrorSeverity severity = ConfigErrorSeverity::kError,
+              base::ErrorCode code = base::ErrorCode::kInvalidArgument) -> void
+{
+  result.errors.push_back(ConfigError{
+    .field_path = std::move(field_path),
+    .severity = severity,
+    .code = code,
+    .message = std::move(message),
+  });
+}
+
+auto
+AddStatusDiagnostic(ConfigValidationResult& result,
+                    std::string field_path,
+                    const base::Status& status,
+                    ConfigErrorSeverity severity = ConfigErrorSeverity::kError) -> void
+{
+  AddDiagnostic(result, std::move(field_path), StatusMessage(status), severity, status.code());
+}
+
+auto
+ValidateSessionScheduleFull(const SessionScheduleConfig& schedule, std::size_t counterparty_index)
+  -> ConfigValidationResult
+{
+  ConfigValidationResult result;
+
+  const auto add_time_pair_diagnostics = [&](std::string_view label,
+                                             std::string_view start_time_field,
+                                             const std::optional<SessionTimeOfDay>& start_time,
+                                             std::string_view end_time_field,
+                                             const std::optional<SessionTimeOfDay>& end_time,
+                                             std::string_view start_day_field,
+                                             const std::optional<SessionDayOfWeek>& start_day,
+                                             std::string_view end_day_field,
+                                             const std::optional<SessionDayOfWeek>& end_day) {
+    if (start_time.has_value() != end_time.has_value()) {
+      AddDiagnostic(
+        result,
+        SessionScheduleFieldPath(counterparty_index, start_time.has_value() ? end_time_field : start_time_field),
+        std::string(label) + " requires both start and end times");
+    }
+    if (start_day.has_value() != end_day.has_value()) {
+      AddDiagnostic(
+        result,
+        SessionScheduleFieldPath(counterparty_index, start_day.has_value() ? end_day_field : start_day_field),
+        std::string(label) + " requires both start and end days");
+    }
+    if ((start_day.has_value() || end_day.has_value()) && !start_time.has_value()) {
+      AddDiagnostic(result,
+                    SessionScheduleFieldPath(counterparty_index, start_time_field),
+                    std::string(label) + " days require matching times");
+    }
+    if (start_time.has_value() && !IsValidTimeOfDay(*start_time)) {
+      AddDiagnostic(result,
+                    SessionScheduleFieldPath(counterparty_index, start_time_field),
+                    std::string(label) + " start time is out of range");
+    }
+    if (end_time.has_value() && !IsValidTimeOfDay(*end_time)) {
+      AddDiagnostic(result,
+                    SessionScheduleFieldPath(counterparty_index, end_time_field),
+                    std::string(label) + " end time is out of range");
+    }
+    if (start_day.has_value() && !IsValidDayOfWeek(*start_day)) {
+      AddDiagnostic(result,
+                    SessionScheduleFieldPath(counterparty_index, start_day_field),
+                    std::string(label) + " start day is out of range");
+    }
+    if (end_day.has_value() && !IsValidDayOfWeek(*end_day)) {
+      AddDiagnostic(result,
+                    SessionScheduleFieldPath(counterparty_index, end_day_field),
+                    std::string(label) + " end day is out of range");
+    }
+  };
+
+  if (schedule.non_stop_session && (HasSessionWindowFields(schedule) || HasLogonWindowFields(schedule))) {
+    AddDiagnostic(result,
+                  SessionScheduleFieldPath(counterparty_index, "non_stop_session"),
+                  "non_stop_session cannot be combined with session or logon window settings");
   }
 
-  if (!TlsTransportEnabledAtBuild()) {
-    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
-                                         "' sets tls_server.enabled=true but this build was compiled without "
-                                         "optional TLS support");
+  add_time_pair_diagnostics("session window",
+                            "start_time",
+                            schedule.start_time,
+                            "end_time",
+                            schedule.end_time,
+                            "start_day",
+                            schedule.start_day,
+                            "end_day",
+                            schedule.end_day);
+  add_time_pair_diagnostics("logon window",
+                            "logon_time",
+                            schedule.logon_time,
+                            "logout_time",
+                            schedule.logout_time,
+                            "logon_day",
+                            schedule.logon_day,
+                            "logout_day",
+                            schedule.logout_day);
+
+  return result;
+}
+
+auto
+ValidateDayCutFull(const session::DayCutConfig& day_cut, std::size_t counterparty_index) -> ConfigValidationResult
+{
+  ConfigValidationResult result;
+  constexpr std::int32_t kHoursPerDay = 24;
+  constexpr std::int32_t kMinutesPerHour = 60;
+  constexpr std::int32_t kMaxUtcOffsetSeconds = 24 * 60 * 60;
+
+  const auto fixed_time_mode =
+    day_cut.mode == session::DayCutMode::kFixedLocalTime || day_cut.mode == session::DayCutMode::kFixedUtcTime;
+  if (fixed_time_mode && (day_cut.reset_hour < 0 || day_cut.reset_hour >= kHoursPerDay)) {
+    AddDiagnostic(result, DayCutFieldPath(counterparty_index, "reset_hour"), "day_cut reset_hour must be 0-23");
   }
-  if (config.certificate_chain_file.empty() || config.private_key_file.empty()) {
-    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
-                                         "' TLS server requires certificate_chain_file and private_key_file");
+  if (fixed_time_mode && (day_cut.reset_minute < 0 || day_cut.reset_minute >= kMinutesPerHour)) {
+    AddDiagnostic(result, DayCutFieldPath(counterparty_index, "reset_minute"), "day_cut reset_minute must be 0-59");
+  }
+  if (day_cut.utc_offset_seconds < -kMaxUtcOffsetSeconds || day_cut.utc_offset_seconds > kMaxUtcOffsetSeconds) {
+    AddDiagnostic(result,
+                  DayCutFieldPath(counterparty_index, "utc_offset_seconds"),
+                  "day_cut utc_offset_seconds absolute value must be <= 86400");
+  }
+
+  return result;
+}
+
+auto
+AppendDiagnostics(ConfigValidationResult& destination, ConfigValidationResult source) -> void
+{
+  destination.errors.insert(destination.errors.end(), source.errors.begin(), source.errors.end());
+}
+
+auto
+BoolToText(bool value) -> std::string_view
+{
+  return value ? "true" : "false";
+}
+
+auto
+TraceModeToText(TraceMode mode) -> std::string_view
+{
+  switch (mode) {
+    case TraceMode::kRing:
+      return "ring";
+    case TraceMode::kDisabled:
+      return "disabled";
+  }
+  return "disabled";
+}
+
+auto
+QueueAppThreadingModeToText(QueueAppThreadingMode mode) -> std::string_view
+{
+  switch (mode) {
+    case QueueAppThreadingMode::kThreaded:
+      return "threaded";
+    case QueueAppThreadingMode::kCoScheduled:
+      return "co-scheduled";
+  }
+  return "co-scheduled";
+}
+
+auto
+PollModeToText(PollMode mode) -> std::string_view
+{
+  switch (mode) {
+    case PollMode::kBusy:
+      return "busy";
+    case PollMode::kBlocking:
+      return "blocking";
+  }
+  return "blocking";
+}
+
+auto
+IoBackendToText(IoBackend backend) -> std::string_view
+{
+  switch (backend) {
+    case IoBackend::kIoUring:
+      return "io_uring";
+    case IoBackend::kEpoll:
+      return "epoll";
+  }
+  return "epoll";
+}
+
+auto
+StoreModeToText(StoreMode mode) -> std::string_view
+{
+  switch (mode) {
+    case StoreMode::kMmap:
+      return "mmap";
+    case StoreMode::kDurableBatch:
+      return "durable";
+    case StoreMode::kMemory:
+      return "memory";
+  }
+  return "memory";
+}
+
+auto
+RecoveryModeToText(session::RecoveryMode mode) -> std::string_view
+{
+  switch (mode) {
+    case session::RecoveryMode::kWarmRestart:
+      return "warm";
+    case session::RecoveryMode::kColdStart:
+      return "cold";
+    case session::RecoveryMode::kNoRecovery:
+      return "no-recovery";
+    case session::RecoveryMode::kMemoryOnly:
+      return "memory";
+  }
+  return "memory";
+}
+
+auto
+DispatchModeToText(AppDispatchMode mode) -> std::string_view
+{
+  switch (mode) {
+    case AppDispatchMode::kQueueDecoupled:
+      return "queue";
+    case AppDispatchMode::kInline:
+      return "inline";
+  }
+  return "inline";
+}
+
+auto
+DurableRolloverModeToText(store::DurableStoreRolloverMode mode) -> std::string_view
+{
+  switch (mode) {
+    case store::DurableStoreRolloverMode::kDisabled:
+      return "disabled";
+    case store::DurableStoreRolloverMode::kExternal:
+      return "external";
+    case store::DurableStoreRolloverMode::kLocalTime:
+      return "local-time";
+    case store::DurableStoreRolloverMode::kUtcDay:
+      return "utc-day";
+  }
+  return "utc-day";
+}
+
+auto
+DayCutModeToText(session::DayCutMode mode) -> std::string_view
+{
+  switch (mode) {
+    case session::DayCutMode::kFixedLocalTime:
+      return "fixed-local-time";
+    case session::DayCutMode::kFixedUtcTime:
+      return "fixed-utc-time";
+    case session::DayCutMode::kExternalControl:
+      return "external-control";
+    case session::DayCutMode::kNoAutoReset:
+      return "no-auto-reset";
+  }
+  return "no-auto-reset";
+}
+
+auto
+DayOfWeekToText(SessionDayOfWeek day) -> std::string_view
+{
+  switch (day) {
+    case SessionDayOfWeek::kSunday:
+      return "sun";
+    case SessionDayOfWeek::kMonday:
+      return "mon";
+    case SessionDayOfWeek::kTuesday:
+      return "tue";
+    case SessionDayOfWeek::kWednesday:
+      return "wed";
+    case SessionDayOfWeek::kThursday:
+      return "thu";
+    case SessionDayOfWeek::kFriday:
+      return "fri";
+    case SessionDayOfWeek::kSaturday:
+      return "sat";
+  }
+  return "sun";
+}
+
+auto
+TimeOfDayToText(const SessionTimeOfDay& time) -> std::string
+{
+  std::ostringstream out;
+  out << std::setfill('0') << std::setw(2) << static_cast<int>(time.hour) << ':' << std::setw(2)
+      << static_cast<int>(time.minute) << ':' << std::setw(2) << static_cast<int>(time.second);
+  return out.str();
+}
+
+auto
+OptionalTimeToText(const std::optional<SessionTimeOfDay>& time) -> std::string
+{
+  return time.has_value() ? TimeOfDayToText(*time) : std::string{};
+}
+
+auto
+OptionalDayToText(const std::optional<SessionDayOfWeek>& day) -> std::string
+{
+  return day.has_value() ? std::string(DayOfWeekToText(*day)) : std::string{};
+}
+
+template<typename Values>
+auto
+JoinCsv(const Values& values) -> std::string
+{
+  std::string joined;
+  for (const auto& value : values) {
+    if (!joined.empty()) {
+      joined.push_back(',');
+    }
+    joined += value;
+  }
+  return joined;
+}
+
+template<typename Values, typename Formatter>
+auto
+JoinCsv(const Values& values, Formatter formatter) -> std::string
+{
+  std::string joined;
+  for (const auto& value : values) {
+    if (!joined.empty()) {
+      joined.push_back(',');
+    }
+    joined += formatter(value);
+  }
+  return joined;
+}
+
+auto
+PathToText(const std::filesystem::path& path) -> std::string
+{
+  return path.string();
+}
+
+auto
+ValidateTlsClientConfigFull(std::size_t counterparty_index,
+                            std::string_view counterparty_name,
+                            const TlsClientConfig& config) -> ConfigValidationResult
+{
+  ConfigValidationResult result;
+  if (!config.enabled) {
+    return result;
+  }
+
+  const auto field = [&](std::string_view name) {
+    return CounterpartyFieldPath(counterparty_index, "tls_client.") + std::string(name);
+  };
+
+  if (!TlsTransportEnabledAtBuild()) {
+    AddDiagnostic(result,
+                  field("enabled"),
+                  "counterparty '" + std::string(counterparty_name) +
+                    "' sets tls_client.enabled=true but this build was compiled without optional TLS support");
+  }
+  if (config.certificate_chain_file.empty() != config.private_key_file.empty()) {
+    AddDiagnostic(result,
+                  field(config.certificate_chain_file.empty() ? "certificate_chain_file" : "private_key_file"),
+                  "counterparty '" + std::string(counterparty_name) +
+                    "' TLS client certificate_chain_file and private_key_file must be configured together");
   }
   if (!PathExists(config.certificate_chain_file)) {
-    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
-                                         "' TLS server certificate_chain_file does not exist");
+    AddDiagnostic(result,
+                  field("certificate_chain_file"),
+                  "counterparty '" + std::string(counterparty_name) +
+                    "' TLS client certificate_chain_file does not exist");
   }
   if (!PathExists(config.private_key_file)) {
-    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
-                                         "' TLS server private_key_file does not exist");
+    AddDiagnostic(result,
+                  field("private_key_file"),
+                  "counterparty '" + std::string(counterparty_name) + "' TLS client private_key_file does not exist");
   }
   if (!PathExists(config.ca_file)) {
-    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
-                                         "' TLS server ca_file does not exist");
+    AddDiagnostic(result,
+                  field("ca_file"),
+                  "counterparty '" + std::string(counterparty_name) + "' TLS client ca_file does not exist");
   }
   if (!PathExists(config.ca_path)) {
-    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
-                                         "' TLS server ca_path does not exist");
+    AddDiagnostic(result,
+                  field("ca_path"),
+                  "counterparty '" + std::string(counterparty_name) + "' TLS client ca_path does not exist");
+  }
+  if (!config.expected_peer_name.empty() && !config.verify_peer) {
+    AddDiagnostic(result,
+                  field("expected_peer_name"),
+                  "counterparty '" + std::string(counterparty_name) +
+                    "' sets expected_peer_name while verify_peer is disabled");
+  }
+  auto version_status = ValidateTlsVersionRange(
+    config.min_version, config.max_version, "counterparty '" + std::string(counterparty_name) + "' TLS client");
+  if (!version_status.ok()) {
+    AddStatusDiagnostic(result, field("min_version"), version_status);
+  }
+  return result;
+}
+
+auto
+ValidateTlsServerConfigFull(std::size_t listener_index, std::string_view listener_name, const TlsServerConfig& config)
+  -> ConfigValidationResult
+{
+  ConfigValidationResult result;
+  if (!config.enabled) {
+    return result;
+  }
+
+  const auto field = [&](std::string_view name) {
+    return ListenerFieldPath(listener_index, "tls_server.") + std::string(name);
+  };
+
+  if (!TlsTransportEnabledAtBuild()) {
+    AddDiagnostic(result,
+                  field("enabled"),
+                  "listener '" + std::string(listener_name) +
+                    "' sets tls_server.enabled=true but this build was compiled without optional TLS support");
+  }
+  if (config.certificate_chain_file.empty() || config.private_key_file.empty()) {
+    AddDiagnostic(result,
+                  field(config.certificate_chain_file.empty() ? "certificate_chain_file" : "private_key_file"),
+                  "listener '" + std::string(listener_name) +
+                    "' TLS server requires certificate_chain_file and private_key_file");
+  }
+  if (!PathExists(config.certificate_chain_file)) {
+    AddDiagnostic(result,
+                  field("certificate_chain_file"),
+                  "listener '" + std::string(listener_name) + "' TLS server certificate_chain_file does not exist");
+  }
+  if (!PathExists(config.private_key_file)) {
+    AddDiagnostic(result,
+                  field("private_key_file"),
+                  "listener '" + std::string(listener_name) + "' TLS server private_key_file does not exist");
+  }
+  if (!PathExists(config.ca_file)) {
+    AddDiagnostic(
+      result, field("ca_file"), "listener '" + std::string(listener_name) + "' TLS server ca_file does not exist");
+  }
+  if (!PathExists(config.ca_path)) {
+    AddDiagnostic(
+      result, field("ca_path"), "listener '" + std::string(listener_name) + "' TLS server ca_path does not exist");
   }
   if (config.require_client_certificate && !config.verify_peer) {
-    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
-                                         "' TLS server require_client_certificate implies verify_peer=true");
+    AddDiagnostic(result,
+                  field("require_client_certificate"),
+                  "listener '" + std::string(listener_name) +
+                    "' TLS server require_client_certificate implies verify_peer=true");
   }
   if (config.require_client_certificate && config.ca_file.empty() && config.ca_path.empty()) {
-    return base::Status::InvalidArgument("listener '" + std::string(listener_name) +
-                                         "' TLS server require_client_certificate requires ca_file or ca_path");
+    AddDiagnostic(result,
+                  field("ca_file"),
+                  "listener '" + std::string(listener_name) +
+                    "' TLS server require_client_certificate requires ca_file or ca_path");
   }
-  return ValidateTlsVersionRange(
+  auto version_status = ValidateTlsVersionRange(
     config.min_version, config.max_version, "listener '" + std::string(listener_name) + "' TLS server");
+  if (!version_status.ok()) {
+    AddStatusDiagnostic(result, field("min_version"), version_status);
+  }
+  return result;
 }
 
 } // namespace
@@ -412,49 +862,115 @@ TlsTransportEnabledAtBuild() noexcept -> bool
 }
 
 auto
-ValidateEngineConfig(const EngineConfig& config) -> base::Status
+ConfigValidationResult::ok() const noexcept -> bool
 {
-  auto loaded_contracts = LoadContractMap(config.profile_contracts);
-  if (!loaded_contracts.ok()) {
-    return loaded_contracts.status();
+  return !has_errors();
+}
+
+auto
+ConfigValidationResult::has_errors() const noexcept -> bool
+{
+  return std::any_of(
+    errors.begin(), errors.end(), [](const auto& error) { return error.severity == ConfigErrorSeverity::kError; });
+}
+
+auto
+ConfigValidationResult::has_warnings() const noexcept -> bool
+{
+  return std::any_of(
+    errors.begin(), errors.end(), [](const auto& error) { return error.severity == ConfigErrorSeverity::kWarning; });
+}
+
+auto
+ConfigValidationResult::summary() const -> std::string
+{
+  const auto error_count = static_cast<std::size_t>(std::count_if(
+    errors.begin(), errors.end(), [](const auto& error) { return error.severity == ConfigErrorSeverity::kError; }));
+  const auto warning_count = errors.size() - error_count;
+
+  std::ostringstream out;
+  out << error_count << ' ' << Plural(error_count, "error", "errors") << ", " << warning_count << ' '
+      << Plural(warning_count, "warning", "warnings");
+  if (errors.empty()) {
+    return out.str();
   }
+  out << ':';
+  for (const auto& error : errors) {
+    out << "\n  [" << DiagnosticPrefix(error.severity) << "] " << error.field_path << ": " << error.message;
+  }
+  return out.str();
+}
+
+auto
+ConfigValidationResult::first_error_status() const -> base::Status
+{
+  const auto it = std::find_if(
+    errors.begin(), errors.end(), [](const auto& error) { return error.severity == ConfigErrorSeverity::kError; });
+  if (it == errors.end()) {
+    return base::Status::Ok();
+  }
+  return StatusFromCode(it->code, it->message);
+}
+
+auto
+ValidateEngineConfigFull(const EngineConfig& config) -> ConfigValidationResult
+{
+  ConfigValidationResult result;
 
   if (config.worker_count == 0) {
-    return base::Status::InvalidArgument("engine worker_count must be positive");
+    AddDiagnostic(result, "worker_count", "engine worker_count must be positive");
+  }
+  if (!config.enable_metrics) {
+    AddDiagnostic(result, "enable_metrics", "metrics collection is disabled", ConfigErrorSeverity::kWarning);
+  }
+  if (config.profile_mlock) {
+    AddDiagnostic(result,
+                  "profile_mlock",
+                  "profile mlock may fail at runtime if RLIMIT_MEMLOCK is insufficient",
+                  ConfigErrorSeverity::kWarning);
   }
   if (config.trace_mode == TraceMode::kRing && config.trace_capacity == 0) {
-    return base::Status::InvalidArgument("ring trace mode requires a positive trace_capacity");
+    AddDiagnostic(result, "trace_capacity", "ring trace mode requires a positive trace_capacity");
   }
-  if (config.worker_cpu_affinity.size() > config.worker_count) {
-    return base::Status::InvalidArgument("worker_cpu_affinity must not contain more entries than worker_count");
+  if (config.worker_count > 0 && config.worker_cpu_affinity.size() > config.worker_count) {
+    AddDiagnostic(result, "worker_cpu_affinity", "worker_cpu_affinity must not contain more entries than worker_count");
   }
-  if (config.app_cpu_affinity.size() > config.worker_count) {
-    return base::Status::InvalidArgument("app_cpu_affinity must not contain more entries than worker_count");
+  if (config.worker_count > 0 && config.app_cpu_affinity.size() > config.worker_count) {
+    AddDiagnostic(result, "app_cpu_affinity", "app_cpu_affinity must not contain more entries than worker_count");
   }
   if (config.queue_app_mode == QueueAppThreadingMode::kCoScheduled && !config.app_cpu_affinity.empty()) {
-    return base::Status::InvalidArgument("app_cpu_affinity requires engine.queue_app_mode=threaded");
+    AddDiagnostic(result, "app_cpu_affinity", "app_cpu_affinity requires engine.queue_app_mode=threaded");
   }
   if (!config.counterparties.empty() && config.profile_artifacts.empty() && config.profile_dictionaries.empty()) {
-    return base::Status::InvalidArgument("counterparty configs require at least one profile artifact");
+    AddDiagnostic(result, "profile_artifacts", "counterparty configs require at least one profile artifact");
+  }
+
+  auto loaded_contracts = LoadContractMap(config.profile_contracts);
+  if (!loaded_contracts.ok()) {
+    AddStatusDiagnostic(result, "profile_contracts", loaded_contracts.status());
   }
 
   std::unordered_set<std::string> listener_names;
   bool has_plain_listener = false;
   bool has_tls_listener = false;
-  for (const auto& listener : config.listeners) {
+  for (std::size_t listener_index = 0; listener_index < config.listeners.size(); ++listener_index) {
+    const auto& listener = config.listeners[listener_index];
     if (listener.name.empty()) {
-      return base::Status::InvalidArgument("listener name must not be empty");
+      AddDiagnostic(result, ListenerFieldPath(listener_index, "name"), "listener name must not be empty");
     }
-    if (!listener_names.emplace(listener.name).second) {
-      return base::Status::AlreadyExists("duplicate listener name in runtime config");
+    if (!listener.name.empty() && !listener_names.emplace(listener.name).second) {
+      AddDiagnostic(result,
+                    ListenerFieldPath(listener_index, "name"),
+                    "duplicate listener name in runtime config",
+                    ConfigErrorSeverity::kError,
+                    base::ErrorCode::kAlreadyExists);
     }
-    if (listener.worker_hint >= config.worker_count) {
-      return base::Status::InvalidArgument("listener worker_hint must be less than worker_count");
+    if (config.worker_count > 0 && listener.worker_hint >= config.worker_count) {
+      AddDiagnostic(result,
+                    ListenerFieldPath(listener_index, "worker_hint"),
+                    "listener worker_hint must be less than worker_count");
     }
-    auto tls_status = ValidateTlsServerConfig(listener.name, listener.tls_server);
-    if (!tls_status.ok()) {
-      return tls_status;
-    }
+    AppendDiagnostics(result, ValidateTlsServerConfigFull(listener_index, listener.name, listener.tls_server));
     if (listener.tls_server.enabled) {
       has_tls_listener = true;
     } else {
@@ -463,80 +979,193 @@ ValidateEngineConfig(const EngineConfig& config) -> base::Status
   }
 
   std::unordered_set<std::uint64_t> session_ids;
-  for (const auto& counterparty : config.counterparties) {
+  for (std::size_t counterparty_index = 0; counterparty_index < config.counterparties.size(); ++counterparty_index) {
+    const auto& counterparty = config.counterparties[counterparty_index];
     if (counterparty.name.empty()) {
-      return base::Status::InvalidArgument("counterparty name must not be empty");
+      AddDiagnostic(result, CounterpartyFieldPath(counterparty_index, "name"), "counterparty name must not be empty");
     }
     if (counterparty.session.session_id == 0) {
-      return base::Status::InvalidArgument("counterparty session_id must be positive");
+      AddDiagnostic(
+        result, SessionFieldPath(counterparty_index, "session_id"), "counterparty session_id must be positive");
     }
-    if (!session_ids.emplace(counterparty.session.session_id).second) {
-      return base::Status::AlreadyExists("duplicate session_id in runtime config");
+    if (counterparty.session.session_id != 0 && !session_ids.emplace(counterparty.session.session_id).second) {
+      AddDiagnostic(result,
+                    SessionFieldPath(counterparty_index, "session_id"),
+                    "duplicate session_id in runtime config",
+                    ConfigErrorSeverity::kError,
+                    base::ErrorCode::kAlreadyExists);
     }
     if (counterparty.session.profile_id == 0) {
-      return base::Status::InvalidArgument("counterparty profile_id must be positive");
+      AddDiagnostic(
+        result, SessionFieldPath(counterparty_index, "profile_id"), "counterparty profile_id must be positive");
     }
-    if (counterparty.session.key.begin_string.empty() || counterparty.session.key.sender_comp_id.empty() ||
-        counterparty.session.key.target_comp_id.empty()) {
-      return base::Status::InvalidArgument("counterparty session key fields must not be empty");
+    if (counterparty.session.key.begin_string.empty()) {
+      AddDiagnostic(result,
+                    SessionFieldPath(counterparty_index, "key.begin_string"),
+                    "counterparty session key fields must not be empty");
+    }
+    if (counterparty.session.key.sender_comp_id.empty()) {
+      AddDiagnostic(result,
+                    SessionFieldPath(counterparty_index, "key.sender_comp_id"),
+                    "counterparty session key fields must not be empty");
+    }
+    if (counterparty.session.key.target_comp_id.empty()) {
+      AddDiagnostic(result,
+                    SessionFieldPath(counterparty_index, "key.target_comp_id"),
+                    "counterparty session key fields must not be empty");
     }
     if (IsTransportSession(counterparty.session.key.begin_string) && counterparty.default_appl_ver_id.empty()) {
-      return base::Status::InvalidArgument("FIXT counterparties require default_appl_ver_id");
+      AddDiagnostic(result,
+                    CounterpartyFieldPath(counterparty_index, "default_appl_ver_id"),
+                    "FIXT counterparties require default_appl_ver_id");
     }
     if ((counterparty.store_mode == StoreMode::kMmap || counterparty.store_mode == StoreMode::kDurableBatch) &&
         counterparty.store_path.empty()) {
-      return base::Status::InvalidArgument("persistent store modes require a store_path");
+      AddDiagnostic(
+        result, CounterpartyFieldPath(counterparty_index, "store_path"), "persistent store modes require a store_path");
     }
     if (counterparty.recovery_mode == session::RecoveryMode::kWarmRestart &&
         counterparty.store_mode == StoreMode::kMemory) {
-      return base::Status::InvalidArgument("warm restart recovery requires a persistent store mode");
+      AddDiagnostic(result,
+                    CounterpartyFieldPath(counterparty_index, "recovery_mode"),
+                    "warm restart recovery requires a persistent store mode");
     }
     if (counterparty.reset_seq_num_on_logon && !counterparty.transport_profile.supports_reset_on_logon) {
-      return base::Status::InvalidArgument("reset_seq_num_on_logon is not supported by the configured transport "
-                                           "version");
+      AddDiagnostic(result,
+                    CounterpartyFieldPath(counterparty_index, "reset_seq_num_on_logon"),
+                    "reset_seq_num_on_logon is not supported by the configured transport version");
     }
     if (counterparty.send_next_expected_msg_seq_num &&
         !counterparty.transport_profile.supports_next_expected_msg_seq_num) {
-      return base::Status::InvalidArgument("send_next_expected_msg_seq_num is not supported by the configured "
-                                           "transport version");
+      AddDiagnostic(result,
+                    CounterpartyFieldPath(counterparty_index, "send_next_expected_msg_seq_num"),
+                    "send_next_expected_msg_seq_num is not supported by the configured transport version");
     }
-    auto schedule_status = ValidateSessionSchedule(counterparty.session_schedule);
-    if (!schedule_status.ok()) {
-      return schedule_status;
-    }
-    auto tls_status = ValidateTlsClientConfig(counterparty.name, counterparty.tls_client);
-    if (!tls_status.ok()) {
-      return tls_status;
-    }
+    AppendDiagnostics(result, ValidateSessionScheduleFull(counterparty.session_schedule, counterparty_index));
+    AppendDiagnostics(result, ValidateDayCutFull(counterparty.day_cut, counterparty_index));
+    AppendDiagnostics(result,
+                      ValidateTlsClientConfigFull(counterparty_index, counterparty.name, counterparty.tls_client));
     if (!counterparty.session.is_initiator && counterparty.tls_client.enabled) {
-      return base::Status::InvalidArgument("counterparty '" + counterparty.name +
-                                           "' is acceptor-mode but configures initiator TLS client settings");
+      AddDiagnostic(result,
+                    CounterpartyFieldPath(counterparty_index, "tls_client.enabled"),
+                    "counterparty '" + counterparty.name +
+                      "' is acceptor-mode but configures initiator TLS client settings");
     }
     if (counterparty.session.is_initiator &&
         counterparty.acceptor_transport_security != TransportSecurityRequirement::kAny) {
-      return base::Status::InvalidArgument("counterparty '" + counterparty.name +
-                                           "' is initiator-mode and must not set acceptor_transport_security");
+      AddDiagnostic(result,
+                    CounterpartyFieldPath(counterparty_index, "acceptor_transport_security"),
+                    "counterparty '" + counterparty.name +
+                      "' is initiator-mode and must not set acceptor_transport_security");
     }
     if (!counterparty.session.is_initiator) {
       if (counterparty.acceptor_transport_security == TransportSecurityRequirement::kTlsOnly && !has_tls_listener) {
-        return base::Status::InvalidArgument("counterparty '" + counterparty.name +
-                                             "' requires TLS-only acceptor transport but no TLS listener is "
-                                             "configured");
+        AddDiagnostic(result,
+                      CounterpartyFieldPath(counterparty_index, "acceptor_transport_security"),
+                      "counterparty '" + counterparty.name +
+                        "' requires TLS-only acceptor transport but no TLS listener is configured");
       }
       if (counterparty.acceptor_transport_security == TransportSecurityRequirement::kPlainOnly && !has_plain_listener) {
-        return base::Status::InvalidArgument("counterparty '" + counterparty.name +
-                                             "' requires plain-only acceptor transport but no plain listener is "
-                                             "configured");
+        AddDiagnostic(result,
+                      CounterpartyFieldPath(counterparty_index, "acceptor_transport_security"),
+                      "counterparty '" + counterparty.name +
+                        "' requires plain-only acceptor transport but no plain listener is configured");
       }
     }
+    if (counterparty.reconnect_enabled && counterparty.reconnect_initial_ms > counterparty.reconnect_max_ms) {
+      AddDiagnostic(result,
+                    CounterpartyFieldPath(counterparty_index, "reconnect_enabled"),
+                    "reconnect_initial_ms is greater than reconnect_max_ms",
+                    ConfigErrorSeverity::kWarning);
+    }
 
-    auto effective_counterparty = ResolveEffectiveCounterpartyConfig(counterparty, loaded_contracts.value());
-    if (!effective_counterparty.ok()) {
-      return effective_counterparty.status();
+    if (loaded_contracts.ok()) {
+      auto effective_counterparty = ResolveEffectiveCounterpartyConfig(counterparty, loaded_contracts.value());
+      if (!effective_counterparty.ok()) {
+        AddStatusDiagnostic(result,
+                            CounterpartyFieldPath(counterparty_index, "contract_service_subsets"),
+                            effective_counterparty.status());
+      }
     }
   }
 
-  return base::Status::Ok();
+  return result;
+}
+
+auto
+ValidateEngineConfig(const EngineConfig& config) -> base::Status
+{
+  auto result = ValidateEngineConfigFull(config);
+  return result.first_error_status();
+}
+
+auto
+ConfigToText(const EngineConfig& config) -> std::string
+{
+  std::ostringstream out;
+  out << "engine.worker_count=" << config.worker_count << '\n';
+  out << "engine.enable_metrics=" << BoolToText(config.enable_metrics) << '\n';
+  out << "engine.trace_mode=" << TraceModeToText(config.trace_mode) << '\n';
+  out << "engine.trace_capacity=" << config.trace_capacity << '\n';
+  if (config.front_door_cpu.has_value()) {
+    out << "engine.front_door_cpu=" << *config.front_door_cpu << '\n';
+  }
+  out << "engine.worker_cpu_affinity="
+      << JoinCsv(config.worker_cpu_affinity, [](std::uint32_t cpu) { return std::to_string(cpu); }) << '\n';
+  out << "engine.queue_app_mode=" << QueueAppThreadingModeToText(config.queue_app_mode) << '\n';
+  out << "engine.app_cpu_affinity="
+      << JoinCsv(config.app_cpu_affinity, [](std::uint32_t cpu) { return std::to_string(cpu); }) << '\n';
+  out << "engine.accept_unknown_sessions=" << BoolToText(config.accept_unknown_sessions) << '\n';
+  out << "engine.poll_mode=" << PollModeToText(config.poll_mode) << '\n';
+  out << "engine.io_backend=" << IoBackendToText(config.io_backend) << '\n';
+  out << "engine.profile_madvise=" << BoolToText(config.profile_madvise) << '\n';
+  out << "engine.profile_mlock=" << BoolToText(config.profile_mlock) << '\n';
+
+  for (const auto& artifact : config.profile_artifacts) {
+    out << "profile=" << PathToText(artifact) << '\n';
+  }
+  for (const auto& dictionary_group : config.profile_dictionaries) {
+    out << "dictionary="
+        << JoinCsv(dictionary_group, [](const std::filesystem::path& path) { return PathToText(path); }) << '\n';
+  }
+  for (const auto& contract : config.profile_contracts) {
+    out << "contract=" << PathToText(contract) << '\n';
+  }
+  for (const auto& listener : config.listeners) {
+    out << "listener|" << listener.name << '|' << listener.host << '|' << listener.port << '|' << listener.worker_hint
+        << '\n';
+  }
+  for (const auto& counterparty : config.counterparties) {
+    const auto& schedule = counterparty.session_schedule;
+    out << "counterparty|" << counterparty.name << '|' << counterparty.session.session_id << '|'
+        << counterparty.session.profile_id << '|' << counterparty.session.key.begin_string << '|'
+        << counterparty.session.key.sender_comp_id << '|' << counterparty.session.key.target_comp_id << '|'
+        << StoreModeToText(counterparty.store_mode) << '|' << PathToText(counterparty.store_path) << '|'
+        << RecoveryModeToText(counterparty.recovery_mode) << '|' << DispatchModeToText(counterparty.dispatch_mode)
+        << '|' << counterparty.session.heartbeat_interval_seconds << '|'
+        << BoolToText(counterparty.session.is_initiator) << '|' << counterparty.default_appl_ver_id << '|'
+        << session::ValidationModeName(counterparty.validation_policy.mode) << '|'
+        << counterparty.durable_flush_threshold << '|' << DurableRolloverModeToText(counterparty.durable_rollover_mode)
+        << '|' << counterparty.durable_archive_limit << '|' << BoolToText(counterparty.reconnect_enabled) << '|'
+        << counterparty.reconnect_initial_ms << '|' << counterparty.reconnect_max_ms << '|'
+        << counterparty.reconnect_max_retries << '|' << counterparty.durable_local_utc_offset_seconds << '|'
+        << BoolToText(counterparty.durable_use_system_timezone) << '|' << DayCutModeToText(counterparty.day_cut.mode)
+        << '|' << counterparty.day_cut.reset_hour << '|' << counterparty.day_cut.reset_minute << '|'
+        << counterparty.day_cut.utc_offset_seconds << '|' << BoolToText(counterparty.reset_seq_num_on_logon) << '|'
+        << BoolToText(counterparty.reset_seq_num_on_logout) << '|'
+        << BoolToText(counterparty.reset_seq_num_on_disconnect) << '|' << BoolToText(counterparty.refresh_on_logon)
+        << '|' << BoolToText(counterparty.send_next_expected_msg_seq_num) << '|' << BoolToText(schedule.use_local_time)
+        << '|' << BoolToText(schedule.non_stop_session) << '|' << OptionalTimeToText(schedule.start_time) << '|'
+        << OptionalTimeToText(schedule.end_time) << '|' << OptionalDayToText(schedule.start_day) << '|'
+        << OptionalDayToText(schedule.end_day) << '|' << OptionalTimeToText(schedule.logon_time) << '|'
+        << OptionalTimeToText(schedule.logout_time) << '|' << OptionalDayToText(schedule.logon_day) << '|'
+        << OptionalDayToText(schedule.logout_day) << '|' << counterparty.sending_time_threshold_seconds << '|'
+        << JoinCsv(counterparty.supported_app_msg_types) << '|'
+        << BoolToText(counterparty.application_messages_available) << '|'
+        << JoinCsv(counterparty.contract_service_subsets) << '\n';
+  }
+
+  return out.str();
 }
 
 ListenerConfigBuilder::ListenerConfigBuilder(ListenerConfig config)

@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <future>
 #include <iostream>
+#include <memory>
 #include <new>
 #include <optional>
 #include <string>
@@ -20,15 +21,18 @@
 #include <unistd.h>
 #endif
 
-#include "fix44_builders.h"
+#include "fix44_api.h"
+#include "nimblefix/advanced/fixed_layout_writer.h"
 #include "nimblefix/codec/compiled_decoder.h"
 #include "nimblefix/codec/fix_codec.h"
 #include "nimblefix/codec/raw_passthrough.h"
-#include "nimblefix/message/fixed_layout_writer.h"
-#include "nimblefix/message/message_builder.h"
+#include "nimblefix/advanced/message_builder.h"
+#include "nimblefix/advanced/runtime_application.h"
 #include "nimblefix/message/message_view.h"
 #include "nimblefix/profile/normalized_dictionary.h"
 #include "nimblefix/profile/profile_loader.h"
+#include "nimblefix/runtime/detail/typed_runtime_application.h"
+#include "nimblefix/runtime/profile_binding.h"
 #include "nimblefix/session/admin_protocol.h"
 #include "nimblefix/store/memory_store.h"
 #include "nimblefix/transport/tcp_transport.h"
@@ -36,6 +40,8 @@
 #include "bench_support.h"
 
 namespace {
+
+namespace fix44 = nimble::generated::profile_4400;
 
 using bench_support::BenchmarkMeasurement;
 using bench_support::BenchmarkResult;
@@ -70,7 +76,9 @@ LoadDictionary(const std::filesystem::path& artifact_path, std::span<const std::
 }
 
 auto
-PopulateFix44MessageBuilder(nimble::message::MessageBuilder& builder, const Fix44BusinessOrder& order) -> void
+PopulateOverlayFallbackBuilder(nimble::message::MessageBuilder& builder,
+                               const Fix44BusinessOrder& order,
+                               std::optional<std::string_view> venue_order_type = std::nullopt) -> void
 {
   builder.set(35U, "D")
     .set(11U, order.cl_ord_id)
@@ -82,64 +90,285 @@ PopulateFix44MessageBuilder(nimble::message::MessageBuilder& builder, const Fix4
   if (order.price.has_value()) {
     builder.set(44U, order.price.value());
   }
+  if (venue_order_type.has_value()) {
+    builder.set(5001U, venue_order_type.value());
+  }
   auto party = builder.add_group_entry(453U);
   party.set(448U, order.party_id).set(447U, order.party_id_source).set(452U, order.party_role);
 }
 
 auto
+BuildRawMessageFromBusinessOrder(const Fix44BusinessOrder& order) -> nimble::message::Message
+{
+  nimble::message::MessageBuilder builder{ "D" };
+  builder.reserve_fields(order.price.has_value() ? 8U : 7U).reserve_groups(1U).reserve_group_entries(453U, 1U);
+  PopulateOverlayFallbackBuilder(builder, order);
+  return std::move(builder).build();
+}
+
+auto
+PopulateFixedLayoutOrder(nimble::message::FixedLayoutWriter* writer, const Fix44BusinessOrder& order) -> void
+{
+  if (writer == nullptr) {
+    return;
+  }
+
+  writer->clear();
+  writer->set_string(fix44::Tag::ClOrdID, order.cl_ord_id)
+    .set_string(fix44::Tag::Symbol, order.symbol)
+    .set_char(fix44::Tag::Side, order.side)
+    .set_string(fix44::Tag::TransactTime, order.transact_time.text)
+    .set_int(fix44::Tag::OrderQty, order.order_qty)
+    .set_char(fix44::Tag::OrdType, order.ord_type);
+  if (order.price.has_value()) {
+    writer->set_float(fix44::Tag::Price, order.price.value());
+  }
+  auto party = writer->add_group_entry(fix44::Tag::NoPartyIDs);
+  party.set_string(fix44::Tag::PartyID, order.party_id)
+    .set_char(fix44::Tag::PartyIDSource, order.party_id_source)
+    .set_int(fix44::Tag::PartyRole, order.party_role);
+}
+
+auto
+TouchRawOrderView(nimble::message::MessageView view) -> std::uint64_t
+{
+  std::uint64_t touched = view.msg_type().size();
+  if (auto cl_ord_id = view.get_string(fix44::Tag::ClOrdID); cl_ord_id.has_value()) {
+    touched += cl_ord_id->size();
+  }
+  if (auto side = view.get_char(fix44::Tag::Side); side.has_value()) {
+    touched += static_cast<unsigned char>(side.value());
+  }
+  if (auto order_qty = view.get_float(fix44::Tag::OrderQty); order_qty.has_value()) {
+    touched += static_cast<std::uint64_t>(order_qty.value());
+  }
+  if (auto parties = view.group(fix44::Tag::NoPartyIDs); parties.has_value() && parties->size() > 0U) {
+    if (auto party_id = (*parties)[0U].get_string(fix44::Tag::PartyID); party_id.has_value()) {
+      touched += party_id->size();
+    }
+  }
+  return touched;
+}
+
+auto
+TouchTypedOrderView(const fix44::NewOrderSingleView& view) -> std::uint64_t
+{
+  std::uint64_t touched = fix44::NewOrderSingleView::kMsgType.size();
+  if (auto cl_ord_id = view.cl_ord_id(); cl_ord_id.has_value()) {
+    touched += cl_ord_id->size();
+  }
+  if (auto side = view.side(); side.ok()) {
+    touched += static_cast<unsigned char>(fix44::ToWire(side.value()));
+  }
+  if (auto order_qty = view.order_qty(); order_qty.has_value()) {
+    touched += static_cast<std::uint64_t>(order_qty.value());
+  }
+  if (auto parties = view.parties(); parties.has_value() && parties->size() > 0U) {
+    if (auto party_id = (*parties)[0U].party_id(); party_id.has_value()) {
+      touched += party_id->size();
+    }
+  }
+  return touched;
+}
+
+class BenchmarkCommandSink final : public nimble::session::SessionCommandSink
+{
+public:
+  auto EnqueueOwnedMessage(std::uint64_t session_id, nimble::message::MessageRef message) -> nimble::base::Status override
+  {
+    if (!message.valid()) {
+      return nimble::base::Status::InvalidArgument("benchmark sink received invalid message");
+    }
+    observed_ += session_id;
+    observed_ += message.view().msg_type().size();
+    ++enqueued_;
+    return nimble::base::Status::Ok();
+  }
+
+  auto EnqueueOwnedEncodedMessage(std::uint64_t session_id, nimble::session::EncodedApplicationMessageRef message)
+    -> nimble::base::Status override
+  {
+    if (!message.valid()) {
+      return nimble::base::Status::InvalidArgument("benchmark sink received invalid encoded message");
+    }
+    auto view = message.view();
+    observed_ += session_id;
+    observed_ += view.msg_type.size();
+    ++enqueued_;
+    return nimble::base::Status::Ok();
+  }
+
+  auto LoadSnapshot(std::uint64_t session_id) const
+    -> nimble::base::Result<nimble::session::SessionSnapshot> override
+  {
+    (void)session_id;
+    return nimble::base::Status::InvalidArgument("benchmark sink does not provide snapshots");
+  }
+
+  auto Subscribe(std::uint64_t session_id, std::size_t queue_capacity)
+    -> nimble::base::Result<nimble::session::SessionSubscription> override
+  {
+    (void)session_id;
+    (void)queue_capacity;
+    return nimble::base::Status::InvalidArgument("benchmark sink does not provide subscriptions");
+  }
+
+  [[nodiscard]] auto enqueued() const -> std::uint64_t { return enqueued_; }
+  [[nodiscard]] auto observed() const -> std::uint64_t { return observed_; }
+
+private:
+  std::uint64_t enqueued_{ 0 };
+  std::uint64_t observed_{ 0 };
+};
+
+class RawQueueDispatchBenchmarkHandler final : public nimble::runtime::QueueApplicationEventHandler
+{
+public:
+  auto OnRuntimeEvent(const nimble::runtime::RuntimeEvent& event) -> nimble::base::Status override
+  {
+    if (event.kind != nimble::runtime::RuntimeEventKind::kApplicationMessage) {
+      return nimble::base::Status::Ok();
+    }
+
+    touched_ += TouchRawOrderView(event.message_view());
+    ++handled_;
+    return nimble::base::Status::Ok();
+  }
+
+  [[nodiscard]] auto handled() const -> std::uint64_t { return handled_; }
+  [[nodiscard]] auto touched() const -> std::uint64_t { return touched_; }
+
+private:
+  std::uint64_t handled_{ 0 };
+  std::uint64_t touched_{ 0 };
+};
+
+class TypedQueueDispatchBenchmarkHandler final : public fix44::Handler
+{
+public:
+  auto OnNewOrderSingle(nimble::runtime::InlineSession<fix44::Profile>& session, fix44::NewOrderSingleView view)
+    -> nimble::base::Status override
+  {
+    (void)session;
+    touched_ += TouchTypedOrderView(view);
+    ++handled_;
+    return nimble::base::Status::Ok();
+  }
+
+  [[nodiscard]] auto handled() const -> std::uint64_t { return handled_; }
+  [[nodiscard]] auto touched() const -> std::uint64_t { return touched_; }
+
+private:
+  std::uint64_t handled_{ 0 };
+  std::uint64_t touched_{ 0 };
+};
+
+class QueueCallbackBenchmarkHandler final : public nimble::runtime::QueueApplicationEventHandler
+{
+public:
+  explicit QueueCallbackBenchmarkHandler(std::shared_ptr<nimble::runtime::ApplicationCallbacks> callbacks)
+    : callbacks_(std::move(callbacks))
+  {
+  }
+
+  auto OnRuntimeEvent(const nimble::runtime::RuntimeEvent& event) -> nimble::base::Status override
+  {
+    if (callbacks_ == nullptr) {
+      return nimble::base::Status::InvalidArgument("benchmark queue callbacks are null");
+    }
+
+    switch (event.kind) {
+      case nimble::runtime::RuntimeEventKind::kSession:
+        return callbacks_->OnSessionEvent(event);
+      case nimble::runtime::RuntimeEventKind::kAdminMessage:
+        return callbacks_->OnAdminMessage(event);
+      case nimble::runtime::RuntimeEventKind::kApplicationMessage:
+        return callbacks_->OnAppMessage(event);
+    }
+    return nimble::base::Status::Ok();
+  }
+
+private:
+  std::shared_ptr<nimble::runtime::ApplicationCallbacks> callbacks_;
+};
+
+auto
 ExtractOrderFromMessageView(nimble::message::MessageView view) -> bench_support::ParsedOrder
 {
-  bench_support::ParsedOrder order;
-  if (auto v = view.get_string(11U)) {
-    order.cl_ord_id = *v;
+  const auto typed_order = fix44::NewOrderSingleView::Bind(view).value();
+  bench_support::ParsedOrder parsed_order;
+  if (auto v = typed_order.cl_ord_id()) {
+    parsed_order.cl_ord_id = *v;
   }
-  if (auto v = view.get_string(55U)) {
-    order.symbol = *v;
+  if (auto v = typed_order.symbol()) {
+    parsed_order.symbol = *v;
   }
-  if (auto v = view.get_char(54U)) {
-    order.side = *v;
+  if (auto v = typed_order.side(); v.ok()) {
+    parsed_order.side = fix44::ToWire(v.value());
   }
-  if (auto v = view.get_string(60U)) {
-    order.transact_time = *v;
+  if (auto v = typed_order.transact_time()) {
+    parsed_order.transact_time = *v;
   }
-  if (auto v = view.get_float(38U)) {
-    order.order_qty = *v;
+  if (auto v = typed_order.order_qty()) {
+    parsed_order.order_qty = *v;
   }
-  if (auto v = view.get_char(40U)) {
-    order.ord_type = *v;
+  if (auto v = typed_order.ord_type(); v.ok()) {
+    parsed_order.ord_type = fix44::ToWire(v.value());
   }
-  if (auto v = view.get_float(44U)) {
-    order.price = *v;
-    order.has_price = true;
+  if (auto v = typed_order.price()) {
+    parsed_order.price = *v;
+    parsed_order.has_price = true;
   }
-  if (auto grp = view.raw_group(453U); grp.has_value() && grp->size() > 0U) {
-    auto entry = (*grp)[0U];
-    if (auto v = entry.field(448U)) {
-      order.party_id = *v;
+  if (auto parties = typed_order.parties(); parties.has_value() && parties->size() > 0U) {
+    auto entry = (*parties)[0U];
+    if (auto v = entry.party_id()) {
+      parsed_order.party_id = *v;
     }
-    if (auto v = entry.field(447U); v.has_value() && !v->empty()) {
-      order.party_id_source = (*v)[0];
+    if (auto v = entry.party_id_source(); v.ok()) {
+      parsed_order.party_id_source = fix44::ToWire(v.value());
     }
-    if (auto v = entry.field(452U); v.has_value() && !v->empty()) {
-      order.party_role = static_cast<int>(*v->data() - '0');
+    if (auto v = entry.party_role(); v.ok()) {
+      parsed_order.party_role = static_cast<int>(fix44::ToWire(v.value()));
     }
   }
-  return order;
+  return parsed_order;
 }
+
+auto
+PopulateGeneratedOrder(fix44::NewOrderSingle* order, const Fix44BusinessOrder& business_order) -> void;
 
 auto
 BuildFix44MessageFromBusinessOrder(const Fix44BusinessOrder& order) -> nimble::message::Message
 {
-  nimble::message::MessageBuilder builder{ "D" };
-  builder.reserve_fields(order.price.has_value() ? 7U : 6U).reserve_groups(1U).reserve_group_entries(453U, 1U);
-  PopulateFix44MessageBuilder(builder, order);
-  return std::move(builder).build();
+  fix44::NewOrderSingle generated_order;
+  PopulateGeneratedOrder(&generated_order, order);
+  return generated_order.ToMessage().value();
 }
 
 auto
 BuildSampleMessage(bool include_price = true) -> nimble::message::Message
 {
   return BuildFix44MessageFromBusinessOrder(BuildFix44BusinessOrder(include_price));
+}
+
+auto
+BuildOverlayBenchmarkMessage(const Fix44BusinessOrder& order, std::string_view venue_order_type) -> nimble::message::Message
+{
+  nimble::message::MessageBuilder builder{ "D" };
+  builder.reserve_fields(order.price.has_value() ? 8U : 7U).reserve_groups(1U).reserve_group_entries(453U, 1U);
+  PopulateOverlayFallbackBuilder(builder, order, venue_order_type);
+  return std::move(builder).build();
+}
+
+auto
+BuildSessionBenchmarkMessage(const nimble::profile::NormalizedDictionaryView& dictionary,
+                             const Fix44BusinessOrder& order) -> nimble::message::Message
+{
+  if (dictionary.find_field(5001U) != nullptr) {
+    // Runtime overlays can add venue-specific tags that the checked-in FIX44 generated header does not know about.
+    return BuildOverlayBenchmarkMessage(order, "L");
+  }
+  return BuildFix44MessageFromBusinessOrder(order);
 }
 
 auto
@@ -157,79 +386,121 @@ BuildEncodedMixedExtras() -> nimble::codec::EncodedOutboundExtras
 }
 
 auto
-PopulateGeneratedWriter(nimble::generated::profile_4400::NewOrderSingleWriter* writer,
-                        const Fix44BusinessOrder& business_order) -> void
+GeneratedSide(char value) -> nimble::generated::profile_4400::Side
 {
-  if (writer == nullptr) {
-    return;
+  switch (value) {
+    case '1':
+      return nimble::generated::profile_4400::Side::Buy;
+    case '2':
+      return nimble::generated::profile_4400::Side::Sell;
+    default:
+      return static_cast<nimble::generated::profile_4400::Side>(value);
   }
-
-  writer->clear();
-  writer->set_cl_ord_id(business_order.cl_ord_id);
-  writer->set_symbol(business_order.symbol);
-  writer->set_side(business_order.side);
-  writer->set_transact_time(business_order.transact_time.text);
-  writer->set_order_qty(business_order.order_qty);
-  writer->set_ord_type(business_order.ord_type);
-  if (business_order.price.has_value()) {
-    writer->set_price(business_order.price.value());
-  }
-  writer->reserve_no_party_i_ds(1U);
-  writer->add_no_party_i_ds()
-    .set_party_id(business_order.party_id)
-    .set_party_id_source(business_order.party_id_source)
-    .set_party_role(business_order.party_role);
 }
 
 auto
-ExtractOrderQty(nimble::message::MessageView order) -> std::optional<double>
+GeneratedOrdType(char value) -> nimble::generated::profile_4400::OrdType
 {
-  if (auto qty = order.get_float(38U); qty.has_value()) {
-    return qty.value();
+  switch (value) {
+    case '1':
+      return nimble::generated::profile_4400::OrdType::Market;
+    case '2':
+      return nimble::generated::profile_4400::OrdType::Limit;
+    default:
+      return static_cast<nimble::generated::profile_4400::OrdType>(value);
   }
-  if (auto qty = order.get_int(38U); qty.has_value()) {
-    return static_cast<double>(qty.value());
+}
+
+auto
+GeneratedPartyIdSource(char value) -> nimble::generated::profile_4400::PartyIdSource
+{
+  switch (value) {
+    case 'D':
+      return nimble::generated::profile_4400::PartyIdSource::Proprietary;
+    case 'G':
+      return nimble::generated::profile_4400::PartyIdSource::Mic;
+    default:
+      return static_cast<nimble::generated::profile_4400::PartyIdSource>(value);
   }
-  return std::nullopt;
+}
+
+auto
+GeneratedPartyRole(std::int64_t value) -> nimble::generated::profile_4400::PartyRole
+{
+  switch (value) {
+    case 1:
+      return nimble::generated::profile_4400::PartyRole::ExecutingFirm;
+    case 3:
+      return nimble::generated::profile_4400::PartyRole::ClientId;
+    case 4:
+      return nimble::generated::profile_4400::PartyRole::ClearingFirm;
+    default:
+      return static_cast<nimble::generated::profile_4400::PartyRole>(value);
+  }
+}
+
+auto
+PopulateGeneratedOrder(nimble::generated::profile_4400::NewOrderSingle* order,
+                       const Fix44BusinessOrder& business_order) -> void
+{
+  if (order == nullptr) {
+    return;
+  }
+
+  order->clear();
+  order->cl_ord_id(business_order.cl_ord_id)
+    .symbol(business_order.symbol)
+    .side(GeneratedSide(business_order.side))
+    .transact_time(business_order.transact_time.text)
+    .order_qty(business_order.order_qty)
+    .ord_type(GeneratedOrdType(business_order.ord_type));
+  if (business_order.price.has_value()) {
+    order->price(business_order.price.value());
+  }
+  order->add_party()
+    .party_id(business_order.party_id)
+    .party_id_source(GeneratedPartyIdSource(business_order.party_id_source))
+    .party_role(GeneratedPartyRole(business_order.party_role));
 }
 
 auto
 BuildFix44OrderAckFromNewOrder(nimble::message::MessageView order, std::uint32_t execution_id)
   -> nimble::base::Result<nimble::message::Message>
 {
-  if (order.msg_type() != "D") {
-    return nimble::base::Status::InvalidArgument("loopback benchmark expected NewOrderSingle (35=D)");
+  auto inbound = fix44::NewOrderSingleView::Bind(order);
+  if (!inbound.ok()) {
+    return inbound.status();
   }
 
-  const auto cl_ord_id = order.get_string(11U);
-  const auto side = order.get_char(54U);
-  const auto order_qty = ExtractOrderQty(order);
-  if (!cl_ord_id.has_value() || !side.has_value() || !order_qty.has_value()) {
+  const auto cl_ord_id = inbound.value().cl_ord_id();
+  const auto side = inbound.value().side();
+  const auto order_qty = inbound.value().order_qty();
+  if (!cl_ord_id.has_value() || !order_qty.has_value()) {
     return nimble::base::Status::InvalidArgument(
       "loopback benchmark NewOrderSingle missing required ack source fields");
   }
+  if (!side.ok()) {
+    return side.status();
+  }
 
-  const auto symbol = order.get_string(55U);
   const auto order_id = std::string("ORDER-") + std::to_string(execution_id);
   const auto exec_id = std::string("EXEC-") + std::to_string(execution_id);
 
-  nimble::message::MessageBuilder ack{ "8" };
-  ack.reserve_fields(10U)
-    .set(35U, "8")
-    .set(37U, order_id)
-    .set(11U, cl_ord_id.value())
-    .set(17U, exec_id)
-    .set(150U, '0')
-    .set(39U, '0')
-    .set(54U, side.value())
-    .set(151U, order_qty.value())
-    .set(14U, 0.0)
-    .set(6U, 0.0);
-  if (symbol.has_value()) {
-    ack.set(55U, symbol.value());
+  fix44::ExecutionReport ack;
+  ack.order_id(order_id)
+    .cl_ord_id(cl_ord_id.value())
+    .exec_id(exec_id)
+    .exec_type(fix44::ExecType::New)
+    .ord_status(fix44::OrdStatus::New)
+    .side(side.value())
+    .order_qty(order_qty.value())
+    .leaves_qty(order_qty.value())
+    .cum_qty(0.0)
+    .avg_px(0.0);
+  if (auto symbol = inbound.value().symbol(); symbol.has_value()) {
+    ack.symbol(symbol.value());
   }
-  ack.set(38U, order_qty.value());
-  return std::move(ack).build();
+  return ack.ToMessage();
 }
 
 auto
@@ -238,29 +509,236 @@ RunEncodeBenchmark(const Fix44BusinessOrder& business_order,
                    const nimble::codec::EncodeOptions& base_options,
                    std::uint32_t iterations) -> nimble::base::Result<BenchmarkResult>
 {
-  auto layout = nimble::message::FixedLayout::Build(dictionary, "D");
-  if (!layout.ok()) {
-    return layout.status();
-  }
   const auto extras = BuildEncodedMixedExtras();
   BenchmarkResult result;
   result.samples_ns.reserve(iterations);
   BenchmarkMeasurement measurement;
   nimble::codec::EncodeBuffer encode_buffer;
-  nimble::generated::profile_4400::NewOrderSingleWriter writer(layout.value());
-  writer.bind_session(base_options.begin_string, base_options.sender_comp_id, base_options.target_comp_id);
+  nimble::generated::profile_4400::NewOrderSingle order;
   auto options = base_options;
   for (std::uint32_t index = 0; index < iterations; ++index) {
     const auto sample_started = std::chrono::steady_clock::now();
     options.msg_seq_num = index + 1U;
-    PopulateGeneratedWriter(&writer, business_order);
-    auto status = writer.encode_to_buffer(dictionary, options, extras.view(), &encode_buffer);
+    PopulateGeneratedOrder(&order, business_order);
+    auto message = order.ToMessage();
+    if (!message.ok()) {
+      return message.status();
+    }
+    auto status = nimble::codec::EncodeFixMessageToBuffer(message.value(), dictionary, options, extras.view(), &encode_buffer);
     if (!status.ok()) {
       return status;
     }
     result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
   }
   measurement.Finish(result);
+  return result;
+}
+
+auto
+RunFixedLayoutEncodeBenchmark(const Fix44BusinessOrder& business_order,
+                              const nimble::profile::NormalizedDictionaryView& dictionary,
+                              const nimble::codec::EncodeOptions& base_options,
+                              std::uint32_t iterations) -> nimble::base::Result<BenchmarkResult>
+{
+  auto layout = nimble::message::FixedLayout::Build(dictionary, "D");
+  if (!layout.ok()) {
+    return layout.status();
+  }
+
+  const auto extras = BuildEncodedMixedExtras();
+  BenchmarkResult result;
+  result.samples_ns.reserve(iterations);
+  result.work_label = "messages";
+
+  BenchmarkMeasurement measurement;
+  nimble::codec::EncodeBuffer encode_buffer;
+  nimble::message::FixedLayoutWriter writer(layout.value());
+  writer.bind_session(base_options.begin_string, base_options.sender_comp_id, base_options.target_comp_id);
+  writer.reserve_group_entries(fix44::Tag::NoPartyIDs, 1U);
+  auto options = base_options;
+  for (std::uint32_t index = 0; index < iterations; ++index) {
+    const auto sample_started = std::chrono::steady_clock::now();
+    options.msg_seq_num = index + 1U;
+    PopulateFixedLayoutOrder(&writer, business_order);
+    auto status = writer.encode_to_buffer(dictionary, options, extras.view(), &encode_buffer);
+    if (!status.ok()) {
+      return status;
+    }
+    result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
+    ++result.work_count;
+  }
+  measurement.Finish(result);
+  return result;
+}
+
+auto
+RunTypedSessionSendBenchmark(const Fix44BusinessOrder& business_order, std::uint32_t iterations)
+  -> nimble::base::Result<BenchmarkResult>
+{
+  auto sink = std::make_shared<BenchmarkCommandSink>();
+  nimble::session::SessionHandle raw_handle(7001U, 0U, sink);
+  nimble::runtime::Session<fix44::Profile> session(raw_handle);
+
+  BenchmarkResult result;
+  result.samples_ns.reserve(iterations);
+  result.work_label = "messages";
+
+  BenchmarkMeasurement measurement;
+  for (std::uint32_t index = 0; index < iterations; ++index) {
+    const auto sample_started = std::chrono::steady_clock::now();
+    fix44::NewOrderSingle order;
+    PopulateGeneratedOrder(&order, business_order);
+    auto status = session.send(std::move(order));
+    if (!status.ok()) {
+      return status;
+    }
+    result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
+    ++result.work_count;
+  }
+  measurement.Finish(result);
+
+  if (sink->enqueued() != iterations || sink->observed() == 0U) {
+    return nimble::base::Status::InvalidArgument("typed session send benchmark did not observe all messages");
+  }
+  return result;
+}
+
+auto
+RunRawSessionSendBenchmark(const Fix44BusinessOrder& business_order, std::uint32_t iterations)
+  -> nimble::base::Result<BenchmarkResult>
+{
+  auto sink = std::make_shared<BenchmarkCommandSink>();
+  nimble::session::SessionHandle session(7002U, 0U, sink);
+
+  BenchmarkResult result;
+  result.samples_ns.reserve(iterations);
+  result.work_label = "messages";
+
+  BenchmarkMeasurement measurement;
+  for (std::uint32_t index = 0; index < iterations; ++index) {
+    const auto sample_started = std::chrono::steady_clock::now();
+    auto message = BuildRawMessageFromBusinessOrder(business_order);
+    auto status = session.Send(nimble::message::MessageRef::Take(std::move(message)));
+    if (!status.ok()) {
+      return status;
+    }
+    result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
+    ++result.work_count;
+  }
+  measurement.Finish(result);
+
+  if (sink->enqueued() != iterations || sink->observed() == 0U) {
+    return nimble::base::Status::InvalidArgument("raw session send benchmark did not observe all messages");
+  }
+  return result;
+}
+
+auto
+RunRawQueueDispatchBenchmark(const nimble::message::Message& sample_message, std::uint32_t iterations)
+  -> nimble::base::Result<BenchmarkResult>
+{
+  nimble::runtime::QueueApplication queue(1U);
+  RawQueueDispatchBenchmarkHandler handler;
+  nimble::runtime::QueueApplicationPoller poller(
+    &queue,
+    &handler,
+    nimble::runtime::QueueApplicationPollerOptions{ .max_events_per_poll = 1U, .yield_when_idle = false });
+  nimble::runtime::RuntimeEvent event{
+    .kind = nimble::runtime::RuntimeEventKind::kApplicationMessage,
+    .session_event = nimble::runtime::SessionEventKind::kBound,
+    .handle = nimble::session::SessionHandle(7101U, 0U),
+    .session_key = nimble::session::SessionKey{ "FIX.4.4", "BUY", "SELL" },
+    .message = {},
+    .text = {},
+    .timestamp_ns = 0U,
+    .poss_resend = false,
+  };
+
+  BenchmarkResult result;
+  result.samples_ns.reserve(iterations);
+  result.work_label = "messages";
+
+  BenchmarkMeasurement measurement;
+  for (std::uint32_t index = 0; index < iterations; ++index) {
+    const auto sample_started = std::chrono::steady_clock::now();
+    event.message = nimble::message::MessageRef::Copy(sample_message.view());
+    auto status = queue.OnAppMessage(event);
+    if (!status.ok()) {
+      return status;
+    }
+    auto drained = poller.PollWorkerOnce(0U);
+    if (!drained.ok()) {
+      return drained.status();
+    }
+    if (drained.value() != 1U) {
+      return nimble::base::Status::InvalidArgument("raw queue dispatch benchmark expected one drained event");
+    }
+    result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
+    ++result.work_count;
+  }
+  measurement.Finish(result);
+
+  if (handler.handled() != iterations || handler.touched() == 0U) {
+    return nimble::base::Status::InvalidArgument("raw queue dispatch benchmark did not handle all messages");
+  }
+  return result;
+}
+
+auto
+RunTypedQueueDispatchBenchmark(const nimble::profile::NormalizedDictionaryView& dictionary,
+                               const nimble::message::Message& sample_message,
+                               std::uint32_t iterations) -> nimble::base::Result<BenchmarkResult>
+{
+  nimble::runtime::ProfileBinding<fix44::Profile> binding(dictionary);
+  auto application = std::make_shared<TypedQueueDispatchBenchmarkHandler>();
+  auto callbacks = std::make_shared<nimble::runtime::detail::TypedRuntimeApplication<fix44::Profile,
+                                                                                       TypedQueueDispatchBenchmarkHandler>>(
+    &binding,
+    application);
+  QueueCallbackBenchmarkHandler handler(callbacks);
+  nimble::runtime::QueueApplication queue(1U);
+  nimble::runtime::QueueApplicationPoller poller(
+    &queue,
+    &handler,
+    nimble::runtime::QueueApplicationPollerOptions{ .max_events_per_poll = 1U, .yield_when_idle = false });
+  nimble::runtime::RuntimeEvent event{
+    .kind = nimble::runtime::RuntimeEventKind::kApplicationMessage,
+    .session_event = nimble::runtime::SessionEventKind::kBound,
+    .handle = nimble::session::SessionHandle(7102U, 0U),
+    .session_key = nimble::session::SessionKey{ "FIX.4.4", "BUY", "SELL" },
+    .message = {},
+    .text = {},
+    .timestamp_ns = 0U,
+    .poss_resend = false,
+  };
+
+  BenchmarkResult result;
+  result.samples_ns.reserve(iterations);
+  result.work_label = "messages";
+
+  BenchmarkMeasurement measurement;
+  for (std::uint32_t index = 0; index < iterations; ++index) {
+    const auto sample_started = std::chrono::steady_clock::now();
+    event.message = nimble::message::MessageRef::Copy(sample_message.view());
+    auto status = queue.OnAppMessage(event);
+    if (!status.ok()) {
+      return status;
+    }
+    auto drained = poller.PollWorkerOnce(0U);
+    if (!drained.ok()) {
+      return drained.status();
+    }
+    if (drained.value() != 1U) {
+      return nimble::base::Status::InvalidArgument("typed queue dispatch benchmark expected one drained event");
+    }
+    result.samples_ns.push_back(DurationNs(sample_started, std::chrono::steady_clock::now()));
+    ++result.work_count;
+  }
+  measurement.Finish(result);
+
+  if (application->handled() != iterations || application->touched() == 0U) {
+    return nimble::base::Status::InvalidArgument("typed queue dispatch benchmark did not handle all messages");
+  }
   return result;
 }
 
@@ -740,16 +1218,15 @@ RunReplayBenchmark(const nimble::profile::NormalizedDictionaryView& dictionary,
     }
   }
 
-  nimble::message::MessageBuilder resend_request_builder{ "2" };
-  resend_request_builder.set(35U, "2")
-    .set(7U, static_cast<std::int64_t>(2))
-    .set(16U, static_cast<std::int64_t>(replay_span + 1U));
-  const auto resend_request = std::move(resend_request_builder).build();
+  fix44::ResendRequest resend_request;
+  resend_request.begin_seq_no(static_cast<std::int64_t>(2)).end_seq_no(static_cast<std::int64_t>(replay_span + 1U));
+  const auto resend_request_message = resend_request.ToMessage().value();
 
   std::vector<std::vector<std::byte>> requests;
   requests.reserve(iterations);
   for (std::uint32_t index = 0; index < iterations; ++index) {
-    auto encoded = BuildFrame(resend_request, dictionary, begin_string, "BUY", "SELL", default_appl_ver_id, index + 2U);
+    auto encoded =
+      BuildFrame(resend_request_message, dictionary, begin_string, "BUY", "SELL", default_appl_ver_id, index + 2U);
     if (!encoded.ok()) {
       return encoded.status();
     }
@@ -830,17 +1307,7 @@ RunSessionBenchmark(const nimble::profile::NormalizedDictionaryView& dictionary,
   }
 
   const auto sample = BuildSampleMessage();
-  nimble::message::Message augmented_sample;
-  const auto& bench_message = [&]() -> const nimble::message::Message& {
-    if (dictionary.find_field(5001U) != nullptr) {
-      nimble::message::MessageBuilder builder{ "D" };
-      PopulateFix44MessageBuilder(builder, BuildFix44BusinessOrder());
-      builder.set(5001U, "L");
-      augmented_sample = std::move(builder).build();
-      return augmented_sample;
-    }
-    return sample;
-  }();
+  const auto bench_message = BuildSessionBenchmarkMessage(dictionary, BuildFix44BusinessOrder());
   std::vector<std::vector<std::byte>> inbound_frames;
   inbound_frames.reserve(iterations);
   for (std::uint32_t index = 0; index < iterations; ++index) {
@@ -925,17 +1392,7 @@ RunSessionOutboundBenchmark(const nimble::profile::NormalizedDictionaryView& dic
   }
 
   const auto sample = BuildSampleMessage();
-  nimble::message::Message augmented_sample;
-  const auto& bench_message = [&]() -> const nimble::message::Message& {
-    if (dictionary.find_field(5001U) != nullptr) {
-      nimble::message::MessageBuilder builder{ "D" };
-      PopulateFix44MessageBuilder(builder, BuildFix44BusinessOrder());
-      builder.set(5001U, "L");
-      augmented_sample = std::move(builder).build();
-      return augmented_sample;
-    }
-    return sample;
-  }();
+  const auto bench_message = BuildSessionBenchmarkMessage(dictionary, BuildFix44BusinessOrder());
 
   const nimble::session::SessionSendEnvelope envelope{ "DESK-9", "ROUTE-7" };
   nimble::codec::EncodeOptions reserve_options;
@@ -1229,6 +1686,13 @@ main(int argc, char** argv)
     return 1;
   }
 
+  auto fixed_layout_encode_result =
+    RunFixedLayoutEncodeBenchmark(fix44_business_order, dictionary.value(), options, iterations);
+  if (!fixed_layout_encode_result.ok()) {
+    std::cerr << fixed_layout_encode_result.status().message() << '\n';
+    return 1;
+  }
+
   auto compiled_decoders = nimble::codec::CompiledDecoderTable::Build(dictionary.value());
 
   BenchmarkResult parse_result;
@@ -1257,6 +1721,30 @@ main(int argc, char** argv)
     return 1;
   }
 
+  auto typed_session_send = RunTypedSessionSendBenchmark(fix44_business_order, iterations);
+  if (!typed_session_send.ok()) {
+    std::cerr << typed_session_send.status().message() << '\n';
+    return 1;
+  }
+
+  auto raw_session_send = RunRawSessionSendBenchmark(fix44_business_order, iterations);
+  if (!raw_session_send.ok()) {
+    std::cerr << raw_session_send.status().message() << '\n';
+    return 1;
+  }
+
+  auto raw_queue_dispatch = RunRawQueueDispatchBenchmark(sample, iterations);
+  if (!raw_queue_dispatch.ok()) {
+    std::cerr << raw_queue_dispatch.status().message() << '\n';
+    return 1;
+  }
+
+  auto typed_queue_dispatch = RunTypedQueueDispatchBenchmark(dictionary.value(), sample, iterations);
+  if (!typed_queue_dispatch.ok()) {
+    std::cerr << typed_queue_dispatch.status().message() << '\n';
+    return 1;
+  }
+
   auto session_outbound =
     RunSessionOutboundBenchmark(dictionary.value(), iterations, begin_string, default_appl_ver_id, false);
   if (!session_outbound.ok()) {
@@ -1274,6 +1762,7 @@ main(int argc, char** argv)
   // --- Shared benchmarks (aligned with QuickFIX compare order) ---
   std::vector<LabeledResult> results;
   results.push_back({ "encode", std::move(encode_result).value() });
+  results.push_back({ "encode-fixed-layout", std::move(fixed_layout_encode_result).value() });
   results.push_back({ "parse", std::move(parse_result) });
   results.push_back({ "session-inbound", std::move(session_benchmark).value() });
 
@@ -1303,6 +1792,10 @@ main(int argc, char** argv)
   // --- NimbleFIX-only benchmarks ---
   results.push_back({ "session-outbound", std::move(session_outbound).value() });
   results.push_back({ "session-outbound-pre-encoded", std::move(session_outbound_pre_encoded).value() });
+  results.push_back({ "session-send-typed", std::move(typed_session_send).value() });
+  results.push_back({ "session-send-raw", std::move(raw_session_send).value() });
+  results.push_back({ "queue-dispatch-typed", std::move(typed_queue_dispatch).value() });
+  results.push_back({ "queue-dispatch-raw", std::move(raw_queue_dispatch).value() });
 
   BenchmarkResult peek_result;
   peek_result.samples_ns.reserve(iterations);

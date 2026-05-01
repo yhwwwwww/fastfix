@@ -1369,6 +1369,63 @@ DurableBatchSessionStore::LoadOutboundRangeViews(std::uint64_t session_id,
 }
 
 auto
+DurableBatchSessionStore::LoadInboundRange(std::uint64_t session_id,
+                                           std::uint32_t begin_seq,
+                                           std::uint32_t end_seq) const -> base::Result<std::vector<MessageRecord>>
+{
+  if (begin_seq == 0U || end_seq == 0U || begin_seq > end_seq) {
+    return base::Status::InvalidArgument("invalid inbound load range");
+  }
+
+  auto status = const_cast<DurableBatchSessionStore*>(this)->Open();
+  if (!status.ok()) {
+    return status;
+  }
+  if (!impl_->pending_entries.empty()) {
+    status = const_cast<DurableBatchSessionStore*>(this)->Flush();
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  std::vector<MessageRecord> records;
+  auto collect_inbound = [&](const StoreRecordHeader& header, std::span<const std::byte> payload) -> base::Status {
+    if (header.record_type != static_cast<std::uint32_t>(StoreRecordType::kInbound) ||
+        header.session_id != session_id || header.seq_num < begin_seq || header.seq_num > end_seq) {
+      return base::Status::Ok();
+    }
+
+    MessageRecord record;
+    record.session_id = header.session_id;
+    record.seq_num = header.seq_num;
+    record.timestamp_ns = header.timestamp_ns;
+    record.flags = header.flags;
+    record.body_start_offset = header.reserved0;
+    record.payload.assign(payload.begin(), payload.end());
+    records.push_back(std::move(record));
+    return base::Status::Ok();
+  };
+
+  for (const auto& [segment_id, segment] : impl_->archived_segments) {
+    (void)segment_id;
+    status = VisitSegmentRecords(segment, collect_inbound);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  status = VisitSegmentRecords(impl_->active_segment, collect_inbound);
+  if (!status.ok()) {
+    return status;
+  }
+
+  std::stable_sort(records.begin(), records.end(), [](const MessageRecord& lhs, const MessageRecord& rhs) {
+    return lhs.seq_num < rhs.seq_num;
+  });
+  return records;
+}
+
+auto
 DurableBatchSessionStore::SaveRecoveryState(const SessionRecoveryState& state) -> base::Status
 {
   return QueueRecoveryState(state);

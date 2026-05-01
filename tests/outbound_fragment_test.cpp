@@ -4,11 +4,11 @@
 #include <string>
 #include <string_view>
 
-#include "fix44_builders.h"
+#include "fix44_api.h"
 #include "nimblefix/codec/fix_codec.h"
 #include "nimblefix/codec/fix_tags.h"
-#include "nimblefix/message/fixed_layout_writer.h"
-#include "nimblefix/message/message_builder.h"
+#include "nimblefix/advanced/fixed_layout_writer.h"
+#include "nimblefix/advanced/message_builder.h"
 
 #include "test_support.h"
 
@@ -38,6 +38,7 @@ ToReadableFrame(std::span<const std::byte> bytes) -> std::string
 } // namespace
 
 using namespace nimble::codec::tags;
+using namespace nimble::generated::profile_4400;
 
 TEST_CASE("encoded fragments drive generic and template encoders end-to-end", "[fix-codec][outbound-fragment]")
 {
@@ -199,15 +200,12 @@ TEST_CASE("encoded fragments drive fixed layout writer end-to-end", "[fix-codec]
   CHECK(account < tail);
 }
 
-TEST_CASE("encoded fragments drive generated writer end-to-end", "[fix-codec][outbound-fragment]")
+TEST_CASE("encoded fragments drive generated api end-to-end", "[fix-codec][outbound-fragment]")
 {
   auto dictionary = nimble::tests::LoadFix44DictionaryView();
   if (!dictionary.ok()) {
     SKIP("FIX44 artifact not available: " << dictionary.status().message());
   }
-
-  auto layout = nimble::message::FixedLayout::Build(dictionary.value(), "D");
-  REQUIRE(layout.ok());
 
   const auto extras = EncodedExtras("50=DESK-9\x01"
                                     "57=ROUTE-7\x01"
@@ -217,14 +215,13 @@ TEST_CASE("encoded fragments drive generated writer end-to-end", "[fix-codec][ou
                                     "1=ACC-77\x01"
                                     "9999=TAIL\x01");
 
-  nimble::generated::profile_4400::NewOrderSingleWriter writer(layout.value());
-  writer.bind_session("FIX.4.4", "BUY", "SELL");
-  writer.set_cl_ord_id("ORD-42")
-    .set_symbol("AAPL")
-    .set_side('1')
-    .set_transact_time("20260414-09:30:00.000")
-    .set_order_qty(100)
-    .set_ord_type('2');
+  NewOrderSingle order;
+  order.cl_ord_id("ORD-42")
+    .symbol("AAPL")
+    .side(Side::Buy)
+    .transact_time("20260414-09:30:00.000")
+    .order_qty(100)
+    .ord_type(OrdType::Limit);
 
   nimble::codec::EncodeOptions options;
   options.begin_string = "FIX.4.4";
@@ -233,8 +230,11 @@ TEST_CASE("encoded fragments drive generated writer end-to-end", "[fix-codec][ou
   options.msg_seq_num = 17U;
   options.sending_time = "20260414-09:30:01.000";
 
+  auto message = order.ToMessage();
+  REQUIRE(message.ok());
+
   nimble::codec::EncodeBuffer buffer;
-  auto status = writer.encode_to_buffer(dictionary.value(), options, extras.view(), &buffer);
+  auto status = nimble::codec::EncodeFixMessageToBuffer(message.value(), dictionary.value(), options, extras.view(), &buffer);
   REQUIRE(status.ok());
 
   auto decoded = nimble::codec::DecodeFixMessageView(buffer.bytes(), dictionary.value());

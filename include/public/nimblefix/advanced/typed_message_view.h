@@ -20,6 +20,11 @@ enum class ValidationMode : std::uint8_t
 
 class TypedGroupView;
 
+/// Advanced dictionary-bound raw view over one message.
+///
+/// Prefer generated inbound typed views emitted by `--cpp-api` for normal
+/// business handlers. Use `TypedMessageView` when the schema is selected
+/// dynamically at runtime or tooling needs tag-level dictionary lookup.
 class TypedMessageView
 {
 public:

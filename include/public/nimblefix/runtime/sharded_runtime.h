@@ -36,6 +36,7 @@ public:
 
   [[nodiscard]] auto RouteSession(const session::SessionKey& key) const -> std::uint32_t;
   auto RegisterSession(const session::SessionCore& session) -> base::Status;
+  auto UnregisterSession(std::uint64_t session_id) -> base::Status;
   auto RegisterPendingConnection(const PendingConnection& pending) -> base::Status;
   auto UnregisterPendingConnection(std::uint64_t connection_id) -> base::Status;
 

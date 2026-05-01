@@ -71,6 +71,8 @@ public:
     -> base::Result<std::vector<MessageRecord>> override;
   auto LoadOutboundRangeViews(std::uint64_t session_id, std::uint32_t begin_seq, std::uint32_t end_seq) const
     -> base::Result<MessageRecordViewRange> override;
+  auto LoadInboundRange(std::uint64_t session_id, std::uint32_t begin_seq, std::uint32_t end_seq) const
+    -> base::Result<std::vector<MessageRecord>> override;
   auto SaveRecoveryState(const SessionRecoveryState& state) -> base::Status override;
   auto LoadRecoveryState(std::uint64_t session_id) const -> base::Result<SessionRecoveryState> override;
 

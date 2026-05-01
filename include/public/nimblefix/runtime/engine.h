@@ -13,15 +13,21 @@
 #include "nimblefix/base/status.h"
 #include "nimblefix/codec/fix_codec.h"
 #include "nimblefix/profile/normalized_dictionary.h"
-#include "nimblefix/runtime/application.h"
 #include "nimblefix/runtime/config.h"
+#include "nimblefix/runtime/diagnostics.h"
+#include "nimblefix/runtime/dynamic_config.h"
 #include "nimblefix/runtime/metrics.h"
+#include "nimblefix/runtime/profile_binding.h"
 #include "nimblefix/runtime/profile_registry.h"
+#include "nimblefix/runtime/session_schedule.h"
 #include "nimblefix/runtime/sharded_runtime.h"
 #include "nimblefix/runtime/trace.h"
 #include "nimblefix/session/session_key.h"
 
 namespace nimble::runtime {
+
+class ApplicationCallbacks;
+struct ManagedQueueApplicationRunnerOptions;
 
 inline constexpr std::uint64_t kFirstDynamicSessionId = 0x8000'0000'0000'0000ULL;
 
@@ -92,12 +98,23 @@ public:
   // counterparties, and makes config()/profiles()/runtime()/Find* queries
   // available on success.
   auto Boot(const EngineConfig& config) -> base::Status;
-  auto EnsureManagedQueueRunnerStarted(const void* owner,
-                                       ApplicationCallbacks* application,
-                                       std::optional<ManagedQueueApplicationRunnerOptions>* options) -> base::Status;
-  auto StopManagedQueueRunner(const void* owner) -> base::Status;
-  auto ReleaseManagedQueueRunner(const void* owner) -> base::Status;
-  auto PollManagedQueueWorkerOnce(const void* owner, std::uint32_t worker_id) -> base::Result<std::size_t>;
+  /// Apply a new configuration without full engine restart.
+  ///
+  /// Computes the delta between the current config and new_config, then:
+  /// - Validates the new config
+  /// - Loads any new profiles
+  /// - Adds new counterparties (registers with ShardedRuntime, updates bookkeeping)
+  /// - Removes absent counterparties (unregisters from ShardedRuntime)
+  /// - Updates modifiable counterparty fields in-place
+  /// - Adds/removes/modifies listeners
+  /// - Updates engine-level live-changeable fields (trace, metrics)
+  ///
+  /// Returns ApplyConfigResult describing what was applied and what requires restart.
+  /// Skipped changes do NOT prevent other changes from being applied.
+  ///
+  /// Precondition: Engine must be booted (Boot() returned Ok).
+  /// Thread safety: call from the control thread only, not from worker threads.
+  auto ApplyConfig(const EngineConfig& new_config) -> base::Result<ApplyConfigResult>;
 
   [[nodiscard]] auto profiles() const -> const ProfileRegistry&;
   [[nodiscard]] auto runtime() const -> const ShardedRuntime*;
@@ -106,10 +123,17 @@ public:
   [[nodiscard]] auto mutable_metrics() -> MetricsRegistry*;
   [[nodiscard]] auto trace() const -> const TraceRecorder&;
   [[nodiscard]] auto mutable_trace() -> TraceRecorder*;
+  [[nodiscard]] auto diagnostics() -> DiagnosticsMonitor&;
+  [[nodiscard]] auto diagnostics() const -> const DiagnosticsMonitor&;
   [[nodiscard]] auto config() const -> const EngineConfig*;
 
   [[nodiscard]] auto FindCounterpartyConfig(std::uint64_t session_id) const -> const CounterpartyConfig*;
+  /// Query schedule status for a registered counterparty session.
+  [[nodiscard]] auto QueryScheduleStatus(std::uint64_t session_id, std::uint64_t unix_time_ns) const
+    -> base::Result<SessionScheduleStatus>;
   [[nodiscard]] auto FindListenerConfig(std::string_view name) const -> const ListenerConfig*;
+  template<class Profile>
+  auto Bind() const -> base::Result<ProfileBinding<Profile>>;
   auto LoadDictionaryView(std::uint64_t profile_id) const -> base::Result<profile::NormalizedDictionaryView>;
   auto ResolveInboundSession(const codec::SessionHeader& header) const -> base::Result<ResolvedCounterparty>;
   auto ResolveInboundSession(const codec::SessionHeaderView& header) const -> base::Result<ResolvedCounterparty>;
@@ -119,8 +143,38 @@ public:
   void SetSessionFactory(SessionFactory factory);
 
 private:
+  friend auto EnsureManagedQueueRunnerStarted(Engine& engine,
+                                              const void* owner,
+                                              ApplicationCallbacks* application,
+                                              std::optional<ManagedQueueApplicationRunnerOptions>* options)
+    -> base::Status;
+  friend auto StopManagedQueueRunner(Engine& engine, const void* owner) -> base::Status;
+  friend auto ReleaseManagedQueueRunner(Engine& engine, const void* owner) -> base::Status;
+  friend auto PollManagedQueueWorkerOnce(Engine& engine, const void* owner, std::uint32_t worker_id)
+    -> base::Result<std::size_t>;
+
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+template<class Profile>
+auto
+Engine::Bind() const -> base::Result<ProfileBinding<Profile>>
+{
+  auto dictionary = LoadDictionaryView(Profile::kProfileId);
+  if (!dictionary.ok()) {
+    return dictionary.status();
+  }
+
+  const auto& loaded_profile = dictionary.value().profile();
+  if (loaded_profile.profile_id() != Profile::kProfileId) {
+    return base::Status::VersionMismatch("profile_id mismatch between generated API and runtime profile");
+  }
+  if (loaded_profile.schema_hash() != Profile::kSchemaHash) {
+    return base::Status::VersionMismatch("schema_hash mismatch between generated API and runtime profile");
+  }
+
+  return ProfileBinding<Profile>(std::move(dictionary).value());
+}
 
 } // namespace nimble::runtime
