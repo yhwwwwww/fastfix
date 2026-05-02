@@ -207,6 +207,11 @@ if(NIMBLEFIX_BUILD_TOOLS)
         "${PROJECT_SOURCE_DIR}/tools/msgdump/*.cpp"
     )
     nimblefix_add_binary(nimblefix-msgdump ${NIMBLEFIX_MSGDUMP_SOURCES})
+
+    file(GLOB NIMBLEFIX_ROUTER_SOURCES CONFIGURE_DEPENDS
+        "${PROJECT_SOURCE_DIR}/tools/router/*.cpp"
+    )
+    nimblefix_add_binary(nimblefix-router ${NIMBLEFIX_ROUTER_SOURCES})
 endif()
 
 if(NIMBLEFIX_BUILD_FUZZERS)
