@@ -249,6 +249,8 @@ struct LiveInitiator::ActiveSession
   std::optional<session::AdminProtocol> protocol;
   std::string host;
   std::uint16_t port{ 0 };
+  std::string primary_host;
+  std::uint16_t primary_port{ 0 };
 };
 
 struct LiveInitiator::ConnectionState
@@ -257,6 +259,7 @@ struct LiveInitiator::ConnectionState
   transport::TransportConnection connection;
   std::unique_ptr<ActiveSession> session;
   std::uint64_t last_progress_ns{ 0 };
+  std::uint64_t connected_since_ns{ 0 };
   std::uint64_t last_backlog_notify_ns{ 0 };
   std::optional<RuntimeEvent> pending_app_event;
   bool close_requested{ false };
@@ -954,6 +957,7 @@ LiveInitiator::OpenSession(std::uint64_t session_id, std::string host, std::uint
     .connection = std::move(transport_connection),
     .session = std::move(active_session),
     .last_progress_ns = timestamp_ns,
+    .connected_since_ns = timestamp_ns,
   };
 
   auto status = SendFrames(state, start.value().outbound_frames, timestamp_ns);
@@ -1623,35 +1627,60 @@ LiveInitiator::ProcessPendingReconnects(WorkerShardState& shard, std::uint64_t t
                     "tls client handshake failed");
       }
       it->retry_count++;
-      const auto max_retries = it->session->counterparty.reconnect_max_retries;
-      if (max_retries > 0 && it->retry_count >= max_retries) {
-        RecordTrace(TraceEventKind::kSessionEvent,
-                    it->session_id,
-                    it->session->worker_id,
-                    timestamp_ns,
-                    0,
-                    it->retry_count,
-                    "reconnect gave up");
-        SetTerminalStatus(
-          base::Status::IoError("reconnect gave up after " + std::to_string(it->retry_count) + " attempts"));
-        if (it->session_registered) {
-          UnregisterActiveSession(it->session_id);
-          std::lock_guard lock(control_mutex_);
-          session_worker_ids_.erase(it->session_id);
+      if (it->session->counterparty.connection_strategy != nullptr) {
+        const auto context = MakeConnectionContext(*it->session, it->retry_count, std::chrono::milliseconds{ 0 });
+        const auto decision = it->session->counterparty.connection_strategy->OnDisconnected(context);
+        if (!ApplyConnectionStrategyDecision(*it, decision, timestamp_ns, wall_now_ns)) {
+          RecordTrace(TraceEventKind::kSessionEvent,
+                      it->session_id,
+                      it->session->worker_id,
+                      timestamp_ns,
+                      0,
+                      it->retry_count,
+                      "reconnect gave up");
+          SetTerminalStatus(
+            base::Status::IoError("reconnect gave up after " + std::to_string(it->retry_count) + " attempts"));
+          if (it->session_registered) {
+            UnregisterActiveSession(it->session_id);
+            std::lock_guard lock(control_mutex_);
+            session_worker_ids_.erase(it->session_id);
+          }
+          pending_reconnect_count_.fetch_sub(1U);
+          it = shard.pending_reconnects.erase(it);
+          continue;
         }
-        pending_reconnect_count_.fetch_sub(1U);
-        it = shard.pending_reconnects.erase(it);
-        continue;
-      }
+      } else {
+        const auto max_retries = it->session->counterparty.reconnect_max_retries;
+        if (max_retries > 0 && it->retry_count >= max_retries) {
+          RecordTrace(TraceEventKind::kSessionEvent,
+                      it->session_id,
+                      it->session->worker_id,
+                      timestamp_ns,
+                      0,
+                      it->retry_count,
+                      "reconnect gave up");
+          SetTerminalStatus(
+            base::Status::IoError("reconnect gave up after " + std::to_string(it->retry_count) + " attempts"));
+          if (it->session_registered) {
+            UnregisterActiveSession(it->session_id);
+            std::lock_guard lock(control_mutex_);
+            session_worker_ids_.erase(it->session_id);
+          }
+          pending_reconnect_count_.fetch_sub(1U);
+          it = shard.pending_reconnects.erase(it);
+          continue;
+        }
 
-      const auto max_ms = it->session->counterparty.reconnect_max_ms;
-      const auto next_backoff = std::min(it->current_backoff_ms * 2, max_ms);
-      const auto jitter = RandomJitter(ReconnectJitterLimit(it->current_backoff_ms));
-      it->current_backoff_ms = next_backoff;
-      it->next_attempt_ns = ComputeScheduledAttemptNs(it->session->counterparty,
-                                                      timestamp_ns,
-                                                      wall_now_ns,
-                                                      MillisToNanos(static_cast<std::uint64_t>(next_backoff) + jitter));
+        const auto max_ms = it->session->counterparty.reconnect_max_ms;
+        const auto next_backoff = std::min(it->current_backoff_ms * 2, max_ms);
+        const auto jitter = RandomJitter(ReconnectJitterLimit(it->current_backoff_ms));
+        it->current_backoff_ms = next_backoff;
+        it->next_attempt_ns =
+          ComputeScheduledAttemptNs(it->session->counterparty,
+                                    timestamp_ns,
+                                    wall_now_ns,
+                                    MillisToNanos(static_cast<std::uint64_t>(next_backoff) + jitter));
+      }
       last_progress_ns_.store(timestamp_ns);
       ++it;
       continue;
@@ -1696,11 +1725,15 @@ LiveInitiator::ProcessPendingReconnects(WorkerShardState& shard, std::uint64_t t
     }
     session_registry_.ClearTerminalStatus();
 
+    it->session->host = it->host;
+    it->session->port = it->port;
+
     ConnectionState state{
       .connection_id = next_connection_id_.fetch_add(1U, std::memory_order_relaxed),
       .connection = std::move(transport_connection),
       .session = std::move(it->session),
       .last_progress_ns = timestamp_ns,
+      .connected_since_ns = timestamp_ns,
     };
 
     auto send_status = SendFrames(state, connected.value().outbound_frames, timestamp_ns);
@@ -1711,26 +1744,41 @@ LiveInitiator::ProcessPendingReconnects(WorkerShardState& shard, std::uint64_t t
       }
       it->session = std::move(state.session);
       it->retry_count++;
-      const auto max_retries = it->session->counterparty.reconnect_max_retries;
-      if (max_retries > 0 && it->retry_count >= max_retries) {
-        if (it->session_registered) {
-          UnregisterActiveSession(it->session_id);
-          std::lock_guard lock(control_mutex_);
-          session_worker_ids_.erase(it->session_id);
+      if (it->session->counterparty.connection_strategy != nullptr) {
+        const auto context = MakeConnectionContext(*it->session, it->retry_count, std::chrono::milliseconds{ 0 });
+        const auto decision = it->session->counterparty.connection_strategy->OnDisconnected(context);
+        if (!ApplyConnectionStrategyDecision(*it, decision, timestamp_ns, wall_now_ns)) {
+          if (it->session_registered) {
+            UnregisterActiveSession(it->session_id);
+            std::lock_guard lock(control_mutex_);
+            session_worker_ids_.erase(it->session_id);
+          }
+          pending_reconnect_count_.fetch_sub(1U);
+          it = shard.pending_reconnects.erase(it);
+          continue;
         }
-        pending_reconnect_count_.fetch_sub(1U);
-        it = shard.pending_reconnects.erase(it);
-        continue;
+      } else {
+        const auto max_retries = it->session->counterparty.reconnect_max_retries;
+        if (max_retries > 0 && it->retry_count >= max_retries) {
+          if (it->session_registered) {
+            UnregisterActiveSession(it->session_id);
+            std::lock_guard lock(control_mutex_);
+            session_worker_ids_.erase(it->session_id);
+          }
+          pending_reconnect_count_.fetch_sub(1U);
+          it = shard.pending_reconnects.erase(it);
+          continue;
+        }
+        const auto max_ms = it->session->counterparty.reconnect_max_ms;
+        const auto next_backoff = std::min(it->current_backoff_ms * 2, max_ms);
+        const auto jitter_val = RandomJitter(ReconnectJitterLimit(it->current_backoff_ms));
+        it->current_backoff_ms = next_backoff;
+        it->next_attempt_ns =
+          ComputeScheduledAttemptNs(it->session->counterparty,
+                                    timestamp_ns,
+                                    wall_now_ns,
+                                    MillisToNanos(static_cast<std::uint64_t>(next_backoff) + jitter_val));
       }
-      const auto max_ms = it->session->counterparty.reconnect_max_ms;
-      const auto next_backoff = std::min(it->current_backoff_ms * 2, max_ms);
-      const auto jitter_val = RandomJitter(ReconnectJitterLimit(it->current_backoff_ms));
-      it->current_backoff_ms = next_backoff;
-      it->next_attempt_ns =
-        ComputeScheduledAttemptNs(it->session->counterparty,
-                                  timestamp_ns,
-                                  wall_now_ns,
-                                  MillisToNanos(static_cast<std::uint64_t>(next_backoff) + jitter_val));
       ++it;
       continue;
     }
@@ -1791,6 +1839,99 @@ LiveInitiator::RetryPendingAppEvent(ConnectionState& connection, std::uint64_t t
 }
 
 auto
+LiveInitiator::MakeConnectionContext(const ActiveSession& session,
+                                     std::uint32_t consecutive_failures,
+                                     std::chrono::milliseconds last_connected_duration) const -> ConnectionContext
+{
+  const auto& primary_host = session.primary_host.empty() ? session.host : session.primary_host;
+  const auto primary_port = session.primary_port == 0U ? session.port : session.primary_port;
+  return ConnectionContext{
+    .session_id = session.counterparty.session.session_id,
+    .consecutive_failures = consecutive_failures,
+    .last_connected_duration = last_connected_duration,
+    .primary_endpoint = ConnectionEndpoint{ .host = primary_host, .port = primary_port },
+    .alternate_endpoints = session.counterparty.alternate_endpoints,
+  };
+}
+
+auto
+LiveInitiator::NotifyConnectionStrategyConnected(const ActiveSession& session) const -> void
+{
+  if (session.counterparty.connection_strategy == nullptr) {
+    return;
+  }
+  session.counterparty.connection_strategy->OnConnected(
+    MakeConnectionContext(session, 0U, std::chrono::milliseconds{ 0 }));
+}
+
+auto
+LiveInitiator::ApplyConnectionStrategyDecision(PendingReconnect& reconnect,
+                                               const ConnectionDecision& decision,
+                                               std::uint64_t timestamp_ns,
+                                               std::uint64_t wall_now_ns) const -> bool
+{
+  if (decision.give_up || reconnect.session == nullptr) {
+    return false;
+  }
+
+  const auto context = MakeConnectionContext(*reconnect.session, reconnect.retry_count, std::chrono::milliseconds{ 0 });
+  const auto& endpoint = decision.next_endpoint.has_value() ? *decision.next_endpoint : context.primary_endpoint;
+  const auto delay_ms = decision.delay.count() < 0 ? 0U : static_cast<std::uint64_t>(decision.delay.count());
+  reconnect.host = endpoint.host;
+  reconnect.port = endpoint.port;
+  reconnect.next_attempt_ns =
+    ComputeScheduledAttemptNs(reconnect.session->counterparty, timestamp_ns, wall_now_ns, MillisToNanos(delay_ms));
+  return true;
+}
+
+auto
+LiveInitiator::ScheduleStrategyReconnect(WorkerShardState& shard,
+                                         std::uint64_t session_id,
+                                         std::uint32_t retry_count,
+                                         std::chrono::milliseconds last_connected_duration,
+                                         std::uint64_t timestamp_ns,
+                                         std::unique_ptr<ActiveSession> session) -> bool
+{
+  if (session == nullptr || session->counterparty.connection_strategy == nullptr) {
+    return false;
+  }
+
+  const auto context = MakeConnectionContext(*session, retry_count, last_connected_duration);
+  const auto decision = session->counterparty.connection_strategy->OnDisconnected(context);
+  if (decision.give_up) {
+    return false;
+  }
+
+  const auto& endpoint = decision.next_endpoint.has_value() ? *decision.next_endpoint : context.primary_endpoint;
+  const auto delay_ms = decision.delay.count() < 0 ? 0U : static_cast<std::uint64_t>(decision.delay.count());
+  const auto wall_now_ns = WallClockNowNs();
+  shard.pending_reconnects.push_back(PendingReconnect{
+    .session_id = session_id,
+    .host = endpoint.host,
+    .port = endpoint.port,
+    .retry_count = retry_count,
+    .current_backoff_ms = session->counterparty.reconnect_initial_ms,
+    .next_attempt_ns =
+      ComputeScheduledAttemptNs(session->counterparty, timestamp_ns, wall_now_ns, MillisToNanos(delay_ms)),
+    .session_registered = true,
+    .session = std::move(session),
+  });
+  pending_reconnect_count_.fetch_add(1U);
+  return true;
+}
+
+auto
+LiveInitiator::ConnectionDuration(std::uint64_t connected_since_ns, std::uint64_t timestamp_ns) const
+  -> std::chrono::milliseconds
+{
+  if (connected_since_ns == 0U || timestamp_ns <= connected_since_ns) {
+    return std::chrono::milliseconds{ 0 };
+  }
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::nanoseconds{ timestamp_ns - connected_since_ns });
+}
+
+auto
 LiveInitiator::HandleInboundFrame(WorkerShardState& shard,
                                   ConnectionState& connection,
                                   std::span<const std::byte> frame,
@@ -1842,6 +1983,7 @@ LiveInitiator::HandleInboundFrame(WorkerShardState& shard,
   }
 
   if (event.session_active) {
+    NotifyConnectionStrategyConnected(*connection.session);
     auto status =
       DispatchSessionEvent(*connection.session, SessionEventKind::kActive, timestamp_ns, "session active", true);
     if (!status.ok()) {
@@ -2384,23 +2526,38 @@ LiveInitiator::CloseConnection(WorkerShardState& shard, std::size_t connection_i
   last_progress_ns_.store(timestamp_ns);
 
   if (schedule_reconnect && connection.session != nullptr) {
-    const auto initial_ms = connection.session->counterparty.reconnect_initial_ms;
-    const auto jitter = RandomJitter(ReconnectJitterLimit(initial_ms));
-    const auto wall_now_ns = WallClockNowNs();
-    shard.pending_reconnects.push_back(PendingReconnect{
-      .session_id = session_id,
-      .host = connection.session->host,
-      .port = connection.session->port,
-      .retry_count = 0,
-      .current_backoff_ms = initial_ms,
-      .next_attempt_ns = ComputeScheduledAttemptNs(connection.session->counterparty,
-                                                   timestamp_ns,
-                                                   wall_now_ns,
-                                                   MillisToNanos(static_cast<std::uint64_t>(initial_ms) + jitter)),
-      .session_registered = true,
-      .session = std::move(connection.session),
-    });
-    pending_reconnect_count_.fetch_add(1U);
+    if (connection.session->counterparty.connection_strategy != nullptr) {
+      auto session = std::move(connection.session);
+      if (!ScheduleStrategyReconnect(shard,
+                                     session_id,
+                                     0U,
+                                     ConnectionDuration(connection.connected_since_ns, timestamp_ns),
+                                     timestamp_ns,
+                                     std::move(session))) {
+        SetTerminalStatus(base::Status::IoError("reconnect gave up after strategy decision"));
+        UnregisterActiveSession(session_id);
+        std::lock_guard lock(control_mutex_);
+        session_worker_ids_.erase(session_id);
+      }
+    } else {
+      const auto initial_ms = connection.session->counterparty.reconnect_initial_ms;
+      const auto jitter = RandomJitter(ReconnectJitterLimit(initial_ms));
+      const auto wall_now_ns = WallClockNowNs();
+      shard.pending_reconnects.push_back(PendingReconnect{
+        .session_id = session_id,
+        .host = connection.session->host,
+        .port = connection.session->port,
+        .retry_count = 0,
+        .current_backoff_ms = initial_ms,
+        .next_attempt_ns = ComputeScheduledAttemptNs(connection.session->counterparty,
+                                                     timestamp_ns,
+                                                     wall_now_ns,
+                                                     MillisToNanos(static_cast<std::uint64_t>(initial_ms) + jitter)),
+        .session_registered = true,
+        .session = std::move(connection.session),
+      });
+      pending_reconnect_count_.fetch_add(1U);
+    }
   }
 }
 
@@ -2472,6 +2629,8 @@ LiveInitiator::MakeActiveSession(const CounterpartyConfig& counterparty,
   session_state->store = std::move(store).value();
   session_state->host = std::move(host);
   session_state->port = port;
+  session_state->primary_host = session_state->host;
+  session_state->primary_port = port;
   session_state->protocol.emplace(
     MakeProtocolConfig(counterparty), *session_state->dictionary, session_state->store.get());
   return session_state;

@@ -726,6 +726,12 @@ PathToText(const std::filesystem::path& path) -> std::string
 }
 
 auto
+EndpointToText(const ConnectionEndpoint& endpoint) -> std::string
+{
+  return endpoint.host + ":" + std::to_string(endpoint.port);
+}
+
+auto
 ValidateTlsClientConfigFull(std::size_t counterparty_index,
                             std::string_view counterparty_name,
                             const TlsClientConfig& config) -> ConfigValidationResult
@@ -1168,7 +1174,12 @@ ConfigToText(const EngineConfig& config) -> std::string
         << codec::TimestampResolutionName(counterparty.timestamp_resolution) << '|'
         << session::UnknownFieldActionName(counterparty.validation_policy.unknown_field_action) << '|'
         << session::MalformedFieldActionName(counterparty.validation_policy.malformed_field_action) << '|'
-        << BoolToText(counterparty.validation_policy.validate_enum_values) << '\n';
+        << BoolToText(counterparty.validation_policy.validate_enum_values) << '|'
+        << JoinCsv(counterparty.alternate_endpoints, EndpointToText) << '\n';
+    if (counterparty.connection_strategy != nullptr) {
+      out << "# counterparty " << counterparty.name
+          << " has a runtime-only connection_strategy; strategy objects are not serialized\n";
+    }
   }
 
   return out.str();

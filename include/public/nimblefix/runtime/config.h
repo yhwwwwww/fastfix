@@ -9,6 +9,7 @@
 
 #include "nimblefix/base/status.h"
 #include "nimblefix/codec/timestamp_resolution.h"
+#include "nimblefix/runtime/connection_strategy.h"
 #include "nimblefix/runtime/io_backend.h"
 #include "nimblefix/session/resend_recovery.h"
 #include "nimblefix/session/session_core.h"
@@ -285,6 +286,12 @@ struct CounterpartyConfig
   std::uint32_t reconnect_initial_ms = kDefaultReconnectInitialMs;
   std::uint32_t reconnect_max_ms = kDefaultReconnectMaxMs;
   std::uint32_t reconnect_max_retries = kUnlimitedReconnectRetries;
+  // Optional connection strategy override. When set, controls reconnect timing
+  // and endpoint selection. When null, the existing exponential backoff behavior
+  // based on reconnect_initial_ms/reconnect_max_ms/reconnect_max_retries applies.
+  std::shared_ptr<ConnectionStrategy> connection_strategy;
+  // Additional endpoints for strategies that support multi-endpoint failover.
+  std::vector<ConnectionEndpoint> alternate_endpoints;
   // Sequence-reset day-cut policy.
   session::DayCutConfig day_cut;
 };

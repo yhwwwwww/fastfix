@@ -181,7 +181,8 @@ CounterpartyEquals(const CounterpartyConfig& left, const CounterpartyConfig& rig
          left.acceptor_transport_security == right.acceptor_transport_security &&
          left.reconnect_enabled == right.reconnect_enabled && left.reconnect_initial_ms == right.reconnect_initial_ms &&
          left.reconnect_max_ms == right.reconnect_max_ms && left.reconnect_max_retries == right.reconnect_max_retries &&
-         DayCutEquals(left.day_cut, right.day_cut);
+         left.connection_strategy.get() == right.connection_strategy.get() &&
+         left.alternate_endpoints == right.alternate_endpoints && DayCutEquals(left.day_cut, right.day_cut);
 }
 
 auto
@@ -283,6 +284,10 @@ CounterpartyChangedFields(const CounterpartyConfig& current, const CounterpartyC
   AppendFieldIfChanged(current.reconnect_initial_ms, proposed.reconnect_initial_ms, "reconnect_initial_ms", fields);
   AppendFieldIfChanged(current.reconnect_max_ms, proposed.reconnect_max_ms, "reconnect_max_ms", fields);
   AppendFieldIfChanged(current.reconnect_max_retries, proposed.reconnect_max_retries, "reconnect_max_retries", fields);
+  if (current.connection_strategy.get() != proposed.connection_strategy.get()) {
+    fields.emplace_back("connection_strategy");
+  }
+  AppendFieldIfChanged(current.alternate_endpoints, proposed.alternate_endpoints, "alternate_endpoints", fields);
   if (!DayCutEquals(current.day_cut, proposed.day_cut)) {
     fields.emplace_back("day_cut");
   }

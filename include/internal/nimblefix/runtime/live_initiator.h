@@ -14,10 +14,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "nimblefix/advanced/runtime_application.h"
 #include "nimblefix/base/result.h"
 #include "nimblefix/base/status.h"
 #include "nimblefix/profile/normalized_dictionary.h"
-#include "nimblefix/advanced/runtime_application.h"
 #include "nimblefix/runtime/config.h"
 #include "nimblefix/runtime/engine.h"
 #include "nimblefix/runtime/live_session_registry.h"
@@ -77,6 +77,8 @@ private:
     std::optional<session::AdminProtocol> protocol;
     std::string host;
     std::uint16_t port{ 0 };
+    std::string primary_host;
+    std::uint16_t primary_port{ 0 };
   };
 
   struct ConnectionState
@@ -85,6 +87,7 @@ private:
     transport::TcpConnection connection;
     std::unique_ptr<ActiveSession> session;
     std::uint64_t last_progress_ns{ 0 };
+    std::uint64_t connected_since_ns{ 0 };
     std::optional<RuntimeEvent> pending_app_event;
     bool close_requested{ false };
     bool count_completion{ false };
@@ -136,6 +139,23 @@ private:
   auto ProcessDueTimers(WorkerShardState& shard, std::uint64_t timestamp_ns) -> base::Status;
   auto ProcessPendingReconnects(WorkerShardState& shard, std::uint64_t timestamp_ns) -> base::Status;
   auto RetryPendingAppEvent(ConnectionState& connection, std::uint64_t timestamp_ns) -> base::Status;
+  [[nodiscard]] auto MakeConnectionContext(const ActiveSession& session,
+                                           std::uint32_t consecutive_failures,
+                                           std::chrono::milliseconds last_connected_duration) const
+    -> ConnectionContext;
+  auto NotifyConnectionStrategyConnected(const ActiveSession& session) const -> void;
+  [[nodiscard]] auto ApplyConnectionStrategyDecision(PendingReconnect& reconnect,
+                                                     const ConnectionDecision& decision,
+                                                     std::uint64_t timestamp_ns,
+                                                     std::uint64_t wall_now_ns) const -> bool;
+  [[nodiscard]] auto ScheduleStrategyReconnect(WorkerShardState& shard,
+                                               std::uint64_t session_id,
+                                               std::uint32_t retry_count,
+                                               std::chrono::milliseconds last_connected_duration,
+                                               std::uint64_t timestamp_ns,
+                                               std::unique_ptr<ActiveSession> session) -> bool;
+  [[nodiscard]] auto ConnectionDuration(std::uint64_t connected_since_ns, std::uint64_t timestamp_ns) const
+    -> std::chrono::milliseconds;
   auto HandleInboundFrame(WorkerShardState& shard,
                           ConnectionState& connection,
                           std::span<const std::byte> frame,

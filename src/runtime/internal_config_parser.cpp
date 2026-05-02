@@ -88,8 +88,9 @@ constexpr std::size_t kTimestampResolution = 47U;
 constexpr std::size_t kUnknownFieldAction = 48U;
 constexpr std::size_t kMalformedFieldAction = 49U;
 constexpr std::size_t kValidateEnumValues = 50U;
+constexpr std::size_t kAlternateEndpoints = 51U;
 constexpr std::size_t kMinFieldCount = kIsInitiator + 1U;
-constexpr std::size_t kMaxFieldCount = kValidateEnumValues + 1U;
+constexpr std::size_t kMaxFieldCount = kAlternateEndpoints + 1U;
 } // namespace counterparty_columns
 
 auto
@@ -254,6 +255,33 @@ ParseCpuAffinityList(std::string_view token) -> base::Result<std::vector<std::ui
     cpu_ids.push_back(cpu_id.value());
   }
   return cpu_ids;
+}
+
+auto
+ParseEndpointList(std::string_view token) -> base::Result<std::vector<ConnectionEndpoint>>
+{
+  std::vector<ConnectionEndpoint> endpoints;
+  const auto value = Trim(token);
+  if (value.empty()) {
+    return endpoints;
+  }
+
+  for (const auto& part : Split(value, kConfigListSeparator)) {
+    const auto separator = part.rfind(':');
+    if (separator == std::string::npos || separator == 0U || separator + 1U >= part.size()) {
+      return base::Status::InvalidArgument("invalid alternate endpoint value in runtime config");
+    }
+    auto port = ParseInteger<std::uint16_t>(std::string_view(part).substr(separator + 1U), "alternate_endpoint_port");
+    if (!port.ok()) {
+      return port.status();
+    }
+    endpoints.push_back(ConnectionEndpoint{
+      .host = part.substr(0U, separator),
+      .port = port.value(),
+    });
+  }
+
+  return endpoints;
 }
 
 auto
@@ -987,6 +1015,13 @@ LoadEngineConfigText(std::string_view text, const std::filesystem::path& base_di
         }
         validation_policy.validate_enum_values = validate_enum_values.value();
       }
+      auto alternate_endpoints = base::Result<std::vector<ConnectionEndpoint>>(std::vector<ConnectionEndpoint>{});
+      if (parts.size() > counterparty_columns::kAlternateEndpoints) {
+        alternate_endpoints = ParseEndpointList(parts[counterparty_columns::kAlternateEndpoints]);
+        if (!alternate_endpoints.ok()) {
+          return alternate_endpoints.status();
+        }
+      }
       auto heartbeat = ParseInteger<std::uint32_t>(parts[counterparty_columns::kHeartbeatIntervalSeconds],
                                                    "heartbeat_interval_seconds");
       if (!heartbeat.ok()) {
@@ -1054,6 +1089,7 @@ LoadEngineConfigText(std::string_view text, const std::filesystem::path& base_di
         .reconnect_initial_ms = reconnect_initial_ms.value(),
         .reconnect_max_ms = reconnect_max_ms.value(),
         .reconnect_max_retries = reconnect_max_retries.value(),
+        .alternate_endpoints = alternate_endpoints.value(),
         .day_cut =
           session::DayCutConfig{
             .mode = day_cut_mode.value(),

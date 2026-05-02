@@ -25,6 +25,26 @@ ProcessPendingReconnects(WorkerShardState& shard, std::uint64_t timestamp_ns) ->
 auto
 RetryPendingAppEvent(ConnectionState& connection, std::uint64_t timestamp_ns) -> base::Status;
 auto
+MakeConnectionContext(const ActiveSession& session,
+                      std::uint32_t consecutive_failures,
+                      std::chrono::milliseconds last_connected_duration) const -> ConnectionContext;
+auto
+NotifyConnectionStrategyConnected(const ActiveSession& session) const -> void;
+auto
+ApplyConnectionStrategyDecision(PendingReconnect& reconnect,
+                                const ConnectionDecision& decision,
+                                std::uint64_t timestamp_ns,
+                                std::uint64_t wall_now_ns) const -> bool;
+auto
+ScheduleStrategyReconnect(WorkerShardState& shard,
+                          std::uint64_t session_id,
+                          std::uint32_t retry_count,
+                          std::chrono::milliseconds last_connected_duration,
+                          std::uint64_t timestamp_ns,
+                          std::unique_ptr<ActiveSession> session) -> bool;
+auto
+ConnectionDuration(std::uint64_t connected_since_ns, std::uint64_t timestamp_ns) const -> std::chrono::milliseconds;
+auto
 HandleInboundFrame(WorkerShardState& shard,
                    ConnectionState& connection,
                    std::span<const std::byte> frame,

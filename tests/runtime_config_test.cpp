@@ -2,18 +2,22 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "nimblefix/advanced/message_builder.h"
 #include "nimblefix/codec/fix_codec.h"
 #include "nimblefix/profile/artifact_builder.h"
 #include "nimblefix/profile/dictgen_input.h"
 #include "nimblefix/runtime/config.h"
+#include "nimblefix/runtime/connection_strategy.h"
 #include "nimblefix/runtime/engine.h"
 #include "nimblefix/runtime/internal_config_parser.h"
 #include "nimblefix/transport/transport_connection.h"
@@ -415,6 +419,106 @@ TEST_CASE("runtime TLS config validation", "[runtime-config][tls]")
   }
 
   std::filesystem::remove_all(temp_root);
+}
+
+TEST_CASE("connection strategies expose reconnect decisions", "[runtime-config][connection-strategy]")
+{
+  const auto context = nimble::runtime::ConnectionContext{
+    .session_id = 42U,
+    .primary_endpoint = nimble::runtime::ConnectionEndpoint{ .host = "primary.fix.test", .port = 9001U },
+    .alternate_endpoints =
+      std::vector<nimble::runtime::ConnectionEndpoint>{
+        nimble::runtime::ConnectionEndpoint{ .host = "backup-a.fix.test", .port = 9002U },
+        nimble::runtime::ConnectionEndpoint{ .host = "backup-b.fix.test", .port = 9003U },
+      },
+  };
+
+  SECTION("exponential backoff increases and resets")
+  {
+    nimble::runtime::ExponentialBackoffStrategy strategy(100U, 400U, 0U);
+    const auto first = strategy.OnDisconnected(context);
+    const auto second = strategy.OnDisconnected(context);
+
+    REQUIRE(!first.give_up);
+    REQUIRE(!second.give_up);
+    REQUIRE(first.delay >= std::chrono::milliseconds{ 100 });
+    REQUIRE(first.delay <= std::chrono::milliseconds{ 125 });
+    REQUIRE(second.delay >= std::chrono::milliseconds{ 200 });
+    REQUIRE(second.delay <= std::chrono::milliseconds{ 225 });
+    REQUIRE(second.delay > first.delay);
+
+    strategy.OnConnected(context);
+    const auto after_reset = strategy.OnDisconnected(context);
+    REQUIRE(!after_reset.give_up);
+    REQUIRE(after_reset.delay >= std::chrono::milliseconds{ 100 });
+    REQUIRE(after_reset.delay <= std::chrono::milliseconds{ 125 });
+  }
+
+  SECTION("exponential backoff gives up after max retries")
+  {
+    nimble::runtime::ExponentialBackoffStrategy strategy(100U, 400U, 2U);
+    REQUIRE(!strategy.OnDisconnected(context).give_up);
+    REQUIRE(!strategy.OnDisconnected(context).give_up);
+    REQUIRE(strategy.OnDisconnected(context).give_up);
+  }
+
+  SECTION("always-start-on-primary returns primary endpoint")
+  {
+    nimble::runtime::AlwaysStartOnPrimaryStrategy strategy(250U, 0U);
+    const auto first = strategy.OnDisconnected(context);
+    const auto second = strategy.OnDisconnected(context);
+
+    REQUIRE(!first.give_up);
+    REQUIRE(first.delay == std::chrono::milliseconds{ 250 });
+    REQUIRE(first.next_endpoint.has_value());
+    REQUIRE(first.next_endpoint->host == "primary.fix.test");
+    REQUIRE(first.next_endpoint->port == 9001U);
+    REQUIRE(second.next_endpoint.has_value());
+    REQUIRE(second.next_endpoint->host == "primary.fix.test");
+  }
+
+  SECTION("round-robin cycles through primary and alternates")
+  {
+    nimble::runtime::RoundRobinStrategy strategy(50U, 0U);
+    const auto first = strategy.OnDisconnected(context);
+    const auto second = strategy.OnDisconnected(context);
+    const auto third = strategy.OnDisconnected(context);
+    const auto fourth = strategy.OnDisconnected(context);
+
+    REQUIRE(first.next_endpoint.has_value());
+    REQUIRE(second.next_endpoint.has_value());
+    REQUIRE(third.next_endpoint.has_value());
+    REQUIRE(fourth.next_endpoint.has_value());
+    REQUIRE(first.next_endpoint->host == "primary.fix.test");
+    REQUIRE(second.next_endpoint->host == "backup-a.fix.test");
+    REQUIRE(third.next_endpoint->host == "backup-b.fix.test");
+    REQUIRE(fourth.next_endpoint->host == "primary.fix.test");
+
+    strategy.OnConnected(context);
+    const auto after_reset = strategy.OnDisconnected(context);
+    REQUIRE(after_reset.next_endpoint.has_value());
+    REQUIRE(after_reset.next_endpoint->host == "primary.fix.test");
+  }
+
+  SECTION("counterparty config can hold and copy strategy pointers")
+  {
+    auto strategy = std::make_shared<nimble::runtime::RoundRobinStrategy>(75U, 3U);
+    auto counterparty = nimble::runtime::CounterpartyConfigBuilder::Initiator(
+                          "strategy-initiator",
+                          8801U,
+                          nimble::session::SessionKey{ .sender_comp_id = "BUY", .target_comp_id = "SELL" },
+                          4400U)
+                          .reconnect(100U, 1000U, 0U)
+                          .build();
+    counterparty.connection_strategy = strategy;
+    counterparty.alternate_endpoints.push_back(
+      nimble::runtime::ConnectionEndpoint{ .host = "backup.fix.test", .port = 9901U });
+
+    const auto copied = counterparty;
+    REQUIRE(copied.connection_strategy == strategy);
+    REQUIRE(copied.alternate_endpoints.size() == 1U);
+    REQUIRE(copied.alternate_endpoints.front().host == "backup.fix.test");
+  }
 }
 
 TEST_CASE("structured config validation collects all errors", "[runtime-config]")
