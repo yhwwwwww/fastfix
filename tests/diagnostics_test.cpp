@@ -83,12 +83,22 @@ public:
     last_registered_sessions = health.registered_sessions;
   }
 
+  auto OnMessageBacklog(std::uint64_t session_id, std::uint64_t backlog_ms) -> void override
+  {
+    ++backlog_count;
+    last_backlog_session_id = session_id;
+    last_backlog_ms = backlog_ms;
+  }
+
   std::atomic<std::uint32_t> metrics_count{ 0 };
   std::atomic<std::uint32_t> trace_count{ 0 };
   std::atomic<std::uint32_t> health_count{ 0 };
+  std::atomic<std::uint32_t> backlog_count{ 0 };
   std::size_t last_worker_count{ 0U };
   std::size_t last_trace_count{ 0U };
   std::uint32_t last_registered_sessions{ 0U };
+  std::uint64_t last_backlog_session_id{ 0U };
+  std::uint64_t last_backlog_ms{ 0U };
 };
 
 } // namespace
@@ -141,6 +151,50 @@ TEST_CASE("TextDiagnosticsSink formatting", "[diagnostics]")
   REQUIRE(sink.last_trace_text().find("config_loaded") != std::string_view::npos);
   REQUIRE(sink.last_trace_text().find("text=\"boot complete\"") != std::string_view::npos);
   REQUIRE(sink.last_health_text().find("health worker_count=2 registered_sessions=2") != std::string_view::npos);
+}
+
+TEST_CASE("diagnostics backlog callback", "[diagnostics-backlog]")
+{
+  nimble::runtime::MetricsRegistry metrics;
+  metrics.Reset(1U);
+  constexpr std::uint64_t session_id = 1001U;
+  REQUIRE(metrics.RegisterSession(session_id, 0U).ok());
+
+  auto sink = std::make_shared<CountingSink>();
+  nimble::runtime::DiagnosticsMonitor monitor;
+  monitor.AddSink(sink);
+  monitor.Bind(&metrics, nullptr);
+
+  monitor.NotifyMessageBacklog(session_id, 6000U);
+  REQUIRE(sink->backlog_count.load() == 1U);
+  REQUIRE(sink->last_backlog_session_id == session_id);
+  REQUIRE(sink->last_backlog_ms == 6000U);
+
+  monitor.NotifyMessageBacklog(session_id, 7000U);
+  REQUIRE(sink->backlog_count.load() == 2U);
+  REQUIRE(sink->last_backlog_session_id == session_id);
+  REQUIRE(sink->last_backlog_ms == 7000U);
+}
+
+TEST_CASE("diagnostics backlog sink formatting", "[diagnostics-backlog]")
+{
+  std::vector<std::string> json_emitted;
+  nimble::runtime::JsonDiagnosticsSink json_sink(
+    [&json_emitted](std::string_view json) { json_emitted.emplace_back(json); });
+  json_sink.OnMessageBacklog(42U, 6000U);
+
+  REQUIRE(json_emitted.size() == 1U);
+  REQUIRE(json_sink.last_backlog_json() == R"({"session_id":42,"backlog_ms":6000})");
+  REQUIRE(json_emitted.front() == json_sink.last_backlog_json());
+
+  std::vector<std::string> text_emitted;
+  nimble::runtime::TextDiagnosticsSink text_sink(
+    [&text_emitted](std::string_view text) { text_emitted.emplace_back(text); });
+  text_sink.OnMessageBacklog(42U, 6000U);
+
+  REQUIRE(text_emitted.size() == 1U);
+  REQUIRE(text_sink.last_backlog_text() == "backlog session_id=42 backlog_ms=6000\n");
+  REQUIRE(text_emitted.front() == text_sink.last_backlog_text());
 }
 
 TEST_CASE("DumpTraceToJson", "[diagnostics]")

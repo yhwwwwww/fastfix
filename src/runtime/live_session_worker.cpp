@@ -609,6 +609,20 @@ LiveSessionWorker::DrainWorkerCommands(std::uint32_t worker_id, std::uint64_t ti
       return base::Status::Ok();
     }
     auto* connection = FindConnectionBySessionId(*shard, command->session_id);
+    if (command->enqueue_timestamp_ns > 0U && engine_ != nullptr && engine_->config() != nullptr) {
+      const auto threshold_ms = engine_->config()->backlog_warn_threshold_ms;
+      if (threshold_ms > 0U) {
+        const auto now_ns = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+        const auto age_ms = (now_ns - command->enqueue_timestamp_ns) / 1'000'000U;
+        if (age_ms >= threshold_ms && connection != nullptr) {
+          const auto throttle_ns = static_cast<std::uint64_t>(engine_->config()->backlog_warn_throttle_ms) * 1'000'000U;
+          if (now_ns - connection->last_backlog_notify_ns >= throttle_ns) {
+            connection->last_backlog_notify_ns = now_ns;
+            engine_->diagnostics().NotifyMessageBacklog(command->session_id, age_ms);
+          }
+        }
+      }
+    }
     if (connection == nullptr || connection->session == nullptr || connection->close_requested) {
       continue;
     }

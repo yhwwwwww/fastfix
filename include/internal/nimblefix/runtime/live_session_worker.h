@@ -14,12 +14,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include "nimblefix/advanced/runtime_application.h"
 #include "nimblefix/base/result.h"
 #include "nimblefix/base/spsc_queue.h"
 #include "nimblefix/base/status.h"
 #include "nimblefix/message/message_ref.h"
 #include "nimblefix/profile/normalized_dictionary.h"
-#include "nimblefix/advanced/runtime_application.h"
 #include "nimblefix/runtime/config.h"
 #include "nimblefix/runtime/engine.h"
 #include "nimblefix/runtime/live_session_registry.h"
@@ -62,6 +62,7 @@ protected:
   {
     OutboundCommandKind kind{ OutboundCommandKind::kSendApplication };
     std::uint64_t session_id{ 0 };
+    std::uint64_t enqueue_timestamp_ns{ 0 };
     message::MessageRef message;
     std::string text;
   };
@@ -81,6 +82,8 @@ protected:
       if (!queue_.TryPush(OutboundCommand{
             .kind = OutboundCommandKind::kSendApplication,
             .session_id = session_id,
+            .enqueue_timestamp_ns =
+              static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
             .message = std::move(message),
             .text = {},
           })) {
@@ -109,6 +112,8 @@ protected:
       if (!queue_.TryPush(OutboundCommand{
             .kind = OutboundCommandKind::kBeginLogout,
             .session_id = session_id,
+            .enqueue_timestamp_ns =
+              static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
             .message = {},
             .text = std::move(text),
           })) {
@@ -147,6 +152,7 @@ protected:
     transport::TransportConnection connection;
     std::unique_ptr<ActiveSession> session;
     std::uint64_t last_progress_ns{ 0 };
+    std::uint64_t last_backlog_notify_ns{ 0 };
     std::optional<RuntimeEvent> pending_app_event;
     bool close_requested{ false };
     bool count_completion{ false };

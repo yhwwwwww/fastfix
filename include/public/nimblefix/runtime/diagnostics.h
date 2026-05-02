@@ -50,6 +50,9 @@ public:
 
   /// Called periodically with an aggregated engine health summary.
   virtual auto OnEngineHealth(const EngineHealthSnapshot& health) -> void = 0;
+
+  /// Called when an outbound session command waits too long before processing.
+  virtual auto OnMessageBacklog(std::uint64_t session_id, std::uint64_t backlog_ms) -> void = 0;
 };
 
 /// Built-in sink that formats diagnostics as JSON strings.
@@ -67,6 +70,7 @@ public:
   auto OnMetricsSnapshot(const RuntimeMetricsSnapshot& snapshot) -> void override;
   auto OnTraceEvents(const std::vector<TraceEvent>& events) -> void override;
   auto OnEngineHealth(const EngineHealthSnapshot& health) -> void override;
+  auto OnMessageBacklog(std::uint64_t session_id, std::uint64_t backlog_ms) -> void override;
 
   /// Set or replace the output callback.
   auto SetOutput(OutputCallback callback) -> void;
@@ -75,12 +79,14 @@ public:
   [[nodiscard]] auto last_metrics_json() const -> std::string_view;
   [[nodiscard]] auto last_trace_json() const -> std::string_view;
   [[nodiscard]] auto last_health_json() const -> std::string_view;
+  [[nodiscard]] auto last_backlog_json() const -> std::string_view;
 
 private:
   OutputCallback output_;
   std::string last_metrics_;
   std::string last_trace_;
   std::string last_health_;
+  std::string last_backlog_json_;
 };
 
 /// Built-in sink that formats diagnostics as human-readable text.
@@ -95,18 +101,21 @@ public:
   auto OnMetricsSnapshot(const RuntimeMetricsSnapshot& snapshot) -> void override;
   auto OnTraceEvents(const std::vector<TraceEvent>& events) -> void override;
   auto OnEngineHealth(const EngineHealthSnapshot& health) -> void override;
+  auto OnMessageBacklog(std::uint64_t session_id, std::uint64_t backlog_ms) -> void override;
 
   auto SetOutput(OutputCallback callback) -> void;
 
   [[nodiscard]] auto last_metrics_text() const -> std::string_view;
   [[nodiscard]] auto last_trace_text() const -> std::string_view;
   [[nodiscard]] auto last_health_text() const -> std::string_view;
+  [[nodiscard]] auto last_backlog_text() const -> std::string_view;
 
 private:
   OutputCallback output_;
   std::string last_metrics_;
   std::string last_trace_;
   std::string last_health_;
+  std::string last_backlog_text_;
 };
 
 /// Manages periodic diagnostics flushing to registered sinks.
@@ -139,6 +148,9 @@ public:
 
   /// Trigger an immediate flush to all registered sinks.
   auto FlushNow() -> void;
+
+  /// Notify sinks that an outbound command was backlogged before processing.
+  auto NotifyMessageBacklog(std::uint64_t session_id, std::uint64_t backlog_ms) -> void;
 
   /// Start periodic background flushing.
   auto Start(std::chrono::milliseconds interval) -> base::Status;

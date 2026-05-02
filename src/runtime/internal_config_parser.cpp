@@ -608,6 +608,18 @@ LoadEngineConfigText(std::string_view text, const std::filesystem::path& base_di
           return parsed.status();
         }
         config.accept_unknown_sessions = parsed.value();
+      } else if (key == "engine.backlog_warn_threshold_ms") {
+        auto parsed = ParseInteger<std::uint32_t>(value, "backlog_warn_threshold_ms");
+        if (!parsed.ok()) {
+          return parsed.status();
+        }
+        config.backlog_warn_threshold_ms = parsed.value();
+      } else if (key == "engine.backlog_warn_throttle_ms") {
+        auto parsed = ParseInteger<std::uint32_t>(value, "backlog_warn_throttle_ms");
+        if (!parsed.ok()) {
+          return parsed.status();
+        }
+        config.backlog_warn_throttle_ms = parsed.value();
       } else if (key == "engine.poll_mode") {
         auto parsed = ParsePollMode(value);
         if (!parsed.ok()) {

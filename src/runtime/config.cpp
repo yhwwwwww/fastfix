@@ -1116,6 +1116,8 @@ ConfigToText(const EngineConfig& config) -> std::string
   out << "engine.app_cpu_affinity="
       << JoinCsv(config.app_cpu_affinity, [](std::uint32_t cpu) { return std::to_string(cpu); }) << '\n';
   out << "engine.accept_unknown_sessions=" << BoolToText(config.accept_unknown_sessions) << '\n';
+  out << "engine.backlog_warn_threshold_ms=" << config.backlog_warn_threshold_ms << '\n';
+  out << "engine.backlog_warn_throttle_ms=" << config.backlog_warn_throttle_ms << '\n';
   out << "engine.poll_mode=" << PollModeToText(config.poll_mode) << '\n';
   out << "engine.io_backend=" << IoBackendToText(config.io_backend) << '\n';
   out << "engine.profile_madvise=" << BoolToText(config.profile_madvise) << '\n';

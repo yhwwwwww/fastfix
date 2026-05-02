@@ -328,6 +328,10 @@ struct EngineConfig
   // Static counterparties still win first. If true but no factory is
   // installed, unknown Logons are rejected.
   bool accept_unknown_sessions{ false };
+  // Outbound command age threshold before diagnostics backlog notification.
+  std::uint32_t backlog_warn_threshold_ms{ 5000 };
+  // Minimum interval between backlog notifications for the same connection.
+  std::uint32_t backlog_warn_throttle_ms{ 1000 };
 };
 
 /// Optional convenience helper for ListenerConfig.

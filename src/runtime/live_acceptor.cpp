@@ -251,6 +251,7 @@ struct OutboundCommand
 {
   OutboundCommandKind kind{ OutboundCommandKind::kSendApplication };
   std::uint64_t session_id{ 0 };
+  std::uint64_t enqueue_timestamp_ns{ 0 };
   message::MessageRef message;
   session::EncodedApplicationMessageRef encoded_message;
   session::SessionSendEnvelopeRef envelope;
@@ -297,6 +298,7 @@ struct LiveAcceptor::ConnectionState
   transport::TransportConnection connection;
   std::unique_ptr<ActiveSession> session;
   std::uint64_t last_progress_ns{ 0 };
+  std::uint64_t last_backlog_notify_ns{ 0 };
   std::optional<RuntimeEvent> pending_app_event;
   std::vector<std::byte> stashed_app_frame;
   bool close_requested{ false };
@@ -406,6 +408,8 @@ public:
     if (!queue_.TryPush(OutboundCommand{
           .kind = OutboundCommandKind::kSendApplication,
           .session_id = session_id,
+          .enqueue_timestamp_ns =
+            static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
           .message = std::move(message),
           .encoded_message = {},
           .envelope = std::move(envelope),
@@ -433,6 +437,8 @@ public:
     if (!queue_.TryPush(OutboundCommand{
           .kind = OutboundCommandKind::kSendApplication,
           .session_id = session_id,
+          .enqueue_timestamp_ns =
+            static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
           .message = message,
           .encoded_message = {},
           .envelope = session::SessionSendEnvelopeRef(envelope),
@@ -456,6 +462,8 @@ public:
     if (!queue_.TryPush(OutboundCommand{
           .kind = OutboundCommandKind::kSendEncodedApplication,
           .session_id = session_id,
+          .enqueue_timestamp_ns =
+            static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
           .message = {},
           .encoded_message = std::move(message),
           .envelope = std::move(envelope),
@@ -484,6 +492,8 @@ public:
     if (!queue_.TryPush(OutboundCommand{
           .kind = OutboundCommandKind::kSendEncodedApplication,
           .session_id = session_id,
+          .enqueue_timestamp_ns =
+            static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
           .message = {},
           .encoded_message = message,
           .envelope = session::SessionSendEnvelopeRef(envelope),
@@ -2450,6 +2460,21 @@ LiveAcceptor::DrainWorkerCommands(std::uint32_t worker_id, std::uint64_t timesta
     }
 
     auto* connection = FindConnectionBySessionId(*shard, command->session_id);
+    if (command->enqueue_timestamp_ns > 0U && impl_->engine != nullptr && impl_->engine->config() != nullptr) {
+      const auto threshold_ms = impl_->engine->config()->backlog_warn_threshold_ms;
+      if (threshold_ms > 0U) {
+        const auto now_ns = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+        const auto age_ms = (now_ns - command->enqueue_timestamp_ns) / 1'000'000U;
+        if (age_ms >= threshold_ms && connection != nullptr) {
+          const auto throttle_ns =
+            static_cast<std::uint64_t>(impl_->engine->config()->backlog_warn_throttle_ms) * 1'000'000U;
+          if (now_ns - connection->last_backlog_notify_ns >= throttle_ns) {
+            connection->last_backlog_notify_ns = now_ns;
+            impl_->engine->diagnostics().NotifyMessageBacklog(command->session_id, age_ms);
+          }
+        }
+      }
+    }
     if (connection == nullptr || connection->session == nullptr || connection->close_requested) {
       continue;
     }

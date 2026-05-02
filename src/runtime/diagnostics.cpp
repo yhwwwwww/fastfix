@@ -377,6 +377,20 @@ JsonDiagnosticsSink::OnEngineHealth(const EngineHealthSnapshot& health) -> void
 }
 
 auto
+JsonDiagnosticsSink::OnMessageBacklog(std::uint64_t session_id, std::uint64_t backlog_ms) -> void
+{
+  last_backlog_json_.clear();
+  last_backlog_json_.reserve(48U);
+  last_backlog_json_.push_back('{');
+  AppendNumberField(last_backlog_json_, "session_id", session_id);
+  AppendNumberField(last_backlog_json_, "backlog_ms", backlog_ms, false);
+  last_backlog_json_.push_back('}');
+  if (output_) {
+    output_(last_backlog_json_);
+  }
+}
+
+auto
 JsonDiagnosticsSink::SetOutput(OutputCallback callback) -> void
 {
   output_ = std::move(callback);
@@ -398,6 +412,12 @@ auto
 JsonDiagnosticsSink::last_health_json() const -> std::string_view
 {
   return last_health_;
+}
+
+auto
+JsonDiagnosticsSink::last_backlog_json() const -> std::string_view
+{
+  return last_backlog_json_;
 }
 
 TextDiagnosticsSink::TextDiagnosticsSink(OutputCallback callback)
@@ -433,6 +453,17 @@ TextDiagnosticsSink::OnEngineHealth(const EngineHealthSnapshot& health) -> void
 }
 
 auto
+TextDiagnosticsSink::OnMessageBacklog(std::uint64_t session_id, std::uint64_t backlog_ms) -> void
+{
+  std::ostringstream out;
+  out << "backlog session_id=" << session_id << " backlog_ms=" << backlog_ms << '\n';
+  last_backlog_text_ = out.str();
+  if (output_) {
+    output_(last_backlog_text_);
+  }
+}
+
+auto
 TextDiagnosticsSink::SetOutput(OutputCallback callback) -> void
 {
   output_ = std::move(callback);
@@ -454,6 +485,12 @@ auto
 TextDiagnosticsSink::last_health_text() const -> std::string_view
 {
   return last_health_;
+}
+
+auto
+TextDiagnosticsSink::last_backlog_text() const -> std::string_view
+{
+  return last_backlog_text_;
 }
 
 DiagnosticsMonitor::DiagnosticsMonitor() = default;
@@ -495,6 +532,18 @@ auto
 DiagnosticsMonitor::FlushNow() -> void
 {
   FlushInternal();
+}
+
+auto
+DiagnosticsMonitor::NotifyMessageBacklog(std::uint64_t session_id, std::uint64_t backlog_ms) -> void
+{
+  std::lock_guard lock(mutex_);
+  for (const auto& sink : sinks_) {
+    if (sink == nullptr) {
+      continue;
+    }
+    sink->OnMessageBacklog(session_id, backlog_ms);
+  }
 }
 
 auto

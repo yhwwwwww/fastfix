@@ -100,6 +100,8 @@ RequireSameCoreConfig(const nimble::runtime::EngineConfig& expected, const nimbl
   // .nfcfg accepts this parser flag for tools, but LoadEngineConfigText validates
   // with the default false value before returning the parsed config.
   REQUIRE(actual.accept_unknown_sessions == false);
+  REQUIRE(actual.backlog_warn_threshold_ms == expected.backlog_warn_threshold_ms);
+  REQUIRE(actual.backlog_warn_throttle_ms == expected.backlog_warn_throttle_ms);
   REQUIRE(actual.listeners.size() == expected.listeners.size());
   for (std::size_t index = 0; index < expected.listeners.size(); ++index) {
     REQUIRE(actual.listeners[index].name == expected.listeners[index].name);
