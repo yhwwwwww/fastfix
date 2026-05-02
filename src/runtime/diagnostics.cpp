@@ -118,6 +118,9 @@ AppendSessionJson(std::string& out, const RuntimeMetricsSnapshot::SessionEntry& 
   AppendNumberField(out, "worker_id", session.worker_id);
   AppendNumberField(out, "inbound_messages", session.inbound_messages);
   AppendNumberField(out, "outbound_messages", session.outbound_messages);
+  AppendNumberField(out, "read_bytes", session.read_bytes);
+  AppendNumberField(out, "write_bytes", session.write_bytes);
+  AppendNumberField(out, "socket_poll_count", session.socket_poll_count);
   AppendNumberField(out, "admin_messages", session.admin_messages);
   AppendNumberField(out, "resend_requests", session.resend_requests);
   AppendNumberField(out, "gap_fills", session.gap_fills);
@@ -261,8 +264,10 @@ MetricsToText(const RuntimeMetricsSnapshot& snapshot) -> std::string
   for (const auto& session : snapshot.sessions) {
     out << "session id=" << session.session_id << " worker=" << session.worker_id
         << " inbound_messages=" << session.inbound_messages << " outbound_messages=" << session.outbound_messages
-        << " parse_failures=" << session.parse_failures << " checksum_failures=" << session.checksum_failures
-        << " resend_requests=" << session.resend_requests << " gap_fills=" << session.gap_fills << '\n';
+        << " read_bytes=" << session.read_bytes << " write_bytes=" << session.write_bytes
+        << " socket_poll_count=" << session.socket_poll_count << " parse_failures=" << session.parse_failures
+        << " checksum_failures=" << session.checksum_failures << " resend_requests=" << session.resend_requests
+        << " gap_fills=" << session.gap_fills << '\n';
   }
   return out.str();
 }

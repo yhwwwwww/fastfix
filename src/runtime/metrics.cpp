@@ -378,6 +378,9 @@ MetricsRegistry::Snapshot() const -> RuntimeMetricsSnapshot
       .worker_id = s.worker_id,
       .inbound_messages = s.inbound_messages.load(std::memory_order_relaxed),
       .outbound_messages = s.outbound_messages.load(std::memory_order_relaxed),
+      .read_bytes = s.read_bytes.load(std::memory_order_relaxed),
+      .write_bytes = s.write_bytes.load(std::memory_order_relaxed),
+      .socket_poll_count = s.socket_poll_count.load(std::memory_order_relaxed),
       .admin_messages = s.admin_messages.load(std::memory_order_relaxed),
       .resend_requests = s.resend_requests.load(std::memory_order_relaxed),
       .gap_fills = s.gap_fills.load(std::memory_order_relaxed),
@@ -402,6 +405,13 @@ MetricsRegistry::FindSession(std::uint64_t session_id) const -> const SessionMet
     return nullptr;
   }
   return it->second.get();
+}
+
+auto
+MetricsRegistry::FindSession(std::uint64_t session_id) -> SessionMetrics*
+{
+  std::shared_lock lock(sessions_mutex_);
+  return FindMutableSession(session_id);
 }
 
 auto

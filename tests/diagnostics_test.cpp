@@ -55,6 +55,16 @@ BuildMetricsSnapshot() -> nimble::runtime::RuntimeMetricsSnapshot
   REQUIRE(metrics.RecordInbound(1002U, true).ok());
   REQUIRE(metrics.RecordOutbound(1001U, false).ok());
   REQUIRE(metrics.RecordOutbound(1002U, true).ok());
+  auto* session_1001 = metrics.FindSession(1001U);
+  auto* session_1002 = metrics.FindSession(1002U);
+  REQUIRE(session_1001 != nullptr);
+  REQUIRE(session_1002 != nullptr);
+  session_1001->read_bytes.fetch_add(101U, std::memory_order_relaxed);
+  session_1001->write_bytes.fetch_add(201U, std::memory_order_relaxed);
+  session_1001->socket_poll_count.fetch_add(2U, std::memory_order_relaxed);
+  session_1002->read_bytes.fetch_add(102U, std::memory_order_relaxed);
+  session_1002->write_bytes.fetch_add(202U, std::memory_order_relaxed);
+  session_1002->socket_poll_count.fetch_add(3U, std::memory_order_relaxed);
   REQUIRE(metrics.RecordParseFailure(1001U).ok());
   REQUIRE(metrics.RecordChecksumFailure(1002U).ok());
   REQUIRE(metrics.RecordResendRequest(1002U).ok());
@@ -123,6 +133,9 @@ TEST_CASE("DiagnosticsMonitor flush produces snapshots", "[diagnostics]")
   REQUIRE(sink->last_metrics_json().find("\"type\":\"metrics\"") != std::string_view::npos);
   REQUIRE(sink->last_metrics_json().find("\"worker_id\":0") != std::string_view::npos);
   REQUIRE(sink->last_metrics_json().find("\"session_id\":1001") != std::string_view::npos);
+  REQUIRE(sink->last_metrics_json().find("\"read_bytes\":0") != std::string_view::npos);
+  REQUIRE(sink->last_metrics_json().find("\"write_bytes\":0") != std::string_view::npos);
+  REQUIRE(sink->last_metrics_json().find("\"socket_poll_count\":0") != std::string_view::npos);
   REQUIRE(sink->last_trace_json().find("\"type\":\"trace\"") != std::string_view::npos);
   REQUIRE(sink->last_trace_json().find("\"kind\":\"config_loaded\"") != std::string_view::npos);
   REQUIRE(sink->last_health_json().find("\"type\":\"health\"") != std::string_view::npos);
@@ -147,6 +160,9 @@ TEST_CASE("TextDiagnosticsSink formatting", "[diagnostics]")
   REQUIRE(emitted.size() == 3U);
   REQUIRE(sink.last_metrics_text().find("metrics workers=2 sessions=2") != std::string_view::npos);
   REQUIRE(sink.last_metrics_text().find("session id=1001 worker=0") != std::string_view::npos);
+  REQUIRE(sink.last_metrics_text().find("read_bytes=101") != std::string_view::npos);
+  REQUIRE(sink.last_metrics_text().find("write_bytes=201") != std::string_view::npos);
+  REQUIRE(sink.last_metrics_text().find("socket_poll_count=2") != std::string_view::npos);
   REQUIRE(sink.last_trace_text().find("[000001]") != std::string_view::npos);
   REQUIRE(sink.last_trace_text().find("config_loaded") != std::string_view::npos);
   REQUIRE(sink.last_trace_text().find("text=\"boot complete\"") != std::string_view::npos);
@@ -195,6 +211,23 @@ TEST_CASE("diagnostics backlog sink formatting", "[diagnostics-backlog]")
   REQUIRE(text_emitted.size() == 1U);
   REQUIRE(text_sink.last_backlog_text() == "backlog session_id=42 backlog_ms=6000\n");
   REQUIRE(text_emitted.front() == text_sink.last_backlog_text());
+}
+
+TEST_CASE("Diagnostics metrics sinks include session network counters", "[diagnostics]")
+{
+  const auto snapshot = BuildMetricsSnapshot();
+
+  nimble::runtime::JsonDiagnosticsSink json_sink;
+  json_sink.OnMetricsSnapshot(snapshot);
+  REQUIRE(json_sink.last_metrics_json().find("\"read_bytes\":101") != std::string_view::npos);
+  REQUIRE(json_sink.last_metrics_json().find("\"write_bytes\":201") != std::string_view::npos);
+  REQUIRE(json_sink.last_metrics_json().find("\"socket_poll_count\":2") != std::string_view::npos);
+
+  nimble::runtime::TextDiagnosticsSink text_sink;
+  text_sink.OnMetricsSnapshot(snapshot);
+  REQUIRE(text_sink.last_metrics_text().find("read_bytes=101") != std::string_view::npos);
+  REQUIRE(text_sink.last_metrics_text().find("write_bytes=201") != std::string_view::npos);
+  REQUIRE(text_sink.last_metrics_text().find("socket_poll_count=2") != std::string_view::npos);
 }
 
 TEST_CASE("DumpTraceToJson", "[diagnostics]")

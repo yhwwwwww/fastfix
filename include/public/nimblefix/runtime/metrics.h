@@ -66,6 +66,9 @@ struct SessionMetrics
   std::uint32_t worker_id{ 0 };
   std::atomic<std::uint64_t> inbound_messages{ 0 };
   std::atomic<std::uint64_t> outbound_messages{ 0 };
+  std::atomic<std::uint64_t> read_bytes{ 0 };
+  std::atomic<std::uint64_t> write_bytes{ 0 };
+  std::atomic<std::uint64_t> socket_poll_count{ 0 };
   std::atomic<std::uint64_t> admin_messages{ 0 };
   std::atomic<std::uint64_t> resend_requests{ 0 };
   std::atomic<std::uint64_t> gap_fills{ 0 };
@@ -119,6 +122,9 @@ struct RuntimeMetricsSnapshot
     std::uint32_t worker_id{ 0 };
     std::uint64_t inbound_messages{ 0 };
     std::uint64_t outbound_messages{ 0 };
+    std::uint64_t read_bytes{ 0 };
+    std::uint64_t write_bytes{ 0 };
+    std::uint64_t socket_poll_count{ 0 };
     std::uint64_t admin_messages{ 0 };
     std::uint64_t resend_requests{ 0 };
     std::uint64_t gap_fills{ 0 };
@@ -199,6 +205,7 @@ public:
 
   [[nodiscard]] auto Snapshot() const -> RuntimeMetricsSnapshot;
   [[nodiscard]] auto FindSession(std::uint64_t session_id) const -> const SessionMetrics*;
+  [[nodiscard]] auto FindSession(std::uint64_t session_id) -> SessionMetrics*;
   // Workers are allocated during Reset()/Boot() and then only read
   // concurrently.
   [[nodiscard]] auto FindWorker(std::uint32_t worker_id) const -> const WorkerMetrics*;

@@ -148,6 +148,12 @@ RecordInboundMetrics(const ActiveSession& session, std::string_view msg_type) ->
 auto
 RecordOutboundMetrics(const ActiveSession& session, const session::EncodedFrame& frame) -> void;
 auto
+RecordReadMetrics(const ActiveSession& session, std::size_t byte_count) -> void;
+auto
+RecordWriteMetrics(const ActiveSession& session, std::size_t byte_count) -> void;
+auto
+RecordSocketPollMetrics(const ActiveSession& session) -> void;
+auto
 RecordProtocolFailure(const ActiveSession& session, const base::Status& status) -> void;
 auto
 RecordTrace(TraceEventKind kind,

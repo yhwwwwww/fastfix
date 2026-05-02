@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <string_view>
 
 #include "nimblefix/runtime/metrics.h"
@@ -10,6 +11,17 @@ TEST_CASE("metrics-trace", "[metrics-trace]")
   nimble::runtime::MetricsRegistry metrics;
   metrics.Reset(2U);
   REQUIRE(metrics.RegisterSession(1001U, 1U).ok());
+  auto* session_metrics = metrics.FindSession(1001U);
+  REQUIRE(session_metrics != nullptr);
+  REQUIRE(session_metrics->read_bytes.load(std::memory_order_relaxed) == 0U);
+  REQUIRE(session_metrics->write_bytes.load(std::memory_order_relaxed) == 0U);
+  REQUIRE(session_metrics->socket_poll_count.load(std::memory_order_relaxed) == 0U);
+  session_metrics->read_bytes.fetch_add(128U, std::memory_order_relaxed);
+  session_metrics->read_bytes.fetch_add(64U, std::memory_order_relaxed);
+  session_metrics->write_bytes.fetch_add(256U, std::memory_order_relaxed);
+  session_metrics->write_bytes.fetch_add(32U, std::memory_order_relaxed);
+  session_metrics->socket_poll_count.fetch_add(1U, std::memory_order_relaxed);
+  session_metrics->socket_poll_count.fetch_add(2U, std::memory_order_relaxed);
   REQUIRE(metrics.RecordInbound(1001U, false).ok());
   REQUIRE(metrics.RecordOutbound(1001U, true).ok());
   REQUIRE(metrics.RecordResendRequest(1001U).ok());
@@ -27,6 +39,9 @@ TEST_CASE("metrics-trace", "[metrics-trace]")
   REQUIRE(snapshot.sessions.size() == 1U);
   REQUIRE(snapshot.sessions[0].inbound_messages == 1U);
   REQUIRE(snapshot.sessions[0].outbound_messages == 1U);
+  REQUIRE(snapshot.sessions[0].read_bytes == 192U);
+  REQUIRE(snapshot.sessions[0].write_bytes == 288U);
+  REQUIRE(snapshot.sessions[0].socket_poll_count == 3U);
   REQUIRE(snapshot.sessions[0].admin_messages == 1U);
   REQUIRE(snapshot.sessions[0].resend_requests == 1U);
   REQUIRE(snapshot.sessions[0].gap_fills == 3U);

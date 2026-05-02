@@ -220,6 +220,16 @@ ApplyInitiatorWorkerThreadSetup(const Engine* engine, std::uint32_t worker_id) -
   return base::Status::Ok();
 }
 
+[[nodiscard]] auto
+MetricsSession(Engine* engine, std::uint64_t session_id) -> SessionMetrics*
+{
+  const auto* config = engine != nullptr ? engine->config() : nullptr;
+  if (config == nullptr || !config->enable_metrics) {
+    return nullptr;
+  }
+  return engine->mutable_metrics()->FindSession(session_id);
+}
+
 enum class OutboundCommandKind : std::uint32_t
 {
   kSendApplication = 0,
@@ -244,6 +254,7 @@ struct LiveInitiator::ActiveSession
 {
   CounterpartyConfig counterparty;
   std::uint32_t worker_id{ 0 };
+  SessionMetrics* metrics{ nullptr };
   session::SessionHandle handle;
   std::unique_ptr<profile::NormalizedDictionaryView> dictionary;
   std::unique_ptr<store::SessionStore> store;
@@ -1276,6 +1287,9 @@ LiveInitiator::PollOnce(std::chrono::milliseconds timeout) -> base::Status
     for (auto it = shard.io_ready_state.ready_indices.rbegin(); it != shard.io_ready_state.ready_indices.rend(); ++it) {
       const auto connection_index = *it;
       if (connection_index < shard.connections.size()) {
+        if (shard.connections[connection_index].session != nullptr) {
+          RecordSocketPollMetrics(*shard.connections[connection_index].session);
+        }
         auto status = ProcessConnection(shard, connection_index, true, now);
         if (!status.ok())
           return status;
@@ -1363,6 +1377,9 @@ LiveInitiator::PollWorkerOnce(WorkerShardState& shard, std::chrono::milliseconds
   for (auto it = shard.io_ready_state.ready_indices.rbegin(); it != shard.io_ready_state.ready_indices.rend(); ++it) {
     const auto connection_index = *it;
     if (connection_index < shard.connections.size()) {
+      if (shard.connections[connection_index].session != nullptr) {
+        RecordSocketPollMetrics(*shard.connections[connection_index].session);
+      }
       status = ProcessConnection(shard, connection_index, true, now);
       if (!status.ok())
         return status;
@@ -1525,6 +1542,7 @@ LiveInitiator::ProcessConnection(WorkerShardState& shard,
       }
 
       const auto frame_bytes = frame.value().value();
+      RecordReadMetrics(*connection->session, frame_bytes.size());
       auto header = codec::PeekSessionHeaderView(
         frame_bytes, codec::kFixSoh, connection->session->counterparty.validation_policy.verify_checksum);
       if (!header.ok()) {
@@ -2235,6 +2253,7 @@ LiveInitiator::SendFrame(ConnectionState& connection, const session::EncodedFram
 
   connection.last_progress_ns = timestamp_ns;
   last_progress_ns_.store(timestamp_ns);
+  RecordWriteMetrics(*connection.session, frame.bytes.size());
   RecordOutboundMetrics(*connection.session, frame);
   return base::Status::Ok();
 }
@@ -2303,6 +2322,7 @@ LiveInitiator::SendFramesBatch(ConnectionState& connection,
   }
 
   for (const auto& frame : frames) {
+    RecordWriteMetrics(*connection.session, frame.bytes.size());
     RecordOutboundMetrics(*connection.session, frame);
   }
   connection.last_progress_ns = timestamp_ns;
@@ -2637,6 +2657,7 @@ LiveInitiator::MakeActiveSession(const CounterpartyConfig& counterparty,
   auto session_state = std::make_unique<ActiveSession>();
   session_state->counterparty = counterparty;
   session_state->worker_id = worker_id;
+  session_state->metrics = MetricsSession(engine_, counterparty.session.session_id);
   session_state->dictionary = std::make_unique<profile::NormalizedDictionaryView>(std::move(dictionary));
   session_state->store = std::move(store).value();
   session_state->host = std::move(host);
@@ -2676,6 +2697,33 @@ LiveInitiator::RecordOutboundMetrics(const ActiveSession& session, const session
   } else if (frame.msg_type == "4") {
     static_cast<void>(metrics->RecordGapFill(session_id, 1U));
   }
+}
+
+auto
+LiveInitiator::RecordReadMetrics(const ActiveSession& session, std::size_t byte_count) -> void
+{
+  if (session.metrics == nullptr) {
+    return;
+  }
+  session.metrics->read_bytes.fetch_add(static_cast<std::uint64_t>(byte_count), std::memory_order_relaxed);
+}
+
+auto
+LiveInitiator::RecordWriteMetrics(const ActiveSession& session, std::size_t byte_count) -> void
+{
+  if (session.metrics == nullptr) {
+    return;
+  }
+  session.metrics->write_bytes.fetch_add(static_cast<std::uint64_t>(byte_count), std::memory_order_relaxed);
+}
+
+auto
+LiveInitiator::RecordSocketPollMetrics(const ActiveSession& session) -> void
+{
+  if (session.metrics == nullptr) {
+    return;
+  }
+  session.metrics->socket_poll_count.fetch_add(1U, std::memory_order_relaxed);
 }
 
 auto
