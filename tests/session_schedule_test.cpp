@@ -1,8 +1,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -34,6 +36,15 @@ MakeDailySchedule() -> nimble::runtime::SessionScheduleConfig
 }
 
 auto
+MakeWeeklySchedule() -> nimble::runtime::SessionScheduleConfig
+{
+  auto schedule = MakeDailySchedule();
+  schedule.start_day = nimble::runtime::SessionDayOfWeek::kMonday;
+  schedule.end_day = nimble::runtime::SessionDayOfWeek::kFriday;
+  return schedule;
+}
+
+auto
 MakeCounterparty(std::uint64_t session_id = 1001U) -> nimble::runtime::CounterpartyConfig
 {
   return nimble::runtime::CounterpartyConfigBuilder::Initiator(
@@ -61,6 +72,37 @@ HasDiagnosticField(const nimble::runtime::ConfigValidationResult& result, std::s
     return error.severity == nimble::runtime::ConfigErrorSeverity::kError && error.field_path == field_path;
   });
 }
+
+class ScopedTimezone
+{
+public:
+  explicit ScopedTimezone(const char* timezone)
+  {
+    if (const auto* current = std::getenv("TZ"); current != nullptr) {
+      had_original_ = true;
+      original_ = current;
+    }
+    setenv("TZ", timezone, 1);
+    tzset();
+  }
+
+  ~ScopedTimezone()
+  {
+    if (had_original_) {
+      setenv("TZ", original_.c_str(), 1);
+    } else {
+      unsetenv("TZ");
+    }
+    tzset();
+  }
+
+  ScopedTimezone(const ScopedTimezone&) = delete;
+  auto operator=(const ScopedTimezone&) -> ScopedTimezone& = delete;
+
+private:
+  bool had_original_{ false };
+  std::string original_;
+};
 
 } // namespace
 
@@ -310,4 +352,120 @@ TEST_CASE("next logon window close", "[session-schedule]")
 
   REQUIRE(nimble::runtime::NextLogonWindowClose(schedule, MakeUtcNs(2026, 7, 6, 8, 15, 0)) ==
           MakeUtcNs(2026, 7, 6, 8, 30, 0));
+}
+
+TEST_CASE("explain schedule non-stop session", "[session-schedule]")
+{
+  auto counterparty = MakeCounterparty();
+  counterparty.session_schedule.non_stop_session = true;
+
+  const nimble::runtime::BlackoutCalendar calendar;
+  const auto timeline = nimble::runtime::ExplainSchedule(counterparty, calendar, MakeUtcNs(2026, 7, 6, 0, 0, 0), 7U);
+
+  REQUIRE(timeline.session_id == counterparty.session.session_id);
+  REQUIRE(timeline.non_stop);
+  REQUIRE(timeline.entries.empty());
+}
+
+TEST_CASE("explain schedule daily window 3 days", "[session-schedule]")
+{
+  auto counterparty = MakeCounterparty();
+  counterparty.session_schedule = MakeDailySchedule();
+
+  const nimble::runtime::BlackoutCalendar calendar;
+  const auto timeline = nimble::runtime::ExplainSchedule(counterparty, calendar, MakeUtcNs(2026, 7, 6, 0, 0, 0), 3U);
+
+  REQUIRE(!timeline.non_stop);
+  REQUIRE(timeline.entries.size() == 6U);
+  REQUIRE(timeline.entries[0].kind == nimble::runtime::SessionScheduleEventKind::kEnteredSessionWindow);
+  REQUIRE(timeline.entries[0].unix_time_ns == MakeUtcNs(2026, 7, 6, 9, 0, 0));
+  REQUIRE(timeline.entries[1].kind == nimble::runtime::SessionScheduleEventKind::kExitedSessionWindow);
+  REQUIRE(timeline.entries[1].unix_time_ns == MakeUtcNs(2026, 7, 6, 17, 0, 0));
+  REQUIRE(timeline.entries[4].kind == nimble::runtime::SessionScheduleEventKind::kEnteredSessionWindow);
+  REQUIRE(timeline.entries[4].unix_time_ns == MakeUtcNs(2026, 7, 8, 9, 0, 0));
+  REQUIRE(timeline.entries[5].kind == nimble::runtime::SessionScheduleEventKind::kExitedSessionWindow);
+  REQUIRE(timeline.entries[5].unix_time_ns == MakeUtcNs(2026, 7, 8, 17, 0, 0));
+}
+
+TEST_CASE("explain schedule with blackout", "[session-schedule]")
+{
+  auto counterparty = MakeCounterparty();
+  counterparty.session_schedule = MakeDailySchedule();
+
+  nimble::runtime::BlackoutCalendar calendar;
+  calendar.AddDate(20260707U);
+  const auto timeline = nimble::runtime::ExplainSchedule(counterparty, calendar, MakeUtcNs(2026, 7, 6, 0, 0, 0), 3U);
+
+  const auto has_blackout_start = std::any_of(timeline.entries.begin(), timeline.entries.end(), [](const auto& entry) {
+    return entry.kind == nimble::runtime::SessionScheduleEventKind::kBlackoutStarted &&
+           entry.unix_time_ns == MakeUtcNs(2026, 7, 7, 0, 0, 0);
+  });
+  const auto has_blackout_end = std::any_of(timeline.entries.begin(), timeline.entries.end(), [](const auto& entry) {
+    return entry.kind == nimble::runtime::SessionScheduleEventKind::kBlackoutEnded &&
+           entry.unix_time_ns == MakeUtcNs(2026, 7, 8, 0, 0, 0);
+  });
+  REQUIRE(has_blackout_start);
+  REQUIRE(has_blackout_end);
+  REQUIRE(std::none_of(timeline.entries.begin(), timeline.entries.end(), [](const auto& entry) {
+    const auto is_session_boundary = entry.kind == nimble::runtime::SessionScheduleEventKind::kEnteredSessionWindow ||
+                                     entry.kind == nimble::runtime::SessionScheduleEventKind::kExitedSessionWindow;
+    return is_session_boundary && nimble::runtime::ExtractDate(entry.unix_time_ns) == 20260707U;
+  }));
+}
+
+TEST_CASE("explain schedule weekly window", "[session-schedule]")
+{
+  auto counterparty = MakeCounterparty();
+  counterparty.session_schedule = MakeWeeklySchedule();
+
+  const nimble::runtime::BlackoutCalendar calendar;
+  const auto timeline = nimble::runtime::ExplainSchedule(counterparty, calendar, MakeUtcNs(2026, 7, 6, 0, 0, 0), 7U);
+
+  REQUIRE(timeline.entries.size() == 2U);
+  REQUIRE(timeline.entries[0].kind == nimble::runtime::SessionScheduleEventKind::kEnteredSessionWindow);
+  REQUIRE(timeline.entries[0].unix_time_ns == MakeUtcNs(2026, 7, 6, 9, 0, 0));
+  REQUIRE(timeline.entries[1].kind == nimble::runtime::SessionScheduleEventKind::kExitedSessionWindow);
+  REQUIRE(timeline.entries[1].unix_time_ns == MakeUtcNs(2026, 7, 10, 17, 0, 0));
+  REQUIRE(std::none_of(timeline.entries.begin(), timeline.entries.end(), [](const auto& entry) {
+    const auto date = nimble::runtime::ExtractDate(entry.unix_time_ns);
+    return date == 20260711U || date == 20260712U;
+  }));
+}
+
+TEST_CASE("explain schedule summary output", "[session-schedule]")
+{
+  auto counterparty = MakeCounterparty();
+  counterparty.session_schedule = MakeDailySchedule();
+
+  const nimble::runtime::BlackoutCalendar calendar;
+  const auto timeline = nimble::runtime::ExplainSchedule(counterparty, calendar, MakeUtcNs(2026, 7, 6, 0, 0, 0), 1U);
+  const auto summary = timeline.summary();
+
+  REQUIRE(!summary.empty());
+  REQUIRE(summary.find("Schedule timeline for session 1001") != std::string::npos);
+  REQUIRE(summary.find("2026-07-06 09:00:00 UTC") != std::string::npos);
+  REQUIRE(summary.find("session window opens") != std::string::npos);
+}
+
+TEST_CASE("explain schedule local time handles dst transition", "[session-schedule]")
+{
+  const ScopedTimezone timezone("EST5EDT,M3.2.0/2,M11.1.0/2");
+  auto counterparty = MakeCounterparty();
+  counterparty.session_schedule = MakeDailySchedule();
+  counterparty.session_schedule.use_local_time = true;
+
+  const nimble::runtime::BlackoutCalendar calendar;
+  const auto timeline = nimble::runtime::ExplainSchedule(counterparty, calendar, MakeUtcNs(2026, 3, 7, 0, 0, 0), 3U);
+
+  const auto has_pre_dst_open = std::any_of(timeline.entries.begin(), timeline.entries.end(), [](const auto& entry) {
+    return entry.kind == nimble::runtime::SessionScheduleEventKind::kEnteredSessionWindow &&
+           entry.unix_time_ns == MakeUtcNs(2026, 3, 7, 14, 0, 0);
+  });
+  const auto has_post_dst_open = std::any_of(timeline.entries.begin(), timeline.entries.end(), [](const auto& entry) {
+    return entry.kind == nimble::runtime::SessionScheduleEventKind::kEnteredSessionWindow &&
+           entry.unix_time_ns == MakeUtcNs(2026, 3, 8, 13, 0, 0);
+  });
+
+  REQUIRE(has_pre_dst_open);
+  REQUIRE(has_post_dst_open);
 }

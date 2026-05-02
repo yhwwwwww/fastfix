@@ -127,6 +127,9 @@ BuildCalendarPoint(std::uint64_t unix_time_ns, bool use_local_time) -> CalendarP
 auto
 MakeUnixTimeNs(std::tm civil_time, bool use_local_time) -> std::optional<std::uint64_t>
 {
+  if (use_local_time) {
+    civil_time.tm_isdst = -1;
+  }
   const auto unix_seconds = use_local_time ? mktime(&civil_time) : timegm(&civil_time);
   if (unix_seconds < 0) {
     return std::nullopt;

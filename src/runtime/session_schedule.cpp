@@ -5,10 +5,12 @@
 #include <charconv>
 #include <ctime>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 
 #include "nimblefix/runtime/engine.h"
 #include "nimblefix/runtime/schedule_helpers.h"
@@ -18,6 +20,7 @@ namespace nimble::runtime {
 namespace {
 
 constexpr std::uint64_t kNanosecondsPerSecond = 1'000'000'000ULL;
+constexpr std::uint64_t kNanosecondsPerDay = static_cast<std::uint64_t>(detail::kSecondsPerDay) * kNanosecondsPerSecond;
 constexpr std::uint32_t kMonthsPerYear = 12U;
 constexpr std::uint32_t kMaxDaysPerMonth = 31U;
 constexpr std::size_t kCompactDateLength = 8U;
@@ -130,7 +133,252 @@ DateParts(BlackoutDate date) -> std::tuple<std::uint32_t, std::uint32_t, std::ui
   return { year, month, day };
 }
 
+auto
+HasSessionWindowFields(const SessionScheduleConfig& schedule) -> bool
+{
+  return schedule.start_time.has_value() || schedule.end_time.has_value() || schedule.start_day.has_value() ||
+         schedule.end_day.has_value();
+}
+
+auto
+HasLogonWindowFields(const SessionScheduleConfig& schedule) -> bool
+{
+  return schedule.logon_time.has_value() || schedule.logout_time.has_value() || schedule.logon_day.has_value() ||
+         schedule.logout_day.has_value();
+}
+
+auto
+PreviewEndTime(std::uint64_t start_time_ns, std::uint32_t days) -> std::uint64_t
+{
+  const auto preview_days = std::max(days, 1U);
+  const auto max_days = (std::numeric_limits<std::uint64_t>::max() - start_time_ns) / kNanosecondsPerDay;
+  if (preview_days > max_days) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  return start_time_ns + static_cast<std::uint64_t>(preview_days) * kNanosecondsPerDay;
+}
+
+auto
+AdvancePast(std::uint64_t unix_time_ns) -> std::uint64_t
+{
+  if (unix_time_ns == std::numeric_limits<std::uint64_t>::max()) {
+    return unix_time_ns;
+  }
+  return unix_time_ns + 1U;
+}
+
+auto
+FormatTimestampUtc(std::uint64_t unix_time_ns) -> std::string
+{
+  const auto point = detail::BuildCalendarPoint(unix_time_ns, false);
+  std::ostringstream out;
+  out << std::setfill('0') << std::setw(4) << point.civil_time.tm_year + 1900 << '-' << std::setw(2)
+      << point.civil_time.tm_mon + 1 << '-' << std::setw(2) << point.civil_time.tm_mday << ' ' << std::setw(2)
+      << point.civil_time.tm_hour << ':' << std::setw(2) << point.civil_time.tm_min << ':' << std::setw(2)
+      << point.civil_time.tm_sec << " UTC";
+  return out.str();
+}
+
+auto
+FormatDateUtc(std::uint64_t unix_time_ns) -> std::string
+{
+  const auto point = detail::BuildCalendarPoint(unix_time_ns, false);
+  std::ostringstream out;
+  out << std::setfill('0') << std::setw(4) << point.civil_time.tm_year + 1900 << '-' << std::setw(2)
+      << point.civil_time.tm_mon + 1 << '-' << std::setw(2) << point.civil_time.tm_mday;
+  return out.str();
+}
+
+auto
+EventKindSortRank(SessionScheduleEventKind kind) -> int
+{
+  switch (kind) {
+    case SessionScheduleEventKind::kBlackoutStarted:
+      return 0;
+    case SessionScheduleEventKind::kExitedSessionWindow:
+      return 1;
+    case SessionScheduleEventKind::kExitedLogonWindow:
+      return 2;
+    case SessionScheduleEventKind::kBlackoutEnded:
+      return 3;
+    case SessionScheduleEventKind::kEnteredLogonWindow:
+      return 4;
+    case SessionScheduleEventKind::kEnteredSessionWindow:
+      return 5;
+    case SessionScheduleEventKind::kDayCutTriggered:
+      return 6;
+  }
+  return 7;
+}
+
+auto
+SortTimelineEntries(std::vector<ScheduleTimelineEntry>& entries) -> void
+{
+  std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
+    if (left.unix_time_ns != right.unix_time_ns) {
+      return left.unix_time_ns < right.unix_time_ns;
+    }
+    return EventKindSortRank(left.kind) < EventKindSortRank(right.kind);
+  });
+}
+
+auto
+AddTimelineEntry(std::vector<ScheduleTimelineEntry>& entries,
+                 std::uint64_t unix_time_ns,
+                 std::uint64_t start_time_ns,
+                 std::uint64_t end_time_ns,
+                 SessionScheduleEventKind kind,
+                 std::string description) -> void
+{
+  if (unix_time_ns < start_time_ns || unix_time_ns >= end_time_ns) {
+    return;
+  }
+  entries.push_back(ScheduleTimelineEntry{
+    .unix_time_ns = unix_time_ns,
+    .kind = kind,
+    .description = std::move(description),
+  });
+}
+
+auto
+CollectWindowTimeline(std::vector<ScheduleTimelineEntry>& entries,
+                      const CounterpartyConfig& config,
+                      const BlackoutCalendar& calendar,
+                      std::uint64_t start_time_ns,
+                      std::uint64_t end_time_ns,
+                      bool logon_window) -> void
+{
+  const auto& schedule = config.session_schedule;
+  auto cursor = start_time_ns;
+  while (cursor < end_time_ns) {
+    const auto status = QueryScheduleStatus(config, cursor);
+    const auto in_window = logon_window ? status.in_logon_window : status.in_session_window;
+    if (in_window) {
+      const auto close_time =
+        logon_window ? NextLogonWindowClose(schedule, cursor) : NextSessionWindowClose(schedule, cursor);
+      if (!close_time.has_value() || *close_time >= end_time_ns) {
+        break;
+      }
+      if (!calendar.IsBlackout(*close_time, schedule.use_local_time)) {
+        AddTimelineEntry(entries,
+                         *close_time,
+                         start_time_ns,
+                         end_time_ns,
+                         logon_window ? SessionScheduleEventKind::kExitedLogonWindow
+                                      : SessionScheduleEventKind::kExitedSessionWindow,
+                         logon_window ? "logon window closes" : "session window closes");
+      }
+      const auto next_cursor = AdvancePast(*close_time);
+      if (next_cursor <= cursor) {
+        break;
+      }
+      cursor = next_cursor;
+      continue;
+    }
+
+    const auto open_time =
+      logon_window ? NextLogonWindowStart(schedule, cursor) : NextSessionWindowStart(schedule, cursor);
+    if (!open_time.has_value() || *open_time >= end_time_ns) {
+      break;
+    }
+    if (!calendar.IsBlackout(*open_time, schedule.use_local_time)) {
+      AddTimelineEntry(entries,
+                       *open_time,
+                       start_time_ns,
+                       end_time_ns,
+                       logon_window ? SessionScheduleEventKind::kEnteredLogonWindow
+                                    : SessionScheduleEventKind::kEnteredSessionWindow,
+                       logon_window ? "logon window opens" : "session window opens");
+    }
+    const auto next_cursor = AdvancePast(*open_time);
+    if (next_cursor <= cursor) {
+      break;
+    }
+    cursor = next_cursor;
+  }
+}
+
+auto
+BlackoutDateBoundary(BlackoutDate date, bool use_local_time, bool end_boundary) -> std::optional<std::uint64_t>
+{
+  const auto [year, month, day] = DateParts(date);
+  if (!ValidateDateParts(year, month, day)) {
+    return std::nullopt;
+  }
+
+  std::tm civil_time{};
+  civil_time.tm_year = static_cast<int>(year) - 1900;
+  civil_time.tm_mon = static_cast<int>(month) - 1;
+  civil_time.tm_mday = static_cast<int>(day) + (end_boundary ? 1 : 0);
+  civil_time.tm_isdst = -1;
+  return detail::MakeUnixTimeNs(civil_time, use_local_time);
+}
+
+auto
+CollectBlackoutTimeline(std::vector<ScheduleTimelineEntry>& entries,
+                        const SessionScheduleConfig& schedule,
+                        const BlackoutCalendar& calendar,
+                        std::uint64_t start_time_ns,
+                        std::uint64_t end_time_ns) -> void
+{
+  for (const auto date : calendar.dates()) {
+    const auto blackout_start = BlackoutDateBoundary(date, schedule.use_local_time, false);
+    const auto blackout_end = BlackoutDateBoundary(date, schedule.use_local_time, true);
+    if (!blackout_start.has_value() || !blackout_end.has_value()) {
+      continue;
+    }
+    if (*blackout_end <= start_time_ns || *blackout_start >= end_time_ns) {
+      continue;
+    }
+
+    const auto date_text = BlackoutDateToString(date);
+    AddTimelineEntry(entries,
+                     *blackout_start,
+                     start_time_ns,
+                     end_time_ns,
+                     SessionScheduleEventKind::kBlackoutStarted,
+                     "blackout starts: " + date_text);
+    if (*blackout_end > start_time_ns && *blackout_end <= end_time_ns) {
+      entries.push_back(ScheduleTimelineEntry{
+        .unix_time_ns = *blackout_end,
+        .kind = SessionScheduleEventKind::kBlackoutEnded,
+        .description = "blackout ends: " + date_text,
+      });
+    }
+  }
+}
+
+auto
+Plural(std::uint32_t count, std::string_view singular, std::string_view plural) -> std::string_view
+{
+  return count == 1U ? singular : plural;
+}
+
 } // namespace
+
+auto
+ScheduleTimeline::summary() const -> std::string
+{
+  std::ostringstream out;
+  out << "Schedule timeline for session " << session_id;
+  if (days > 0U) {
+    out << " (" << days << ' ' << Plural(days, "day", "days") << " from " << FormatDateUtc(start_time_ns) << ')';
+  }
+  if (non_stop) {
+    out << ":\n  non-stop session (no schedule boundaries)";
+    return out.str();
+  }
+  if (entries.empty()) {
+    out << ":\n  no schedule events";
+    return out.str();
+  }
+
+  out << ':';
+  for (const auto& entry : entries) {
+    out << "\n  " << FormatTimestampUtc(entry.unix_time_ns) << "  " << entry.description;
+  }
+  return out.str();
+}
 
 auto
 QueryScheduleStatus(const CounterpartyConfig& config, std::uint64_t unix_time_ns) -> SessionScheduleStatus
@@ -156,6 +404,34 @@ QueryScheduleStatus(const CounterpartyConfig& config, std::uint64_t unix_time_ns
     status.next_session_window_close_ns = NextSessionWindowClose(config.session_schedule, unix_time_ns);
   }
   return status;
+}
+
+auto
+ExplainSchedule(const CounterpartyConfig& config,
+                const BlackoutCalendar& calendar,
+                std::uint64_t start_time_ns,
+                std::uint32_t days) -> ScheduleTimeline
+{
+  const auto preview_days = std::max(days, 1U);
+  ScheduleTimeline timeline;
+  timeline.session_id = config.session.session_id;
+  timeline.non_stop = config.session_schedule.non_stop_session;
+  timeline.start_time_ns = start_time_ns;
+  timeline.days = preview_days;
+  if (timeline.non_stop) {
+    return timeline;
+  }
+
+  const auto end_time_ns = PreviewEndTime(start_time_ns, preview_days);
+  if (HasSessionWindowFields(config.session_schedule)) {
+    CollectWindowTimeline(timeline.entries, config, calendar, start_time_ns, end_time_ns, false);
+  }
+  if (HasLogonWindowFields(config.session_schedule)) {
+    CollectWindowTimeline(timeline.entries, config, calendar, start_time_ns, end_time_ns, true);
+  }
+  CollectBlackoutTimeline(timeline.entries, config.session_schedule, calendar, start_time_ns, end_time_ns);
+  SortTimelineEntries(timeline.entries);
+  return timeline;
 }
 
 auto

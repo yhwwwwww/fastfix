@@ -12,6 +12,7 @@
 
 namespace nimble::runtime {
 
+class BlackoutCalendar;
 class Engine;
 
 // ─── Schedule Status ───────────────────────────────────────────────────────
@@ -56,6 +57,35 @@ struct SessionScheduleEvent
   SessionScheduleStatus status;
 };
 
+/// One event in a schedule timeline preview.
+struct ScheduleTimelineEntry
+{
+  /// Nanosecond timestamp of this event.
+  std::uint64_t unix_time_ns{ 0 };
+  /// What happens at this time.
+  SessionScheduleEventKind kind{ SessionScheduleEventKind::kEnteredSessionWindow };
+  /// Human-readable description (e.g. "session window opens", "blackout: 2026-07-04").
+  std::string description;
+};
+
+/// Preview result containing a sorted list of schedule events.
+struct ScheduleTimeline
+{
+  /// Session identifier from the counterparty config.
+  std::uint64_t session_id{ 0 };
+  /// Whether the session is configured as non-stop (timeline will be empty).
+  bool non_stop{ false };
+  /// Sorted ascending timeline entries.
+  std::vector<ScheduleTimelineEntry> entries;
+  /// Starting wall-clock time used for this preview.
+  std::uint64_t start_time_ns{ 0 };
+  /// Number of days covered by this preview.
+  std::uint32_t days{ 0 };
+
+  /// Human-readable multi-line summary.
+  [[nodiscard]] auto summary() const -> std::string;
+};
+
 /// Query the schedule status for a specific session at a given wall-clock time.
 ///
 /// \param config Counterparty config containing the session_schedule.
@@ -63,6 +93,22 @@ struct SessionScheduleEvent
 /// \return Populated SessionScheduleStatus.
 [[nodiscard]] auto
 QueryScheduleStatus(const CounterpartyConfig& config, std::uint64_t unix_time_ns) -> SessionScheduleStatus;
+
+/// Generate a schedule timeline for a counterparty's session schedule.
+///
+/// Starting from `start_time_ns`, iterates forward `days` days and collects
+/// all session window open/close events and blackout boundaries.
+///
+/// \param config Counterparty config with session_schedule populated.
+/// \param calendar Optional blackout calendar (empty calendar = no blackouts).
+/// \param start_time_ns Starting wall-clock time in nanoseconds.
+/// \param days Number of days to preview (must be >= 1).
+/// \return Timeline of events sorted by timestamp.
+[[nodiscard]] auto
+ExplainSchedule(const CounterpartyConfig& config,
+                const BlackoutCalendar& calendar,
+                std::uint64_t start_time_ns,
+                std::uint32_t days) -> ScheduleTimeline;
 
 // ─── Window Close Time ─────────────────────────────────────────────────────
 
