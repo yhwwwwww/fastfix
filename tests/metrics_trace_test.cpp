@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <string_view>
+
 #include "nimblefix/runtime/metrics.h"
 #include "nimblefix/runtime/trace.h"
 
@@ -40,6 +42,8 @@ TEST_CASE("metrics-trace", "[metrics-trace]")
   REQUIRE(snapshot.workers[1].tls_handshake_failures == 1U);
   REQUIRE(snapshot.workers[1].tls_handshake_latency_ns == 3000U);
   REQUIRE(snapshot.workers[1].tls_session_resumptions == 1U);
+  REQUIRE(snapshot.workers[1].histograms.store_flush_latency_ns.count == 1U);
+  REQUIRE(snapshot.workers[1].histograms.store_flush_latency_ns.p50_ns == 2048U);
 
   nimble::runtime::TraceRecorder trace;
   trace.Configure(nimble::runtime::TraceMode::kRing, 2U, 2U);
@@ -57,4 +61,61 @@ TEST_CASE("metrics-trace", "[metrics-trace]")
   REQUIRE(events[2].sequence == 4U);
   REQUIRE(events[3].sequence == 5U);
   REQUIRE(std::string_view(events[3].text.data()) == "store");
+}
+
+TEST_CASE("latency histogram snapshots percentiles", "[metrics-trace]")
+{
+  nimble::runtime::LatencyHistogram histogram;
+  histogram.Observe(0U);
+  histogram.Observe(63U);
+  histogram.Observe(64U);
+  histogram.Observe(127U);
+  histogram.Observe(128U);
+  histogram.Observe(1'048'576U);
+
+  const auto snapshot = histogram.Snapshot();
+  REQUIRE(snapshot.Count() == 6U);
+  REQUIRE(snapshot.Percentile(0.50) == 128U);
+  REQUIRE(snapshot.Percentile(50.0) == 128U);
+  REQUIRE(snapshot.Percentile(0.90) == 1'048'576U);
+  REQUIRE(snapshot.Percentile(99.9) == 1'048'576U);
+  REQUIRE(histogram.Percentile(50.0) == 128U);
+  REQUIRE(snapshot.SumNs() > 0U);
+
+  histogram.Reset();
+  const auto reset_snapshot = histogram.Snapshot();
+  REQUIRE(reset_snapshot.Count() == 0U);
+  REQUIRE(reset_snapshot.Percentile(99.0) == 0U);
+}
+
+TEST_CASE("worker metrics snapshot includes latency histogram percentiles", "[metrics-trace]")
+{
+  nimble::runtime::MetricsRegistry metrics;
+  metrics.Reset(1U);
+  REQUIRE(metrics.RegisterSession(1001U, 0U).ok());
+  REQUIRE(metrics.ObserveStoreFlushLatency(1001U, 200U).ok());
+  REQUIRE(metrics.ObserveStoreFlushLatency(1001U, 900U).ok());
+  auto* worker = metrics.FindWorker(0U);
+  REQUIRE(worker != nullptr);
+  worker->session_inbound_latency_ns.Observe(90U);
+  worker->session_inbound_latency_ns.Observe(2'000U);
+  worker->encode_latency_ns.Observe(300U);
+  worker->parse_latency_ns.Observe(70U);
+  worker->send_latency_ns.Observe(1'500U);
+
+  const auto snapshot = metrics.Snapshot();
+  REQUIRE(snapshot.workers.size() == 1U);
+  const auto& histograms = snapshot.workers[0].histograms;
+  REQUIRE(histograms.session_inbound_latency_ns.count == 2U);
+  REQUIRE(histograms.session_inbound_latency_ns.p50_ns == 128U);
+  REQUIRE(histograms.session_inbound_latency_ns.p90_ns == 2048U);
+  REQUIRE(histograms.encode_latency_ns.count == 1U);
+  REQUIRE(histograms.encode_latency_ns.p99_ns == 512U);
+  REQUIRE(histograms.parse_latency_ns.count == 1U);
+  REQUIRE(histograms.parse_latency_ns.p999_ns == 128U);
+  REQUIRE(histograms.store_flush_latency_ns.count == 2U);
+  REQUIRE(histograms.store_flush_latency_ns.p50_ns == 256U);
+  REQUIRE(histograms.store_flush_latency_ns.p90_ns == 1024U);
+  REQUIRE(histograms.send_latency_ns.count == 1U);
+  REQUIRE(histograms.send_latency_ns.sum_ns > 0U);
 }

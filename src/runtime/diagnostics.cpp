@@ -129,6 +129,40 @@ AppendSessionJson(std::string& out, const RuntimeMetricsSnapshot::SessionEntry& 
 }
 
 auto
+AppendHistogramEntryJson(std::string& out,
+                         std::string_view name,
+                         const RuntimeMetricsSnapshot::WorkerEntry::HistogramEntry& histogram,
+                         bool trailing_comma = true) -> void
+{
+  out.push_back('"');
+  out.append(name);
+  out.append("\":{");
+  AppendNumberField(out, "p50_ns", histogram.p50_ns);
+  AppendNumberField(out, "p90_ns", histogram.p90_ns);
+  AppendNumberField(out, "p99_ns", histogram.p99_ns);
+  AppendNumberField(out, "p999_ns", histogram.p999_ns);
+  AppendNumberField(out, "count", histogram.count);
+  AppendNumberField(out, "sum_ns", histogram.sum_ns, false);
+  out.push_back('}');
+  if (trailing_comma) {
+    out.push_back(',');
+  }
+}
+
+auto
+AppendWorkerHistogramsJson(std::string& out,
+                           const RuntimeMetricsSnapshot::WorkerEntry::WorkerHistogramSnapshot& histograms) -> void
+{
+  out.append("\"histograms\":{");
+  AppendHistogramEntryJson(out, "session_inbound_latency_ns", histograms.session_inbound_latency_ns);
+  AppendHistogramEntryJson(out, "encode_latency_ns", histograms.encode_latency_ns);
+  AppendHistogramEntryJson(out, "parse_latency_ns", histograms.parse_latency_ns);
+  AppendHistogramEntryJson(out, "store_flush_latency_ns", histograms.store_flush_latency_ns);
+  AppendHistogramEntryJson(out, "send_latency_ns", histograms.send_latency_ns, false);
+  out.push_back('}');
+}
+
+auto
 AppendWorkerJson(std::string& out, const RuntimeMetricsSnapshot::WorkerEntry& worker) -> void
 {
   out.push_back('{');
@@ -154,7 +188,8 @@ AppendWorkerJson(std::string& out, const RuntimeMetricsSnapshot::WorkerEntry& wo
   AppendNumberField(out, "tls_handshake_successes", worker.tls_handshake_successes);
   AppendNumberField(out, "tls_handshake_failures", worker.tls_handshake_failures);
   AppendNumberField(out, "tls_handshake_latency_ns", worker.tls_handshake_latency_ns);
-  AppendNumberField(out, "tls_session_resumptions", worker.tls_session_resumptions, false);
+  AppendNumberField(out, "tls_session_resumptions", worker.tls_session_resumptions);
+  AppendWorkerHistogramsJson(out, worker.histograms);
   out.push_back('}');
 }
 
@@ -205,11 +240,23 @@ MetricsToText(const RuntimeMetricsSnapshot& snapshot) -> std::string
 {
   std::ostringstream out;
   out << "metrics workers=" << snapshot.workers.size() << " sessions=" << snapshot.sessions.size() << '\n';
+  const auto append_histogram = [&out](std::string_view name,
+                                       const RuntimeMetricsSnapshot::WorkerEntry::HistogramEntry& histogram) {
+    out << ' ' << name << "_count=" << histogram.count << ' ' << name << "_sum_ns=" << histogram.sum_ns << ' ' << name
+        << "_p50_ns=" << histogram.p50_ns << ' ' << name << "_p90_ns=" << histogram.p90_ns << ' ' << name
+        << "_p99_ns=" << histogram.p99_ns << ' ' << name << "_p999_ns=" << histogram.p999_ns;
+  };
   for (const auto& worker : snapshot.workers) {
     out << "worker id=" << worker.worker_id << " registered_sessions=" << worker.registered_sessions
         << " inbound_messages=" << worker.inbound_messages << " outbound_messages=" << worker.outbound_messages
         << " parse_failures=" << worker.parse_failures << " checksum_failures=" << worker.checksum_failures
-        << " resend_requests=" << worker.resend_requests << " gap_fills=" << worker.gap_fills << '\n';
+        << " resend_requests=" << worker.resend_requests << " gap_fills=" << worker.gap_fills;
+    append_histogram("session_inbound_latency_ns", worker.histograms.session_inbound_latency_ns);
+    append_histogram("encode_latency_ns", worker.histograms.encode_latency_ns);
+    append_histogram("parse_latency_ns", worker.histograms.parse_latency_ns);
+    append_histogram("store_flush_latency_ns", worker.histograms.store_flush_latency_ns);
+    append_histogram("send_latency_ns", worker.histograms.send_latency_ns);
+    out << '\n';
   }
   for (const auto& session : snapshot.sessions) {
     out << "session id=" << session.session_id << " worker=" << session.worker_id

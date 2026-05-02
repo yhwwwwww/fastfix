@@ -1,11 +1,137 @@
 #include "nimblefix/runtime/metrics.h"
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 
 namespace nimble::runtime {
+
+namespace {
+
+[[nodiscard]] auto
+BucketUpperBoundNs(std::size_t bucket_index) -> std::uint64_t
+{
+  if (bucket_index + 1U >= kLatencyHistogramBucketCount) {
+    return kLatencyHistogramOverflowLowerBoundNs;
+  }
+  return kLatencyHistogramFirstBucketUpperBoundNs << bucket_index;
+}
+
+[[nodiscard]] auto
+BucketMidpointNs(std::size_t bucket_index) -> std::uint64_t
+{
+  if (bucket_index == 0U) {
+    return kLatencyHistogramFirstBucketUpperBoundNs / 2U;
+  }
+  if (bucket_index + 1U >= kLatencyHistogramBucketCount) {
+    return kLatencyHistogramOverflowLowerBoundNs;
+  }
+  const auto upper_bound = BucketUpperBoundNs(bucket_index);
+  return upper_bound - (upper_bound / 4U);
+}
+
+[[nodiscard]] auto
+MakeHistogramEntry(const LatencyHistogramSnapshot& histogram) -> RuntimeMetricsSnapshot::WorkerEntry::HistogramEntry
+{
+  return RuntimeMetricsSnapshot::WorkerEntry::HistogramEntry{
+    .p50_ns = histogram.Percentile(50.0),
+    .p90_ns = histogram.Percentile(90.0),
+    .p99_ns = histogram.Percentile(99.0),
+    .p999_ns = histogram.Percentile(99.9),
+    .count = histogram.Count(),
+    .sum_ns = histogram.SumNs(),
+  };
+}
+
+[[nodiscard]] auto
+MakeWorkerHistogramSnapshot(const WorkerMetrics& worker) -> RuntimeMetricsSnapshot::WorkerEntry::WorkerHistogramSnapshot
+{
+  return RuntimeMetricsSnapshot::WorkerEntry::WorkerHistogramSnapshot{
+    .session_inbound_latency_ns = MakeHistogramEntry(worker.session_inbound_latency_ns.Snapshot()),
+    .encode_latency_ns = MakeHistogramEntry(worker.encode_latency_ns.Snapshot()),
+    .parse_latency_ns = MakeHistogramEntry(worker.parse_latency_ns.Snapshot()),
+    .store_flush_latency_ns = MakeHistogramEntry(worker.store_flush_latency_ns.Snapshot()),
+    .send_latency_ns = MakeHistogramEntry(worker.send_latency_ns.Snapshot()),
+  };
+}
+
+[[nodiscard]] auto
+NormalizePercentile(double p) -> double
+{
+  if (p <= 1.0) {
+    return p * 100.0;
+  }
+  return p;
+}
+
+} // namespace
+
+auto
+LatencyHistogramSnapshot::Count() const -> std::uint64_t
+{
+  std::uint64_t total = 0U;
+  for (const auto count : counts) {
+    total += count;
+  }
+  return total;
+}
+
+auto
+LatencyHistogramSnapshot::SumNs() const -> std::uint64_t
+{
+  std::uint64_t sum = 0U;
+  for (std::size_t index = 0U; index < counts.size(); ++index) {
+    sum += counts[index] * BucketMidpointNs(index);
+  }
+  return sum;
+}
+
+auto
+LatencyHistogramSnapshot::Percentile(double p) const -> std::uint64_t
+{
+  const auto total = Count();
+  if (total == 0U) {
+    return 0U;
+  }
+
+  const auto clamped = std::clamp(NormalizePercentile(p), 0.0, 100.0);
+  const auto target =
+    std::max<std::uint64_t>(1U, static_cast<std::uint64_t>(std::ceil((clamped / 100.0) * static_cast<double>(total))));
+  std::uint64_t cumulative = 0U;
+  for (std::size_t index = 0U; index < counts.size(); ++index) {
+    cumulative += counts[index];
+    if (cumulative >= target) {
+      return BucketUpperBoundNs(index);
+    }
+  }
+  return kLatencyHistogramOverflowLowerBoundNs;
+}
+
+auto
+LatencyHistogram::Percentile(double p) const -> std::uint64_t
+{
+  return Snapshot().Percentile(p);
+}
+
+auto
+LatencyHistogram::Snapshot() const -> LatencyHistogramSnapshot
+{
+  LatencyHistogramSnapshot snapshot;
+  for (std::size_t index = 0U; index < buckets_.size(); ++index) {
+    snapshot.counts[index] = buckets_[index].load(std::memory_order_relaxed);
+  }
+  return snapshot;
+}
+
+auto
+LatencyHistogram::Reset() -> void
+{
+  for (auto& bucket : buckets_) {
+    bucket.store(0U, std::memory_order_relaxed);
+  }
+}
 
 auto
 MetricsRegistry::Reset(std::uint32_t worker_count) -> void
@@ -171,6 +297,7 @@ MetricsRegistry::ObserveStoreFlushLatency(std::uint64_t session_id, std::uint64_
   auto* worker = FindMutableWorker(session->worker_id);
   session->last_store_flush_latency_ns.store(latency_ns, std::memory_order_relaxed);
   worker->last_store_flush_latency_ns.store(latency_ns, std::memory_order_relaxed);
+  worker->store_flush_latency_ns.Observe(latency_ns);
   return base::Status::Ok();
 }
 
@@ -240,6 +367,7 @@ MetricsRegistry::Snapshot() const -> RuntimeMetricsSnapshot
       .tls_handshake_failures = w.tls_handshake_failures.load(std::memory_order_relaxed),
       .tls_handshake_latency_ns = w.tls_handshake_latency_ns.load(std::memory_order_relaxed),
       .tls_session_resumptions = w.tls_session_resumptions.load(std::memory_order_relaxed),
+      .histograms = MakeWorkerHistogramSnapshot(w),
     });
   }
   snapshot.sessions.reserve(sessions_.size());

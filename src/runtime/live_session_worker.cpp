@@ -11,8 +11,8 @@
 #include <thread>
 #include <utility>
 
-#include "nimblefix/base/spsc_queue.h"
 #include "nimblefix/advanced/engine.h"
+#include "nimblefix/base/spsc_queue.h"
 #include "nimblefix/codec/fix_tags.h"
 #include "nimblefix/runtime/live_runtime_support.h"
 #include "nimblefix/store/durable_batch_store.h"
@@ -209,11 +209,20 @@ LiveSessionWorker::PollWorkerOnce(WorkerShardState& shard, std::chrono::millisec
   const auto t_send2_done = NowNs();
 
   if (wm != nullptr) {
-    wm->poll_wait_ns.fetch_add(t_poll_end - t_poll_start, std::memory_order_relaxed);
-    wm->recv_dispatch_ns.fetch_add(t_recv_done - t_poll_end, std::memory_order_relaxed);
-    wm->app_callback_ns.fetch_add((t_app_done - t_recv_done) + (t_app2_done - t_timer_done), std::memory_order_relaxed);
-    wm->send_ns.fetch_add((t_send_done - t_app_done) + (t_send2_done - t_app2_done), std::memory_order_relaxed);
-    wm->timer_process_ns.fetch_add(t_timer_done - t_send_done, std::memory_order_relaxed);
+    const auto poll_wait_ns = t_poll_end - t_poll_start;
+    const auto recv_dispatch_ns = t_recv_done - t_poll_end;
+    const auto app_callback_ns = (t_app_done - t_recv_done) + (t_app2_done - t_timer_done);
+    const auto send_ns = (t_send_done - t_app_done) + (t_send2_done - t_app2_done);
+    const auto timer_process_ns = t_timer_done - t_send_done;
+    wm->poll_wait_ns.fetch_add(poll_wait_ns, std::memory_order_relaxed);
+    wm->recv_dispatch_ns.fetch_add(recv_dispatch_ns, std::memory_order_relaxed);
+    wm->app_callback_ns.fetch_add(app_callback_ns, std::memory_order_relaxed);
+    wm->send_ns.fetch_add(send_ns, std::memory_order_relaxed);
+    wm->timer_process_ns.fetch_add(timer_process_ns, std::memory_order_relaxed);
+    wm->session_inbound_latency_ns.Observe(recv_dispatch_ns + app_callback_ns);
+    wm->parse_latency_ns.Observe(recv_dispatch_ns);
+    wm->encode_latency_ns.Observe(send_ns);
+    wm->send_latency_ns.Observe(send_ns);
     wm->poll_iterations.fetch_add(1, std::memory_order_relaxed);
   }
 
