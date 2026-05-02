@@ -787,6 +787,7 @@ Engine::ResolveInboundSession(const codec::SessionHeader& header) const -> base:
     .target_comp_id = header.target_comp_id,
     .target_sub_id = header.target_sub_id,
     .default_appl_ver_id = header.default_appl_ver_id,
+    .appl_ver_id = header.appl_ver_id,
     .sending_time = header.sending_time,
     .orig_sending_time = header.orig_sending_time,
     .body_length = header.body_length,

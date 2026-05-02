@@ -691,6 +691,9 @@ EncodePreEncodedApplicationToBuffer(EncodedApplicationMessageView message,
   if (message.msg_type == "A" && !options.default_appl_ver_id.empty()) {
     append_string_field(kDefaultApplVerIDPrefix, options.default_appl_ver_id);
   }
+  if (!options.appl_ver_id.empty()) {
+    append_string_field(kApplVerIDPrefix, options.appl_ver_id);
+  }
   if (options.poss_dup) {
     out.append(kPossDupFlagYesField);
     out.push_back(delimiter);
@@ -995,6 +998,12 @@ AdminProtocol::ValidateCompIds(const codec::DecodedMessageView& decoded,
     *disconnect = true;
     return false;
   }
+  if (!is_logon && config_.transport_profile.transport_and_app_version_decoupled &&
+      !decoded.header.appl_ver_id.empty()) {
+    // Message-level ApplVerID(1128) selects the application version for mixed-version FIXT.1.1 sessions.
+    // It is intentionally parsed and exposed, not enforced against the session
+    // DefaultApplVerID(1137).
+  }
   return true;
 }
 
@@ -1279,6 +1288,7 @@ AdminProtocol::EncodeFrame(message::MessageView message,
   options.sender_comp_id = config_.sender_comp_id;
   options.target_comp_id = config_.target_comp_id;
   options.default_appl_ver_id = config_.default_appl_ver_id;
+  options.appl_ver_id = envelope.appl_ver_id;
   options.orig_sending_time = orig_sending_time;
   options.timestamp_resolution = config_.timestamp_resolution;
   options.msg_seq_num = seq_num;
@@ -1330,6 +1340,7 @@ AdminProtocol::EncodeFrame(EncodedApplicationMessageView message,
   options.sender_comp_id = config_.sender_comp_id;
   options.target_comp_id = config_.target_comp_id;
   options.default_appl_ver_id = config_.default_appl_ver_id;
+  options.appl_ver_id = envelope.appl_ver_id;
   options.orig_sending_time = orig_sending_time;
   options.timestamp_resolution = config_.timestamp_resolution;
   options.msg_seq_num = seq_num;

@@ -23,6 +23,7 @@ struct RawPassThroughView
   std::string_view on_behalf_of_comp_id;
   std::string_view deliver_to_comp_id;
   std::string_view default_appl_ver_id;
+  std::string_view appl_ver_id; // ApplVerID(1128) when present in header
   std::string_view sending_time;
   std::string_view orig_sending_time;
   bool poss_dup{ false };
@@ -70,6 +71,7 @@ struct ReplayOptions
   std::string_view target_sub_id;
   std::string_view begin_string;
   std::string_view default_appl_ver_id;  // DefaultApplVerID, empty = omit
+  std::string_view appl_ver_id;          // ApplVerID, empty = preserve stored
   std::string_view on_behalf_of_comp_id; // OnBehalfOfCompID, empty = preserve stored
   std::string_view deliver_to_comp_id;   // DeliverToCompID, empty = preserve stored
   std::uint32_t msg_seq_num{ 0 };

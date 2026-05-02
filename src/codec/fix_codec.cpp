@@ -1152,6 +1152,9 @@ AppendResolvedHeaderFields(std::string& out,
   if (msg_type == "A" && !options.default_appl_ver_id.empty()) {
     AppendPrefixedStringField(out, checksum, kDefaultApplVerIDPrefix, options.default_appl_ver_id, delimiter);
   }
+  if (!options.appl_ver_id.empty()) {
+    AppendPrefixedStringField(out, checksum, kApplVerIDPrefix, options.appl_ver_id, delimiter);
+  }
 
   if (options.poss_dup) {
     AppendPrefixedStringField(out, checksum, std::string_view("43="), std::string_view("Y"), delimiter);
@@ -2158,6 +2161,9 @@ FrameEncodeTemplate::EncodeToBuffer(message::MessageView message,
   if (!state_->default_appl_ver_fragment.empty()) {
     AppendTracked(full, &checksum, state_->default_appl_ver_fragment);
   }
+  if (!options.appl_ver_id.empty()) {
+    AppendPrefixedStringField(full, &checksum, kApplVerIDPrefix, options.appl_ver_id, delimiter);
+  }
   if (options.poss_dup) {
     AppendTracked(full, &checksum, state_->poss_dup_fragment);
   }
@@ -2265,6 +2271,9 @@ FrameEncodeTemplate::EncodeToBuffer(message::MessageView message,
   AppendPrefixedStringField(full, &checksum, state_->sending_time_prefix, sending_time, delimiter);
   if (!state_->default_appl_ver_fragment.empty()) {
     AppendTracked(full, &checksum, state_->default_appl_ver_fragment);
+  }
+  if (!options.appl_ver_id.empty()) {
+    AppendPrefixedStringField(full, &checksum, kApplVerIDPrefix, options.appl_ver_id, delimiter);
   }
   if (options.poss_dup) {
     AppendTracked(full, &checksum, state_->poss_dup_fragment);
@@ -2639,6 +2648,9 @@ DecodeFixMessageView(std::span<const std::byte> bytes,
       case kDefaultApplVerID:
         header.default_appl_ver_id = value_sv;
         break;
+      case kApplVerID:
+        header.appl_ver_id = value_sv;
+        break;
       case kPossDupFlag: {
         auto parsed = ParseBoolean(value_sv, "PossDupFlag");
         if (!parsed.ok()) {
@@ -2918,6 +2930,9 @@ DecodeFixMessageView(std::span<const std::byte> bytes,
         break;
       case kDefaultApplVerID:
         header.default_appl_ver_id = value_sv;
+        break;
+      case kApplVerID:
+        header.appl_ver_id = value_sv;
         break;
       case kPossDupFlag: {
         auto parsed = ParseBoolean(value_sv, "PossDupFlag");
@@ -3245,6 +3260,9 @@ PeekSessionHeaderView(std::span<const std::byte> bytes, char delimiter, bool ver
         break;
       case kDefaultApplVerID:
         header.default_appl_ver_id = value;
+        break;
+      case kApplVerID:
+        header.appl_ver_id = value;
         break;
       case kPossResend: {
         auto parsed = ParseBoolean(value, "PossResend");

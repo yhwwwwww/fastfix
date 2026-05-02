@@ -125,6 +125,7 @@ IsStandardSessionHeaderTag(std::uint32_t tag) -> bool
     case kTargetSubID:
     case kPossResend:
     case kOrigSendingTime:
+    case kApplVerID:
     case kDefaultApplVerID:
       return true;
     default:

@@ -261,6 +261,9 @@ DecodeRawPassThroughImpl(std::span<const std::byte> data,
       case kDefaultApplVerID:
         view.default_appl_ver_id = val;
         break;
+      case kApplVerID:
+        view.appl_ver_id = val;
+        break;
       case kSendingTime:
         view.sending_time = val;
         break;
@@ -429,6 +432,7 @@ EncodeReplay(const RawPassThroughView& stored, const ReplayOptions& options, Enc
   const auto replay_default_appl_ver_id = ResolveReplayDefaultApplVerID(stored, options);
   const auto replay_sender_sub_id = ResolveReplayString(options.sender_sub_id, stored.sender_sub_id);
   const auto replay_target_sub_id = ResolveReplayString(options.target_sub_id, stored.target_sub_id);
+  const auto replay_appl_ver_id = ResolveReplayString(options.appl_ver_id, stored.appl_ver_id);
   const auto replay_on_behalf_of = ResolveReplayString(options.on_behalf_of_comp_id, stored.on_behalf_of_comp_id);
   const auto replay_deliver_to = ResolveReplayString(options.deliver_to_comp_id, stored.deliver_to_comp_id);
 
@@ -445,6 +449,9 @@ EncodeReplay(const RawPassThroughView& stored, const ReplayOptions& options, Enc
   AppendStringField(out, kSendingTimePrefix, options.sending_time, soh);
   if (!replay_default_appl_ver_id.empty()) {
     AppendStringField(out, kDefaultApplVerIDPrefix, replay_default_appl_ver_id, soh);
+  }
+  if (!replay_appl_ver_id.empty()) {
+    AppendStringField(out, kApplVerIDPrefix, replay_appl_ver_id, soh);
   }
   AppendOptionalFlagField(out, std::string_view("43="), true, soh);
   AppendOptionalFlagField(out, kPossResendPrefix, options.poss_resend, soh);
@@ -510,6 +517,7 @@ EncodeReplayInto(const RawPassThroughView& stored, const ReplayOptions& options,
   const auto replay_default_appl_ver_id = ResolveReplayDefaultApplVerID(stored, options);
   const auto replay_sender_sub_id = ResolveReplayString(options.sender_sub_id, stored.sender_sub_id);
   const auto replay_target_sub_id = ResolveReplayString(options.target_sub_id, stored.target_sub_id);
+  const auto replay_appl_ver_id = ResolveReplayString(options.appl_ver_id, stored.appl_ver_id);
   const auto replay_on_behalf_of = ResolveReplayString(options.on_behalf_of_comp_id, stored.on_behalf_of_comp_id);
   const auto replay_deliver_to = ResolveReplayString(options.deliver_to_comp_id, stored.deliver_to_comp_id);
   const auto begin_string = options.begin_string.empty() ? stored.begin_string : options.begin_string;
@@ -524,6 +532,7 @@ EncodeReplayInto(const RawPassThroughView& stored, const ReplayOptions& options,
     CountStringFieldBytes(kSendingTimePrefix, options.sending_time) +
     (replay_default_appl_ver_id.empty() ? 0U
                                         : CountStringFieldBytes(kDefaultApplVerIDPrefix, replay_default_appl_ver_id)) +
+    (replay_appl_ver_id.empty() ? 0U : CountStringFieldBytes(kApplVerIDPrefix, replay_appl_ver_id)) +
     CountLiteralFieldBytes(std::string_view("43=Y")) +
     (options.poss_resend ? CountLiteralFieldBytes(std::string_view("97=Y")) : 0U) +
     (options.orig_sending_time.empty() ? 0U
@@ -610,6 +619,11 @@ EncodeReplayInto(const RawPassThroughView& stored, const ReplayOptions& options,
   if (!replay_default_appl_ver_id.empty()) {
     append_sv(kDefaultApplVerIDPrefix);
     append_sv(replay_default_appl_ver_id);
+    append_char(soh);
+  }
+  if (!replay_appl_ver_id.empty()) {
+    append_sv(kApplVerIDPrefix);
+    append_sv(replay_appl_ver_id);
     append_char(soh);
   }
   append_sv(std::string_view("43=Y"));

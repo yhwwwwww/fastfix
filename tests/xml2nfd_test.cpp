@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
 
 #include "nimblefix/codec/fix_tags.h"
 #include "nimblefix/profile/dictgen_input.h"
@@ -24,6 +25,32 @@ ReadFileContent(const std::filesystem::path& path) -> std::string
   std::ostringstream buffer;
   buffer << stream.rdbuf();
   return buffer.str();
+}
+
+void
+RequireQuickFix50XmlConvertsToNfd(std::string_view spec_filename, std::uint64_t profile_id)
+{
+  const auto project_root = std::filesystem::path(NIMBLEFIX_PROJECT_DIR);
+  const auto xml_path = project_root / "bench" / "vendor" / "quickfix" / "spec" / spec_filename;
+
+  const auto xml_content = ReadFileContent(xml_path);
+  REQUIRE(!xml_content.empty());
+
+  const auto nfd_text = nimble::tools::ConvertXmlToNfd(xml_content, profile_id);
+  REQUIRE(!nfd_text.empty());
+
+  auto dictionary = nimble::profile::LoadNormalizedDictionaryText(nfd_text);
+  REQUIRE(dictionary.ok());
+
+  const auto& dict = dictionary.value();
+  CHECK(dict.profile_id == profile_id);
+  CHECK(dict.schema_hash != 0U);
+  // FIX 5.0 has more fields than FIX 4.4.
+  CHECK(dict.fields.size() > 100U);
+  // Should have application messages.
+  CHECK(dict.messages.size() > 10U);
+  // Should have groups.
+  CHECK(dict.groups.size() > 5U);
 }
 
 } // namespace
@@ -165,4 +192,19 @@ TEST_CASE("xml2nfd converts QuickFIX XML to valid nfd", "[xml2nfd]")
     CHECK(allocs_it->name == "NoAllocs");
     CHECK(allocs_it->field_rules.size() == 2U);
   }
+}
+
+TEST_CASE("xml2nfd converts FIX 5.0 XML to valid nfd", "[xml2nfd][fix50]")
+{
+  RequireQuickFix50XmlConvertsToNfd("FIX50.xml", 5000U);
+}
+
+TEST_CASE("xml2nfd converts FIX 5.0 SP1 XML to valid nfd", "[xml2nfd][fix50]")
+{
+  RequireQuickFix50XmlConvertsToNfd("FIX50SP1.xml", 5001U);
+}
+
+TEST_CASE("xml2nfd converts FIX 5.0 SP2 XML to valid nfd", "[xml2nfd][fix50]")
+{
+  RequireQuickFix50XmlConvertsToNfd("FIX50SP2.xml", 5002U);
 }

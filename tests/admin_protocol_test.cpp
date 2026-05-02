@@ -1,12 +1,14 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "nimblefix/advanced/message_builder.h"
 #include "nimblefix/codec/fix_codec.h"
 #include "nimblefix/codec/fix_tags.h"
+#include "nimblefix/codec/raw_passthrough.h"
 #include "nimblefix/session/admin_protocol.h"
 #include "nimblefix/store/memory_store.h"
 
@@ -4021,4 +4023,171 @@ TEST_CASE("admin protocol validation policy controls enum validation", "[admin-p
     REQUIRE(event.ok());
     RequireAcceptedApplication(std::move(event).value());
   }
+}
+
+TEST_CASE("FIXT.1.1 logon includes DefaultApplVerID", "[fix50]")
+{
+  auto dictionary = nimble::tests::LoadFix44DictionaryView();
+  if (!dictionary.ok()) {
+    SKIP("FIX44 artifact not available: " << dictionary.status().message());
+  }
+
+  nimble::store::MemorySessionStore store;
+  nimble::session::AdminProtocol protocol(
+    nimble::session::AdminProtocolConfig{
+      .session =
+        nimble::session::SessionConfig{
+          .session_id = 6200U,
+          .key = nimble::session::SessionKey{ "FIXT.1.1", "BUY", "SELL" },
+          .profile_id = dictionary.value().profile().header().profile_id,
+          .default_appl_ver_id = "9",
+          .heartbeat_interval_seconds = 30U,
+          .is_initiator = true,
+        },
+      .transport_profile = nimble::session::TransportSessionProfile::FixT11(),
+      .begin_string = "FIXT.1.1",
+      .sender_comp_id = "BUY",
+      .target_comp_id = "SELL",
+      .default_appl_ver_id = "9",
+      .heartbeat_interval_seconds = 30U,
+    },
+    dictionary.value(),
+    &store);
+
+  auto event = protocol.OnTransportConnected(1U);
+  REQUIRE(event.ok());
+  REQUIRE(event.value().outbound_frames.size() == 1U);
+
+  auto decoded = nimble::codec::DecodeFixMessage(event.value().outbound_frames.front().bytes, dictionary.value());
+  REQUIRE(decoded.ok());
+  CHECK(decoded.value().header.begin_string == "FIXT.1.1");
+  CHECK(decoded.value().header.msg_type == "A");
+  CHECK(decoded.value().header.default_appl_ver_id == "9");
+}
+
+TEST_CASE("ApplVerID parsed from inbound header", "[fix50]")
+{
+  auto dictionary = nimble::tests::LoadFix44DictionaryView();
+  if (!dictionary.ok()) {
+    SKIP("FIX44 artifact not available: " << dictionary.status().message());
+  }
+
+  const auto frame = ::nimble::tests::EncodeFixFrame("35=D|34=2|49=BUY|56=SELL|52=20260402-12:00:00.000|"
+                                                     "1128=9|11=ORD-FIX50|55=AAPL|",
+                                                     "FIXT.1.1");
+
+  auto decoded = nimble::codec::DecodeFixMessageView(frame, dictionary.value());
+  REQUIRE(decoded.ok());
+  CHECK(decoded.value().header.begin_string == "FIXT.1.1");
+  CHECK(decoded.value().header.msg_type == "D");
+  CHECK(decoded.value().header.appl_ver_id == "9");
+  CHECK(decoded.value().message.view().get_string(kClOrdID).value() == "ORD-FIX50");
+
+  auto peeked = nimble::codec::PeekSessionHeaderView(frame);
+  REQUIRE(peeked.ok());
+  CHECK(peeked.value().appl_ver_id == "9");
+}
+
+TEST_CASE("FIXT.1.1 application accepts ApplVerID override", "[fix50]")
+{
+  auto dictionary = nimble::tests::LoadFix44DictionaryView();
+  if (!dictionary.ok()) {
+    SKIP("FIX44 artifact not available: " << dictionary.status().message());
+  }
+
+  nimble::store::MemorySessionStore store;
+  nimble::session::AdminProtocol protocol(
+    nimble::session::AdminProtocolConfig{
+      .session =
+        nimble::session::SessionConfig{
+          .session_id = 6201U,
+          .key = nimble::session::SessionKey{ "FIXT.1.1", "SELL", "BUY" },
+          .profile_id = dictionary.value().profile().header().profile_id,
+          .default_appl_ver_id = "9",
+          .heartbeat_interval_seconds = 30U,
+          .is_initiator = false,
+        },
+      .transport_profile = nimble::session::TransportSessionProfile::FixT11(),
+      .begin_string = "FIXT.1.1",
+      .sender_comp_id = "SELL",
+      .target_comp_id = "BUY",
+      .default_appl_ver_id = "9",
+      .heartbeat_interval_seconds = 30U,
+    },
+    dictionary.value(),
+    &store);
+
+  REQUIRE(protocol.OnTransportConnected(1U).ok());
+  REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIXT.1.1", "9").ok());
+
+  const auto inbound = ::nimble::tests::EncodeFixFrame("35=D|34=2|49=BUY|56=SELL|52=20260402-12:00:00.000|"
+                                                       "1128=8|11=ORD-FIX50|55=AAPL|54=1|60=20260402-12:00:00.000|"
+                                                       "40=1|",
+                                                       "FIXT.1.1");
+  auto event = protocol.OnInbound(inbound, 10U);
+  REQUIRE(event.ok());
+  RequireAcceptedApplication(std::move(event).value());
+}
+
+TEST_CASE("FIXT.1.1 application emits per-message ApplVerID", "[fix50]")
+{
+  auto dictionary = nimble::tests::LoadFix44DictionaryView();
+  if (!dictionary.ok()) {
+    SKIP("FIX44 artifact not available: " << dictionary.status().message());
+  }
+
+  nimble::store::MemorySessionStore store;
+  nimble::session::AdminProtocol protocol(
+    nimble::session::AdminProtocolConfig{
+      .session =
+        nimble::session::SessionConfig{
+          .session_id = 6202U,
+          .key = nimble::session::SessionKey{ "FIXT.1.1", "SELL", "BUY" },
+          .profile_id = dictionary.value().profile().header().profile_id,
+          .default_appl_ver_id = "9",
+          .heartbeat_interval_seconds = 30U,
+          .is_initiator = false,
+        },
+      .transport_profile = nimble::session::TransportSessionProfile::FixT11(),
+      .begin_string = "FIXT.1.1",
+      .sender_comp_id = "SELL",
+      .target_comp_id = "BUY",
+      .default_appl_ver_id = "9",
+      .heartbeat_interval_seconds = 30U,
+    },
+    dictionary.value(),
+    &store);
+
+  REQUIRE(protocol.OnTransportConnected(1U).ok());
+  REQUIRE(ActivateAcceptorSession(&protocol, dictionary.value(), "FIXT.1.1", "9").ok());
+
+  nimble::message::MessageBuilder builder("D");
+  builder.set_string(kMsgType, "D").set_string(kClOrdID, "ORD-FIX50").set_string(kSymbol, "AAPL");
+  auto outbound = protocol.SendApplication(
+    std::move(builder).build(), 10U, nimble::session::SessionSendEnvelopeView{ .appl_ver_id = "8" });
+  REQUIRE(outbound.ok());
+
+  auto decoded = nimble::codec::DecodeFixMessage(outbound.value().bytes, dictionary.value());
+  REQUIRE(decoded.ok());
+  CHECK(decoded.value().header.begin_string == "FIXT.1.1");
+  CHECK(decoded.value().header.msg_type == "D");
+  CHECK(decoded.value().header.default_appl_ver_id.empty());
+  CHECK(decoded.value().header.appl_ver_id == "8");
+}
+
+TEST_CASE("RawPassThrough preserves ApplVerID", "[fix50]")
+{
+  const auto frame = ::nimble::tests::EncodeFixFrame("35=D|34=2|49=BUY|56=SELL|52=20260402-12:00:00.000|"
+                                                     "1128=9|11=ORD-FIX50|55=AAPL|",
+                                                     "FIXT.1.1");
+
+  auto decoded = nimble::codec::DecodeRawPassThrough(std::span<const std::byte>(frame.data(), frame.size()));
+  REQUIRE(decoded.ok());
+  CHECK(decoded.value().begin_string == "FIXT.1.1");
+  CHECK(decoded.value().msg_type == "D");
+  CHECK(decoded.value().appl_ver_id == "9");
+  const auto body =
+    std::string_view(reinterpret_cast<const char*>(decoded.value().raw_body.data()), decoded.value().raw_body.size());
+  CHECK(body.find("1128=9") == std::string_view::npos);
+  CHECK(body.find("11=ORD-FIX50") != std::string_view::npos);
 }

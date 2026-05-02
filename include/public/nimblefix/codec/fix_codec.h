@@ -82,6 +82,7 @@ struct SessionHeader
   std::string on_behalf_of_comp_id;
   std::string deliver_to_comp_id;
   std::string default_appl_ver_id;
+  std::string appl_ver_id;
   std::string sending_time;
   std::string orig_sending_time;
   std::uint32_t body_length{ 0 };
@@ -102,6 +103,7 @@ struct SessionHeaderView
   std::string_view on_behalf_of_comp_id;
   std::string_view deliver_to_comp_id;
   std::string_view default_appl_ver_id;
+  std::string_view appl_ver_id;
   std::string_view sending_time;
   std::string_view orig_sending_time;
   std::uint32_t body_length{ 0 };
@@ -122,6 +124,7 @@ struct SessionHeaderView
     header.on_behalf_of_comp_id = std::string(on_behalf_of_comp_id);
     header.deliver_to_comp_id = std::string(deliver_to_comp_id);
     header.default_appl_ver_id = std::string(default_appl_ver_id);
+    header.appl_ver_id = std::string(appl_ver_id);
     header.sending_time = std::string(sending_time);
     header.orig_sending_time = std::string(orig_sending_time);
     header.body_length = body_length;
@@ -145,6 +148,9 @@ struct EncodeOptions
   std::string_view on_behalf_of_comp_id;
   std::string_view deliver_to_comp_id;
   std::string default_appl_ver_id;
+  // Optional per-message ApplVerID(1128) for FIXT.1.1 mixed-version sessions.
+  // Leave empty to omit; DefaultApplVerID(1137) Logon behavior is unchanged.
+  std::string_view appl_ver_id;
   std::string_view sending_time;
   std::string_view orig_sending_time;
   TimestampResolution timestamp_resolution{ TimestampResolution::kMilliseconds };

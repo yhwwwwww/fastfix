@@ -12,8 +12,13 @@ struct SessionSendEnvelopeView
   std::string_view sender_sub_id;
   // TargetSubID(57) written into the session-managed FIX header when present.
   std::string_view target_sub_id;
+  // ApplVerID(1128) written into the session-managed FIX header when present.
+  std::string_view appl_ver_id;
 
-  [[nodiscard]] auto empty() const -> bool { return sender_sub_id.empty() && target_sub_id.empty(); }
+  [[nodiscard]] auto empty() const -> bool
+  {
+    return sender_sub_id.empty() && target_sub_id.empty() && appl_ver_id.empty();
+  }
 };
 
 struct SessionSendEnvelope
@@ -23,12 +28,16 @@ struct SessionSendEnvelope
   // same tag numbers.
   std::string sender_sub_id;
   std::string target_sub_id;
+  // Use ApplVerID(1128) to select the application-version dictionary for this
+  // message on FIXT.1.1 transports. Leave empty to use the session default.
+  std::string appl_ver_id;
 
   SessionSendEnvelope() = default;
 
-  SessionSendEnvelope(std::string_view sender, std::string_view target)
+  SessionSendEnvelope(std::string_view sender, std::string_view target, std::string_view appl_ver = {})
     : sender_sub_id(sender)
     , target_sub_id(target)
+    , appl_ver_id(appl_ver)
   {
   }
 
@@ -37,10 +46,14 @@ struct SessionSendEnvelope
     return SessionSendEnvelopeView{
       .sender_sub_id = sender_sub_id,
       .target_sub_id = target_sub_id,
+      .appl_ver_id = appl_ver_id,
     };
   }
 
-  [[nodiscard]] auto empty() const -> bool { return sender_sub_id.empty() && target_sub_id.empty(); }
+  [[nodiscard]] auto empty() const -> bool
+  {
+    return sender_sub_id.empty() && target_sub_id.empty() && appl_ver_id.empty();
+  }
 };
 
 class SessionSendEnvelopeRef
@@ -63,7 +76,7 @@ public:
     if (view.empty()) {
       return SessionSendEnvelopeRef(view);
     }
-    return SessionSendEnvelopeRef(SessionSendEnvelope(view.sender_sub_id, view.target_sub_id));
+    return SessionSendEnvelopeRef(SessionSendEnvelope(view.sender_sub_id, view.target_sub_id, view.appl_ver_id));
   }
 
   [[nodiscard]] auto empty() const -> bool { return view().empty(); }

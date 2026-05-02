@@ -281,7 +281,7 @@ TEST_CASE("raw-passthrough replay preserves extended header semantics across "
 {
   const auto frame =
     nimble::tests::EncodeFixFrame("35=A|34=4|49=SELLER|50=DESK|56=BUYER|57=ROUTE|52=20260413-10:00:00.000|"
-                                  "1137=9|43=Y|97=Y|122=20260413-09:59:59.999|115=CLIENT-A|128=VENUE-B|98="
+                                  "1137=9|1128=9|43=Y|97=Y|122=20260413-09:59:59.999|115=CLIENT-A|128=VENUE-B|98="
                                   "0|108=30|");
 
   auto stored = nimble::codec::DecodeRawPassThrough(std::span<const std::byte>(frame.data(), frame.size()));
@@ -291,6 +291,7 @@ TEST_CASE("raw-passthrough replay preserves extended header semantics across "
   CHECK(stored.value().on_behalf_of_comp_id == "CLIENT-A");
   CHECK(stored.value().deliver_to_comp_id == "VENUE-B");
   CHECK(stored.value().default_appl_ver_id == "9");
+  CHECK(stored.value().appl_ver_id == "9");
   CHECK(stored.value().poss_dup);
   CHECK(stored.value().poss_resend);
   CHECK(stored.value().orig_sending_time == "20260413-09:59:59.999");
@@ -300,6 +301,7 @@ TEST_CASE("raw-passthrough replay preserves extended header semantics across "
   CHECK(stored_body.find("108=30") != std::string_view::npos);
   CHECK(stored_body.find("50=DESK") == std::string_view::npos);
   CHECK(stored_body.find("57=ROUTE") == std::string_view::npos);
+  CHECK(stored_body.find("1128=9") == std::string_view::npos);
   CHECK(stored_body.find("97=Y") == std::string_view::npos);
   CHECK(stored_body.find("115=CLIENT-A") == std::string_view::npos);
   CHECK(stored_body.find("128=VENUE-B") == std::string_view::npos);
@@ -343,6 +345,7 @@ TEST_CASE("raw-passthrough replay preserves extended header semantics across "
   CHECK(replayed.value().on_behalf_of_comp_id == "CLIENT-A");
   CHECK(replayed.value().deliver_to_comp_id == "VENUE-B");
   CHECK(replayed.value().default_appl_ver_id == "9");
+  CHECK(replayed.value().appl_ver_id == "9");
   CHECK(replayed.value().poss_dup);
   CHECK(replayed.value().poss_resend);
   CHECK(replayed.value().orig_sending_time == "20260413-10:00:00.000");

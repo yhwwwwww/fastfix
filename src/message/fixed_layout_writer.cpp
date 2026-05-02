@@ -528,6 +528,11 @@ FixedLayoutWriter::encode_to_buffer(const profile::NormalizedDictionaryView& /*d
     out.append(options.default_appl_ver_id);
     out.push_back(delimiter);
   }
+  if (!options.appl_ver_id.empty()) {
+    out.append(codec::tags::kApplVerIDPrefix);
+    out.append(options.appl_ver_id);
+    out.push_back(delimiter);
+  }
 
   // 9. PossDup (optional)
   if (options.poss_dup) {
@@ -726,6 +731,11 @@ FixedLayoutWriter::encode_to_buffer(const profile::NormalizedDictionaryView& /*d
   if (layout_->msg_type() == "A" && !options.default_appl_ver_id.empty()) {
     out.append(codec::tags::kDefaultApplVerIDPrefix);
     out.append(options.default_appl_ver_id);
+    out.push_back(delimiter);
+  }
+  if (!options.appl_ver_id.empty()) {
+    out.append(codec::tags::kApplVerIDPrefix);
+    out.append(options.appl_ver_id);
     out.push_back(delimiter);
   }
   if (options.poss_dup) {
